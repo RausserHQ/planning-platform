@@ -1,0 +1,9 @@
+# Operator-owned, non-secret policy for the explicitly human-invoked CLI.
+# Keep this outside caller-controlled planning artifacts. Refresh the trusted
+# ref before apply and replace the target hash with the canonical hash of the
+# exact publisher config.
+repository_root: /absolute/path/to/approved-repository-checkout
+expected_origin_url: https://github.com/owner/repository.git
+trusted_ref: refs/remotes/origin/main
+artifact_path: planning/example-plan/v1/backlog.yaml
+openproject_target_sha256: eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee

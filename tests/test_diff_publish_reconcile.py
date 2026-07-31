@@ -40,6 +40,7 @@ def _envelope(artifact, snapshot: OpenProjectSnapshot) -> PublicationEnvelope:
         snapshot_sha256=snapshot.sha256,
         snapshot_etag=snapshot.etag,
         trace_id="trace",
+        publication_target_sha256="e" * 64,
         publication_identity=artifact.plan.plan.publication_identity,
     )
 
@@ -213,6 +214,8 @@ def test_publish_binds_exact_loaded_bytes_and_allows_null_proposal_commit() -> N
     applied: list[str] = []
 
     class Adapter:
+        publication_target_sha256 = "e" * 64
+
         def snapshot(self):
             return snapshot
 
@@ -264,6 +267,8 @@ def test_publish_rejects_exact_hash_mismatch_and_stale_snapshot() -> None:
     snapshot = _snapshot(artifact.plan)
 
     class Adapter:
+        publication_target_sha256 = "e" * 64
+
         def snapshot(self):
             return snapshot
 
@@ -281,6 +286,7 @@ def test_publish_rejects_exact_hash_mismatch_and_stale_snapshot() -> None:
         snapshot.sha256,
         snapshot.etag,
         "trace",
+        "e" * 64,
         artifact.plan.plan.publication_identity,
     )
     with pytest.raises(PublicationRejected, match="SHA-256"):
@@ -288,6 +294,43 @@ def test_publish_rejects_exact_hash_mismatch_and_stale_snapshot() -> None:
     stale = _snapshot(artifact.plan, etag="stale")
     with pytest.raises(PublicationRejected, match="snapshot"):
         publish(artifact, Adapter(), _envelope(artifact, stale))
+
+
+def test_publication_resume_cannot_cross_openproject_targets() -> None:
+    artifact = _artifact()
+    snapshot = _snapshot(artifact.plan)
+    envelope = _envelope(artifact, snapshot)
+    operations = plan_diff(
+        artifact.plan.model_copy(
+            update={
+                "plan": artifact.plan.plan.model_copy(
+                    update={"approved_planning_commit": envelope.approved_commit}
+                )
+            }
+        ),
+        snapshot,
+        trace_id=envelope.trace_id,
+    )
+    journal = InMemoryPublicationJournal()
+    journal.begin(envelope, operations)
+    journal.intent(operations[0])
+    journal.failure(operations[0], RuntimeError("retryable"))
+    journal.close()
+
+    class WrongTargetAdapter:
+        publication_target_sha256 = "f" * 64
+
+        def snapshot(self):
+            raise AssertionError("target mismatch must precede snapshot or replay")
+
+    with pytest.raises(PublicationRejected, match="target changed"):
+        publish(
+            artifact,
+            WrongTargetAdapter(),  # type: ignore[arg-type]
+            envelope,
+            apply=True,
+            journal=journal,
+        )
 
 
 def test_conflicting_identity_and_stale_reconciliation_offer_no_repair() -> None:

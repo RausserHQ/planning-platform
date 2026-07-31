@@ -280,6 +280,7 @@ class MemoryStore:
 
 class OpenProjectFake:
     def __init__(self) -> None:
+        self.publication_target_sha256 = "e" * 64
         self.states: list[tuple[int, str | None, str | None]] = []
         self.comments: list[str] = []
         self.config = SimpleNamespace(

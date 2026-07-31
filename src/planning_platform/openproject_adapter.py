@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
@@ -75,6 +76,11 @@ class OpenProjectAdapterConfig:
     max_collection_items: int = 10_000
 
     def __post_init__(self) -> None:
+        for name in ("type_ids", "status_ids", "custom_field_ids", "priority_ids"):
+            values = getattr(self, name)
+            if not isinstance(values, Mapping):
+                raise ValueError(f"{name} must be a mapping")
+            object.__setattr__(self, name, MappingProxyType(dict(values)))
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("base_url must be an HTTP(S) URL")
         if (
@@ -140,6 +146,26 @@ class OpenProjectAdapterConfig:
                 raise ValueError(f"{name} values must be positive numeric IDs")
 
 
+def openproject_target_sha256(config: OpenProjectAdapterConfig) -> str:
+    """Bind durable publication replay to one exact non-secret target config."""
+    document = {
+        "base_url": config.base_url.rstrip("/"),
+        "project_id": config.project_id,
+        "alert_assignee_id": config.alert_assignee_id,
+        "type_ids": dict(config.type_ids),
+        "status_ids": dict(config.status_ids),
+        "custom_field_ids": dict(config.custom_field_ids),
+        "priority_ids": dict(config.priority_ids),
+        "timeout_seconds": float(config.timeout_seconds),
+        "page_size": config.page_size,
+        "max_collection_pages": config.max_collection_pages,
+        "max_collection_items": config.max_collection_items,
+    }
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class PublicationEffect:
     operation_id: str
@@ -194,6 +220,7 @@ class OpenProjectPublicationAdapter:
         if not token:
             raise ValueError("OpenProject API token is required")
         self.config = config
+        self.publication_target_sha256 = openproject_target_sha256(config)
         self._client = client or httpx.Client(
             base_url=config.base_url.rstrip("/"),
             auth=httpx.BasicAuth("apikey", token),

@@ -4,12 +4,14 @@ import hashlib
 from pathlib import Path
 
 import pytest
+import yaml
 from hypothesis import given
 from hypothesis import strategies as st
 
 from planning_platform.loader import (
     SchemaValidationError,
     load_artifact,
+    load_artifact_bytes,
     load_plan,
     validate_schema,
 )
@@ -43,6 +45,17 @@ def test_loaded_artifact_binds_exact_raw_and_git_blob_hashes() -> None:
     assert artifact.raw_bytes == raw
     assert artifact.sha256 == hashlib.sha256(raw).hexdigest()
     assert artifact.blob_sha1 == hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
+
+
+def test_loaded_artifact_rejects_duplicate_yaml_keys() -> None:
+    path = FIXTURES / "single-repository/backlog.yaml"
+    raw = path.read_text(encoding="utf-8").replace(
+        "    title: Implement deterministic core",
+        "    title: Reviewed title\n    title: Reviewer-visible override",
+        1,
+    )
+    with pytest.raises(yaml.constructor.ConstructorError, match="duplicate mapping key"):
+        load_artifact_bytes(raw.encode("utf-8"))
 
 
 def _mutated(**changes: object) -> tuple:

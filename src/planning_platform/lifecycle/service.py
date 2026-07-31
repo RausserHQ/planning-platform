@@ -590,6 +590,7 @@ class LifecycleService:
             snapshot_sha256=run.snapshot_sha256,
             snapshot_etag=run.snapshot_etag,
             trace_id=str(event.trace_id),
+            publication_target_sha256=self._openproject.publication_target_sha256,
             publication_identity=artifact.plan.plan.publication_identity,
         )
         journal = self._publication_journal_factory()

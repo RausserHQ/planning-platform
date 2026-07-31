@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml  # type: ignore[import-untyped]
 from jsonschema import Draft202012Validator, FormatChecker  # type: ignore[import-untyped]
 
 from .models import BacklogPlan
+from .yaml_loader import load_unique_yaml
 
 
 class SchemaValidationError(ValueError):
@@ -35,7 +35,7 @@ def schema_path() -> Path:
 
 
 def _raw_mapping(raw_bytes: bytes) -> dict[str, Any]:
-    data = yaml.safe_load(raw_bytes.decode("utf-8"))
+    data = load_unique_yaml(raw_bytes.decode("utf-8"))
     if not isinstance(data, dict):
         raise SchemaValidationError("backlog document must be a mapping")
     return data
