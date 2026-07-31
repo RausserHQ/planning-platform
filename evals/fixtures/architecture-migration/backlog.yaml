@@ -1,0 +1,32 @@
+schema_version: 1.0.0
+plan:
+  id: architecture-migration
+  version: 1
+  publication_identity: architecture-migration:v1
+  source_idea: {work_package_id: 3, lock_version: 0, updated_at: '2026-07-30T00:00:00Z'}
+  repositories: [{name: Acme/service, commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}]
+  approved_planning_commit: null
+  openproject_snapshot: {captured_at: '2026-07-30T00:00:00Z', etag: fixture, sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}
+items:
+  - key: migrate-boundary
+    type: Investigation
+    title: Migrate architecture boundary
+    objective: Verify the new architecture boundary before migration.
+    parent: null
+    repository: Acme/service
+    integration_work: false
+    source_requirements: [ARCH-1]
+    maintenance_objectives: []
+    acceptance_criteria: [{criterion: Boundary document is generated., observation: Inspect generated architecture artifact.}]
+    blocked_by: []
+    sequence_after: []
+    related_to: []
+    decision_required: []
+    decisions: []
+    mutex: []
+    risk: high
+    estimate: M
+    agent_eligibility: {eligible: false, reason: Needs architecture review.}
+    validation_commands: [pytest -q]
+    required_evidence: [{kind: decision_record, description: Approved architecture decision record.}]
+    result_predicate: {kind: artifact, expression: 'docs/architecture-boundary.md exists'}

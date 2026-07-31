@@ -17,6 +17,10 @@ SHA, canonical SHA-256, approval event, and OpenProject snapshot.
 `plan.approved_planning_commit` is intentionally nullable in the proposal
 schema. A file in a Git commit cannot contain that same commit's hash. Apply
 requires the external publication envelope and rejects an unapproved proposal.
+After verifying the raw artifact hash and Git blob identity, the publisher
+materializes that approved commit only in memory so the OpenProject Planning
+commit field and managed hash bind the merge commit without changing the
+approved artifact bytes.
 
 ## Consequences
 
@@ -26,4 +30,3 @@ requires the external publication envelope and rejects an unapproved proposal.
 - Human-owned fields never appear in the managed hash.
 - Title changes cannot fork identity.
 - Audit records can reproduce every proposed and applied operation.
-

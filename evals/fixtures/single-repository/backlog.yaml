@@ -1,0 +1,32 @@
+schema_version: 1.0.0
+plan:
+  id: single-repository
+  version: 1
+  publication_identity: single-repository:v1
+  source_idea: {work_package_id: 1, lock_version: 0, updated_at: '2026-07-30T00:00:00Z'}
+  repositories: [{name: Acme/service, commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}]
+  approved_planning_commit: null
+  openproject_snapshot: {captured_at: '2026-07-30T00:00:00Z', etag: fixture, sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}
+items:
+  - key: implement-core
+    type: Task
+    title: Implement deterministic core
+    objective: Provide a deterministic core with observable checks.
+    parent: null
+    repository: Acme/service
+    integration_work: false
+    source_requirements: [REQ-1]
+    maintenance_objectives: []
+    acceptance_criteria: [{criterion: Core returns stable output., observation: Run pytest returns exit code zero.}]
+    blocked_by: []
+    sequence_after: []
+    related_to: []
+    decision_required: []
+    decisions: []
+    mutex: []
+    risk: low
+    estimate: S
+    agent_eligibility: {eligible: true, reason: Bounded deterministic work.}
+    validation_commands: [pytest -q]
+    required_evidence: [{kind: command_output, description: Captured focused pytest output.}]
+    result_predicate: {kind: command, expression: 'pytest -q exits 0'}
