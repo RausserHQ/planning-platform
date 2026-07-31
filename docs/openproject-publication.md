@@ -23,6 +23,7 @@ OPENPROJECT_API_TOKEN_FILE=/run/secrets/openproject-publisher-token
 OPENPROJECT_WEBHOOK_SECRET_FILE=/run/secrets/openproject-webhook-secret
 PLANNING_PLATFORM_SERVICE_USER=planning-platform-publisher
 PLANNING_PLATFORM_PROJECT=planning-platform
+PLANNING_PLATFORM_ALERT_ASSIGNEE_LOGIN=admin
 PLANNING_PLATFORM_WEBHOOK_URL=https://windmill.internal/api/w/planning/openproject
 ```
 
@@ -37,13 +38,19 @@ validates incoming OpenProject webhook signatures as
 webhook secret.
 
 The publisher role is project-scoped and only receives work-package creation,
-editing, and relation permissions. The `Idea intake` template asks for the
-problem, outcome, repository, constraints, and evidence. The webhook subscribes
-to work-package create/update and comment events.
+editing, and relation permissions. A separate alert-assignee role grants only
+`view_work_packages` and passive `work_package_assigned` eligibility to the
+pre-existing active human account named by
+`PLANNING_PLATFORM_ALERT_ASSIGNEE_LOGIN`. Bootstrap removes that dedicated role
+from a previous recipient during rotation. The publisher discovers exactly one
+eligible User through the project-scoped `available_assignees` endpoint; zero
+or multiple eligible users is a deployment error. The `Idea intake` template
+asks for the problem, outcome, repository, constraints, and evidence. The
+webhook subscribes to work-package create/update and comment events.
 
 ## Mutation rules
 
-Identity is only `(Plan ID custom field, Node key custom field)`. The adapter
+Planning-item identity is only `(Plan ID custom field, Node key custom field)`. The adapter
 scans every page of the configured project and reads each matching candidate
 before mutation; duplicates, inconsistent totals/offsets, changed collection
 scope, pagination without progress, or configured page/item bounds stop
@@ -60,7 +67,11 @@ publication intent remains ambiguous for an operator.
 writes its required `{raw: ...}` formattable shape, with the raw value encoded
 as a canonical JSON string array. This is lossless even when one requirement
 contains a newline. `Evidence state` is verified as `pending` on creation, then
-is runtime-owned and is not part of later managed-content updates.
+is runtime-owned and is not part of later managed-content updates. Operational
+alerts use the separate `Alert fingerprint` custom field as their stable
+identity. Subject edits therefore cannot create duplicates; a missing identity
+field or a collision with content lacking the exact generated alert marker
+stops without mutation.
 
 Only the region between the generated description markers is replaced. Status,
 assignee, comments, time, actual effort, PR links, and other human fields are
@@ -68,6 +79,11 @@ not sent in updates. Removed nodes receive the configured `Superseded` status;
 they are never deleted. If a later approved plan reintroduces a Superseded
 identity, an explicit replay-safe operation moves it to `Ready`; an unchanged
 subsequent reapply then has zero operations.
+
+Operational alert creation assigns the new Task to the one bootstrapped human
+alert assignee. Later alert updates never rewrite assignee or subject. They
+converge only the generated description region, priority, and the alert-owned
+Blocked/Done state with the current `lockVersion`.
 
 Relations are scanned through global `/api/v3/relations` filters. Each managed
 relation has one exact deterministic description marker. Human relations are

@@ -1,0 +1,17 @@
+summary: Record terminal Planning Platform alert delivery failure
+description: Persists only authenticated alert identity and sanitized failure state.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+    error:
+      type:
+        - object
+        - "null"
+      additionalProperties: true
+  required:
+    - event

@@ -11,6 +11,13 @@ only component allowed to coordinate external effects.
 - OpenProject uses a project-scoped non-admin service user. Its API token and
   the separate webhook HMAC secret are SOPS-managed and mounted only in
   bootstrap/worker pods.
+- Alertmanager reaches one internal Windmill trigger with a separate
+  SOPS-managed bearer token. The trigger accepts only bounded alerts labeled
+  `area=planning-platform`; Windmill converges one OpenProject Task per
+  fingerprint, assigns its creation to the one least-privilege human alert
+  recipient, and never mirrors alerts into GitHub Issues. The synchronous
+  trigger returns a retryable failure to Alertmanager until OpenProject
+  delivery and its sanitized audit commit both succeed.
 - The internal planner token authenticates every `/v1` request. Health and
   metrics are the only unauthenticated planner endpoints.
 - HTTP ingress preserves the exact raw body. Lifecycle metadata is parsed only
@@ -34,9 +41,14 @@ Production NetworkPolicies deny ingress and egress by default. The planner may
 reach only its database and model API; it cannot reach GitHub or OpenProject.
 OpenProject and Windmill UIs are LAN-only. The sole public endpoint is the
 GitHub webhook path, carried through the approved tunnel and verified before
-any durable effect.
+any durable effect. Alert delivery stays cluster-internal from Alertmanager to
+Windmill and then uses the existing project-scoped OpenProject publisher token.
 
 Release jobs are tag-only. Every privileged third-party action is pinned to a
 commit, Python runtime dependencies are installed from the hash-bearing lock
 export, images include SBOM/provenance attestations, and a pinned Trivy action
-rejects fixable critical findings before a digest is promoted to GitOps.
+rejects fixable critical findings before a digest is promoted to GitOps. The
+Windmill extension upgrades the runtime npm bundle to exact npm `11.19.0` and
+asserts its fixed `tar` `7.5.19` dependency before installing the pinned
+Windmill CLI; this closes the upstream runtime image's fixable
+`CVE-2026-59873` without weakening the scanner.

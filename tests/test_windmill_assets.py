@@ -22,6 +22,7 @@ REQUIRED_FLOWS = {
     "nightly_reconciliation",
     "replan_affected_subgraph",
     "dead_letter_recovery",
+    "alertmanager_webhook",
 }
 
 
@@ -85,7 +86,7 @@ def test_flow_modules_resolve_and_retries_use_supported_bounded_shape() -> None:
 
 
 def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> None:
-    for source in ("github", "openproject"):
+    for source in ("github", "openproject", "alertmanager"):
         trigger = _document(PLANNING / f"{source}_webhook.http_trigger.yaml")
         assert trigger["authentication_method"] == "none"
         assert trigger["http_method"] == "post"
@@ -100,7 +101,25 @@ def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> Non
         assert isinstance(script, dict)
         assert script["language"] == "python3"
         assert "def preprocessor(event)" in str(script["content"])
-        assert "verify_webhook" in str(value["modules"][0])
+        expected_script = (
+            "alertmanager_delivery" if source == "alertmanager" else "verify_webhook"
+        )
+        assert expected_script in str(value["modules"][0])
+        if source == "alertmanager":
+            assert trigger["request_type"] == "sync"
+            failure = value["failure_module"]
+            assert isinstance(failure, dict)
+            assert failure["value"]["path"] == "f/planning/alert_delivery_failure"
+
+    failure_source = (PLANNING / "alert_delivery_failure.py").read_text()
+    assert '"windmill_status_code": 503' in failure_source
+    assert 'UUID(_required("WM_JOB_ID"))' in failure_source
+    assert "operational_alert_payload_sha256" in failure_source
+    delivery_source = (PLANNING / "alertmanager_delivery.py").read_text()
+    assert "operational_alert_is_stale" in delivery_source
+    assert 'UUID(_required("WM_JOB_ID"))' in delivery_source
+    assert "operational_alert_payload_sha256" in delivery_source
+    assert "pg_advisory_xact_lock" in delivery_source
 
     schedule = _document(PLANNING / "nightly_reconciliation.schedule.yaml")
     assert schedule["enabled"] is True
@@ -114,7 +133,7 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
         for path in ROOT.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     )
-    assert len(workspace_files) == 31
+    assert len(workspace_files) == 37
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert "!windmill/" in dockerignore
@@ -124,3 +143,6 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
 
     dockerfile = (REPO_ROOT / "deploy/windmill/extend.Dockerfile").read_text()
     assert "COPY windmill/ /opt/planning-platform-workspace/" in dockerfile
+    assert "ARG NPM_VERSION=11.19.0" in dockerfile
+    assert 'npm install --global "npm@${NPM_VERSION}"' in dockerfile
+    assert 'tar/package.json").version' in dockerfile

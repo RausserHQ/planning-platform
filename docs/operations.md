@@ -20,6 +20,11 @@ pod.
    image.
 5. Install Windmill CE 1.775.2 and sync `windmill/` with CLI 1.775.2.
 6. Start planner and Windmill workers, then enable the signed webhook routes.
+7. Apply the scoped Alertmanager route only after the authenticated
+   `planning/alerts` trigger is synced. A firing alert must create a Blocked
+   operational Task; a resolved delivery must converge the same fingerprint to
+   Done while preserving human text outside the generated region. The created
+   Task must be assigned to the one bootstrapped human alert recipient.
 
 All migrations are explicit Jobs. Application startup is read-only with
 respect to schema and reports not-ready when any required table is absent.
@@ -72,6 +77,19 @@ The custom worker image supplies this package through
 Never edit a delivery row, publication journal, LangGraph checkpoint, or
 OpenProject managed hash by hand.
 
+Alertmanager retries are safe: the Windmill trigger is synchronous, authenticates
+the exact raw request, serializes each fingerprint with a PostgreSQL advisory
+lock, and converges a single OpenProject work package. Its bounded internal
+retry runs before a terminal failure module returns HTTP 503, so Alertmanager
+retains delivery ownership and retries. The latest successful transition time
+is read under the same advisory lock; an older firing notification cannot
+reopen a resolved alert. The delivery audit contains only the fingerprint,
+alert name/state/severity, normalized payload digest, transition time, outcome,
+and work-package ID. Each delivery or terminal-failure attempt uses its
+Windmill job ID as the audit namespace. Rotate the Alertmanager bearer token by
+updating both the AlertmanagerConfig Secret and the worker environment in one
+GitOps change.
+
 Crash-only planner start/resume payloads are AES-256-GCM ciphertext bound to
 the exact thread and operation purpose. Raw Idea text, repository file
 content, and human answers are not stored in lifecycle tables. Back up the
@@ -109,7 +127,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.2` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.3` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
 blocks on fixable critical Trivy findings. The Windmill image also contains the

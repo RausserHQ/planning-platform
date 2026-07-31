@@ -19,6 +19,7 @@ from planning_platform.openproject_adapter import (
     OpenProjectConflict,
     OpenProjectPublicationAdapter,
     OpenProjectPublicationError,
+    OperationalAlert,
 )
 from planning_platform.publication_journal import (
     AmbiguousPublicationEffect,
@@ -65,7 +66,9 @@ def _config() -> OpenProjectAdapterConfig:
             "source_requirements": 47,
             "planning_commit": 48,
             "evidence_state": 49,
+            "alert_fingerprint": 50,
         },
+        alert_assignee_id=77,
         priority_ids={"low": 50, "medium": 51, "high": 52, "critical": 53},
     )
 
@@ -225,6 +228,179 @@ def _form(payload: dict[str, Any], *, href: str, method: str) -> httpx.Response:
             "_links": {"commit": {"href": href, "method": method}},
         },
     )
+
+
+def _operational_alert(*, state: str = "firing") -> OperationalAlert:
+    return OperationalAlert(
+        fingerprint="0123456789abcdef",
+        name="PlanningPlatformDeadLettersPresent",
+        severity="critical",
+        state=state,  # type: ignore[arg-type]
+        summary="One or more deliveries are dead-lettered",
+        description="Inspect the failure before audited recovery.",
+        namespace="planning-platform",
+        starts_at="2026-07-31T12:00:00Z",
+        ends_at=None if state == "firing" else "2026-07-31T12:30:00Z",
+        runbook_url="https://example.test/runbook",
+        labels={
+            "alertname": "PlanningPlatformDeadLettersPresent",
+            "area": "planning-platform",
+            "severity": "critical",
+        },
+    )
+
+
+def _alert_raw(
+    payload: dict[str, Any],
+    *,
+    package_id: int = 1176,
+    lock_version: int = 1,
+) -> dict[str, Any]:
+    return {
+        "id": package_id,
+        "lockVersion": lock_version,
+        "subject": payload["subject"],
+        "description": payload["description"],
+        "customField50": payload["customField50"],
+        "_links": payload["_links"],
+    }
+
+
+def test_operational_alert_create_is_replay_safe_and_human_visible() -> None:
+    created: dict[str, Any] | None = None
+    writes = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal created, writes
+        if request.url.path.endswith("/projects/42/work_packages"):
+            return _collection([] if created is None else [created])
+        if request.url.path == "/api/v3/work_packages/form":
+            payload = json.loads(request.content)
+            return _form(payload, href="/api/v3/work_packages", method="post")
+        if request.url.path == "/api/v3/work_packages" and request.method == "POST":
+            writes += 1
+            created = _alert_raw(json.loads(request.content))
+            return httpx.Response(201, json=created)
+        raise AssertionError(request.url)
+
+    adapter = _adapter(httpx.MockTransport(handler))
+    effect = adapter.ensure_operational_alert(_operational_alert())
+    assert effect.outcome == "created"
+    assert effect.work_package_id == 1176
+    assert created is not None
+    assert created["subject"].startswith("[Planning alert 0123456789abcdef]")
+    assert created["_links"]["status"]["href"] == "/api/v3/statuses/26"
+    assert created["_links"]["priority"]["href"] == "/api/v3/priorities/53"
+    assert created["_links"]["assignee"]["href"] == "/api/v3/users/77"
+
+    replay = adapter.ensure_operational_alert(_operational_alert())
+    assert replay.outcome == "unchanged"
+    assert replay.work_package_id == 1176
+    assert writes == 1
+
+
+def test_operational_alert_resolution_preserves_human_description() -> None:
+    firing = _operational_alert()
+    adapter_for_region = _adapter(
+        httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError(request.url)))
+    )
+    generated = adapter_for_region._operational_alert_region(firing)
+    current = {
+        "id": 1176,
+        "lockVersion": 4,
+        "subject": adapter_for_region._operational_alert_subject(firing),
+        "description": {"raw": f"Human triage note\n\n{generated}"},
+        "customField50": firing.fingerprint,
+        "_links": {
+            "type": {"href": "/api/v3/types/14"},
+            "priority": {"href": "/api/v3/priorities/53"},
+            "status": {"href": "/api/v3/statuses/26"},
+        },
+    }
+    patched: dict[str, Any] | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal current, patched
+        if request.url.path.endswith("/projects/42/work_packages"):
+            return _collection([current])
+        if request.url.path == "/api/v3/work_packages/1176/form":
+            payload = json.loads(request.content)
+            assert payload["lockVersion"] == 4
+            return _form(payload, href="/api/v3/work_packages/1176", method="patch")
+        if request.url.path == "/api/v3/work_packages/1176" and request.method == "PATCH":
+            patched = json.loads(request.content)
+            current = {
+                **current,
+                **patched,
+                "lockVersion": 5,
+                "_links": {
+                    **current["_links"],
+                    **patched["_links"],
+                },
+            }
+            return httpx.Response(200, json=current)
+        raise AssertionError(request.url)
+
+    effect = _adapter(httpx.MockTransport(handler)).ensure_operational_alert(
+        _operational_alert(state="resolved")
+    )
+    assert effect.outcome == "updated"
+    assert patched is not None
+    assert patched["description"]["raw"].startswith("Human triage note")
+    assert patched["_links"]["status"]["href"] == "/api/v3/statuses/28"
+
+
+def test_operational_alert_identity_survives_human_subject_edit() -> None:
+    alert = _operational_alert()
+    adapter_for_region = _adapter(
+        httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError(request.url)))
+    )
+    generated = adapter_for_region._operational_alert_region(alert)
+    current = {
+        "id": 1176,
+        "lockVersion": 2,
+        "subject": "Human-renamed alert",
+        "description": {"raw": generated},
+        "customField50": alert.fingerprint,
+        "_links": {
+            "type": {"href": "/api/v3/types/14"},
+            "priority": {"href": "/api/v3/priorities/53"},
+            "status": {"href": "/api/v3/statuses/26"},
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/projects/42/work_packages"):
+            return _collection([current])
+        raise AssertionError(request.url)
+
+    effect = _adapter(httpx.MockTransport(handler)).ensure_operational_alert(alert)
+    assert effect.outcome == "unchanged"
+    assert effect.work_package_id == 1176
+
+
+def test_operational_alert_identity_collision_fails_without_mutation() -> None:
+    alert = _operational_alert()
+    collision = {
+        "id": 1176,
+        "lockVersion": 1,
+        "subject": "Manual work",
+        "description": {"raw": "Human-only description"},
+        "customField50": alert.fingerprint,
+        "_links": {
+            "type": {"href": "/api/v3/types/14"},
+            "priority": {"href": "/api/v3/priorities/53"},
+            "status": {"href": "/api/v3/statuses/26"},
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/projects/42/work_packages"):
+            return _collection([collision])
+        raise AssertionError(request.url)
+
+    with pytest.raises(OpenProjectPublicationError, match="identity collides"):
+        _adapter(httpx.MockTransport(handler)).ensure_operational_alert(alert)
 
 
 def test_identity_scan_is_paginated_authenticates_and_duplicate_is_fatal() -> None:
@@ -1343,6 +1519,15 @@ def test_pinned_bootstrap_uses_v176_models_and_exact_webhook_events() -> None:
     assert "IssuePriority.where" in bootstrap
     assert "workflow.author = false" in bootstrap
     assert "role.permissions = required_permissions" in bootstrap
+    assert (
+        "alert_role.permissions = %i[view_work_packages work_package_assigned]"
+        in bootstrap
+    )
+    assert ".where.not(user_id: alert_assignee.id)" in bootstrap
+    assert "stale_member.member_roles.where(role: alert_role).destroy_all" in bootstrap
+    assert "member_roles.only_inherited.where(role: alert_role).destroy_all" in bootstrap
+    assert "member_roles.only_non_inherited.where(role: alert_role)" in bootstrap
+    assert '"alert assignee role mismatch"' in bootstrap
     assert "return rows.first if rows.one?" in bootstrap
 
 
