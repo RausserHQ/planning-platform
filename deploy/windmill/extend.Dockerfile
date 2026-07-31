@@ -1,7 +1,7 @@
 ARG WINDMILL_BASE
 FROM ${WINDMILL_BASE}
 
-ARG PLANNING_PLATFORM_VERSION=0.1.0
+ARG PLANNING_PLATFORM_VERSION=0.1.7
 ARG NPM_VERSION=11.19.0
 
 USER root
@@ -20,7 +20,7 @@ RUN npm install --global "npm@${NPM_VERSION}" \
     && rm -f /usr/bin/wmill \
     && npm install --global "windmill-cli@1.775.2" \
     && wmill_version="$(wmill --version)" \
-    && printf '%s\n' "$wmill_version" | grep -Fqx "CLI version: 1.775.2" \
+    && printf '%s\n' "$wmill_version" | grep -Fx "CLI version: 1.775.2" >/dev/null \
     && rm -rf /tmp/planning-platform-dist \
     && find /opt/planning-platform -type d -exec chmod 0755 {} + \
     && find /opt/planning-platform -type f -exec chmod 0644 {} + \
