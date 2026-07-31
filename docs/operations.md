@@ -109,7 +109,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.0` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.1` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
 blocks on fixable critical Trivy findings. GitOps consumes the resulting

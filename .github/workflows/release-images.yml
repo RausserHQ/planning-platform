@@ -3,7 +3,7 @@ name: Build planning platform images
 on:
   push:
     tags:
-      - v0.1.0
+      - v0.1.1
 
 permissions:
   contents: read
@@ -18,16 +18,16 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   PLANNER_IMAGE: ghcr.io/rausserhq/planning-platform/planner
-  PLANNER_TAG: v0.1.0
+  PLANNER_TAG: v0.1.1
   WINDMILL_IMAGE: ghcr.io/rausserhq/planning-platform/windmill
   WINDMILL_SOURCE_IMAGE: ghcr.io/rausserhq/planning-platform/windmill-source
-  WINDMILL_TAG: v1.775.2-planning.1
-  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.1
+  WINDMILL_TAG: v1.775.2-planning.2
+  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.2
   WINDMILL_SHA: 64ec1aa490ab5537a73bcb6f6b7e926c6339af39
 
 jobs:
   planner:
-    runs-on: rausserhq-docker-ci
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -78,7 +78,7 @@ jobs:
           echo "Planner: \`${image}\`" >>"${GITHUB_STEP_SUMMARY}"
 
   windmill:
-    runs-on: rausserhq-docker-ci
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out planning source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
