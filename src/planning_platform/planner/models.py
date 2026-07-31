@@ -1,0 +1,215 @@
+"""API and structured-model contracts for the private planner."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Literal
+from uuid import UUID
+
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+
+from planning_platform.models import BacklogItem
+
+MAX_PLANNER_REQUEST_BYTES = 4 * 1024 * 1024
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class RepositoryFile(StrictModel):
+    path: str = Field(min_length=1, max_length=512)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: str = Field(max_length=262_144)
+
+    @model_validator(mode="after")
+    def content_matches_hash(self) -> RepositoryFile:
+        actual = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
+        if actual != self.sha256:
+            raise ValueError("repository file content does not match sha256")
+        return self
+
+
+class RepositorySnapshot(StrictModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    files: tuple[RepositoryFile, ...] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def snapshot_matches_hash(self) -> RepositorySnapshot:
+        paths = [file.path for file in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("repository snapshot contains duplicate file paths")
+        if repository_snapshot_digest(self.name, self.commit, self.files) != self.snapshot_sha256:
+            raise ValueError("repository snapshot does not match snapshot_sha256")
+        return self
+
+
+class PlannerEvent(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    idempotency_key: str = Field(min_length=8, max_length=255)
+    trace_id: UUID
+
+
+class IdeaSnapshot(StrictModel):
+    work_package_id: int = Field(ge=1)
+    lock_version: int = Field(ge=0)
+    updated_at: AwareDatetime
+    title: str = Field(min_length=1)
+    description: str = Field(default="", max_length=65_536)
+
+
+class OpenProjectSnapshotInput(StrictModel):
+    captured_at: AwareDatetime
+    etag: str = Field(min_length=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class StartPlanRequest(StrictModel):
+    event: PlannerEvent
+    idea: IdeaSnapshot
+    plan_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{2,63}$")
+    plan_version: int = Field(ge=1)
+    idea_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    openproject_snapshot: OpenProjectSnapshotInput
+    repositories: tuple[RepositorySnapshot, ...] = Field(min_length=1, max_length=20)
+
+    @model_validator(mode="after")
+    def idea_matches_hash(self) -> StartPlanRequest:
+        actual = idea_snapshot_digest(self.idea, self.openproject_snapshot)
+        if actual != self.idea_sha256:
+            raise ValueError("Idea fields do not match idea_sha256")
+        _validate_request_size(self)
+        return self
+
+
+class ResumePlanRequest(StrictModel):
+    event: PlannerEvent
+    interrupt_id: str = Field(min_length=1)
+    comment_id: int = Field(ge=1)
+    comment_created_at: AwareDatetime
+    answer: str = Field(min_length=1, max_length=65_536)
+
+    @model_validator(mode="after")
+    def request_is_bounded(self) -> ResumePlanRequest:
+        _validate_request_size(self)
+        return self
+
+
+class ArtifactManifestEntry(StrictModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    required: bool = True
+
+
+class PendingInterrupt(StrictModel):
+    interrupt_id: str
+    questions: tuple[str, ...]
+    impact: str = Field(min_length=1, max_length=1_024)
+    created_at: AwareDatetime
+
+
+class PlanResponse(StrictModel):
+    thread_id: str
+    status: Literal["planning", "needs_input", "artifacts_ready", "failed"]
+    trace_id: str
+    interrupt: PendingInterrupt | None
+    artifact_manifest: tuple[ArtifactManifestEntry, ...]
+
+
+class ArtifactContent(StrictModel):
+    path: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content: str
+
+
+class ArtifactBundle(StrictModel):
+    thread_id: str
+    artifacts: tuple[ArtifactContent, ...]
+
+
+class ScopeClassification(StrictModel):
+    scope: Literal["tiny", "material"]
+    risk: Literal["low", "medium", "high", "critical"]
+    rationale: str
+
+
+class CompactSpecification(StrictModel):
+    problem: str
+    desired_outcome: str
+    constraints: tuple[str, ...] = ()
+    non_goals: tuple[str, ...] = ()
+
+
+class ConsequentialQuestions(StrictModel):
+    questions: tuple[str, ...] = ()
+    impact: str = Field(max_length=1_024)
+
+
+class DocumentSection(StrictModel):
+    title: str
+    body: str
+
+
+class RequirementsDraft(StrictModel):
+    requirements: tuple[str, ...]
+    decisions: tuple[str, ...] = ()
+    items: tuple[BacklogItem, ...]
+
+
+class DecompositionDraft(StrictModel):
+    items: tuple[BacklogItem, ...]
+
+
+class RelationDraft(StrictModel):
+    items: tuple[BacklogItem, ...]
+
+
+class DecompositionCritique(StrictModel):
+    acceptable: bool
+    findings: tuple[str, ...] = ()
+
+
+class ResumeBinding(StrictModel):
+    interrupt_id: str
+    comment_id: int
+    comment_created_at: AwareDatetime
+
+
+def derive_thread_id(idea_id: int, plan_version: int) -> str:
+    return f"openproject:{idea_id}:planning:{plan_version}"
+
+
+def repository_snapshot_digest(name: str, commit: str, files: tuple[RepositoryFile, ...]) -> str:
+    value = {
+        "name": name,
+        "commit": commit,
+        "files": [
+            {"path": file.path, "sha256": file.sha256}
+            for file in sorted(files, key=lambda candidate: candidate.path)
+        ],
+    }
+    return _canonical_sha256(value)
+
+
+def idea_snapshot_digest(idea: IdeaSnapshot, snapshot: OpenProjectSnapshotInput) -> str:
+    return _canonical_sha256(
+        {
+            "idea": idea.model_dump(mode="json"),
+            "openproject_snapshot": snapshot.model_dump(mode="json"),
+        }
+    )
+
+
+def _canonical_sha256(value: object) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _validate_request_size(request: BaseModel) -> None:
+    size = len(request.model_dump_json().encode("utf-8"))
+    if size > MAX_PLANNER_REQUEST_BYTES:
+        raise ValueError(f"planner request exceeds {MAX_PLANNER_REQUEST_BYTES} UTF-8 bytes")

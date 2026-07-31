@@ -45,3 +45,6 @@ or emits OpenProject-only relation names.
 
 The API accepts immutable snapshots and produces proposals. It cannot fetch or
 mutate OpenProject or create GitHub branches/PRs. Windmill owns those effects.
+An authenticated internal publisher may read exact, hash-verified artifact
+bytes from `GET /v1/plans/{thread_id}/artifacts`; this read-only handoff does
+not transfer publication authority to the planner.

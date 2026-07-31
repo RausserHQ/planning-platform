@@ -27,9 +27,15 @@ Nightly schedule
   -> safe repairs or recommendations
 ```
 
-The planner network identity has read-only repository-context access and its
-own `planner` database role. It has no OpenProject token, GitHub write
-credential, Windmill token, or access to the OpenProject/Windmill databases.
+The planner network identity accepts immutable repository context only from
+the authenticated broker and has its own `planner` database role. It has no
+direct repository credential, OpenProject token, GitHub credential, Windmill
+token, or access to the OpenProject/Windmill databases.
+
+Each mutating planner execution is fenced by a PostgreSQL session advisory
+lock and a LangGraph saver bound to that same non-reconnecting connection.
+Checkpoint reads use the application pool, but executions do not, preventing
+long model calls from exhausting the read/idempotency pool.
 
 ## Durable identity
 
@@ -58,4 +64,3 @@ links, human notes, and runtime failures are outside the managed field set.
   `planner` databases and login roles.
 - S3-compatible OpenProject attachments and PostgreSQL backups use
   infrastructure-owned object storage.
-

@@ -37,6 +37,7 @@ dev = [
 
 [project.scripts]
 planning = "planning_platform.cli:main"
+planning-planner-migrate = "planning_platform.planner.migrate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/planning_platform"]
@@ -44,6 +45,9 @@ packages = ["src/planning_platform"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests", "windmill/tests"]
+markers = [
+  "postgres: opt-in planner integration test requiring PLANNER_TEST_DATABASE_URL",
+]
 
 [tool.ruff]
 line-length = 100
@@ -56,4 +60,3 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 packages = ["planning_platform"]
-

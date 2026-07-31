@@ -28,6 +28,13 @@ our own API. It does not use the licensed LangGraph Agent Server. Windmill is
 built from its AGPL source without the `enterprise` feature; the official Helm
 chart is used with that image override.
 
+Evaluation command safety is a syntax-level, fail-closed screen. It accepts
+only known read-only tool forms and rejects absolute, home-relative, URI, and
+parent-traversal path syntax in positional arguments and option values. This
+cannot prove that a relative path is contained: before actual execution, the
+runner must resolve every referenced path and symlink beneath an authorized
+workspace and must sandbox network and credential access.
+
 ## Contract lifecycle
 
 `backlog.yaml` is a proposal while `plan.approved_planning_commit` is `null`.
@@ -38,4 +45,3 @@ snapshot, and approval event. Apply rejects any mismatch.
 
 See [architecture](docs/architecture.md) and the
 [contract rationale](docs/decisions/0001-authority-and-publication-contract.md).
-
