@@ -1,0 +1,184 @@
+openapi: 3.1.0
+info:
+  title: Planning Platform Planner API
+  version: 1.0.0
+servers:
+  - url: http://planner-api.planning-platform.svc.cluster.local:8080
+paths:
+  /health/live:
+    get:
+      operationId: live
+      responses:
+        "200":
+          description: Process is alive
+  /health/ready:
+    get:
+      operationId: ready
+      responses:
+        "200":
+          description: Database and graph are ready
+        "503":
+          description: A required dependency is unavailable
+  /metrics:
+    get:
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus metrics
+  /v1/plans:
+    post:
+      operationId: startPlan
+      summary: Start or idempotently resume a planning thread
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartPlanRequest"
+      responses:
+        "200":
+          description: Existing idempotent result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+        "201":
+          description: Planning thread created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+        "409":
+          description: Same idempotency key with a different request
+  /v1/plans/{thread_id}:
+    get:
+      operationId: getPlan
+      parameters:
+        - $ref: "#/components/parameters/ThreadId"
+      responses:
+        "200":
+          description: Durable thread state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+        "404":
+          description: Thread not found
+  /v1/plans/{thread_id}/resume:
+    post:
+      operationId: resumePlan
+      parameters:
+        - $ref: "#/components/parameters/ThreadId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResumePlanRequest"
+      responses:
+        "200":
+          description: Thread resumed or an existing resume replayed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+        "409":
+          description: Comment is stale, already bound, or does not match interrupt
+components:
+  parameters:
+    ThreadId:
+      in: path
+      name: thread_id
+      required: true
+      schema:
+        type: string
+        pattern: "^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$"
+  schemas:
+    RepositorySnapshot:
+      type: object
+      additionalProperties: false
+      required: [name, commit, files]
+      properties:
+        name:
+          type: string
+        commit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        files:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [path, sha256, content]
+            properties:
+              path:
+                type: string
+              sha256:
+                type: string
+                pattern: "^[0-9a-f]{64}$"
+              content:
+                type: string
+    StartPlanRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - event
+        - idea
+        - plan_id
+        - plan_version
+        - openproject_snapshot
+        - repositories
+      properties:
+        event:
+          type: object
+        idea:
+          type: object
+        plan_id:
+          type: string
+        plan_version:
+          type: integer
+          minimum: 1
+        openproject_snapshot:
+          type: object
+        repositories:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RepositorySnapshot"
+    ResumePlanRequest:
+      type: object
+      additionalProperties: false
+      required: [event, interrupt_id, comment_id, comment_created_at, answer]
+      properties:
+        event:
+          type: object
+        interrupt_id:
+          type: string
+        comment_id:
+          type: integer
+          minimum: 1
+        comment_created_at:
+          type: string
+          format: date-time
+        answer:
+          type: string
+          minLength: 1
+    PlanResponse:
+      type: object
+      additionalProperties: false
+      required: [thread_id, status, trace_id, artifact_manifest]
+      properties:
+        thread_id:
+          type: string
+        status:
+          enum: [planning, needs_input, artifacts_ready, failed]
+        trace_id:
+          type: string
+          format: uuid
+        interrupt:
+          type: [object, "null"]
+        artifact_manifest:
+          type: array
+          items:
+            type: object
+

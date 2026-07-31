@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "planning-platform"
+version = "0.1.0"
+description = "Open-source Idea-to-Tickets planning, publication, and reconciliation"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.141.1",
+  "httpx==0.28.1",
+  "jsonschema==4.26.0",
+  "langchain-openai==1.4.1",
+  "langgraph==1.2.10",
+  "langgraph-checkpoint-postgres==3.1.1",
+  "prometheus-client==0.26.0",
+  "psycopg[binary,pool]==3.3.4",
+  "pydantic==2.13.4",
+  "PyYAML==6.0.3",
+  "tenacity==9.1.4",
+  "uvicorn[standard]==0.52.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis==6.141.1",
+  "mypy==1.18.2",
+  "pytest==8.4.2",
+  "pytest-asyncio==1.2.0",
+  "pytest-cov==7.0.0",
+  "respx==0.22.0",
+  "ruff==0.13.2",
+]
+
+[project.scripts]
+planning = "planning_platform.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/planning_platform"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests", "windmill/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["planning_platform"]
+

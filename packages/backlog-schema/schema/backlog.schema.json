@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://planning.rausserhq.org/schema/backlog-1.0.0.json",
+  "title": "Planning Platform Backlog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "plan", "items"],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "plan": {
+      "$ref": "#/$defs/plan"
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/item"
+      }
+    }
+  },
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stableKey": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 96
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "publication_identity",
+        "source_idea",
+        "repositories",
+        "approved_planning_commit",
+        "openproject_snapshot"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{2,63}$"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "publication_identity": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{2,63}:v[1-9][0-9]*$"
+        },
+        "source_idea": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["work_package_id", "lock_version", "updated_at"],
+          "properties": {
+            "work_package_id": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lock_version": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "updated_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "repositories": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "commit"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+              },
+              "commit": {
+                "$ref": "#/$defs/sha1"
+              }
+            }
+          }
+        },
+        "approved_planning_commit": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "openproject_snapshot": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["captured_at", "etag", "sha256"],
+          "properties": {
+            "captured_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "etag": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion", "observation"],
+      "properties": {
+        "criterion": {
+          "type": "string",
+          "minLength": 8
+        },
+        "observation": {
+          "type": "string",
+          "minLength": 8
+        }
+      }
+    },
+    "requiredEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "artifact",
+            "check_run",
+            "command_output",
+            "decision_record",
+            "deployment",
+            "metric",
+            "pull_request",
+            "review"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 8
+        }
+      }
+    },
+    "resultPredicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "expression"],
+      "properties": {
+        "kind": {
+          "enum": ["artifact", "command", "deployment", "github_check", "metric"]
+        },
+        "expression": {
+          "type": "string",
+          "minLength": 3
+        }
+      }
+    },
+    "agentEligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eligible", "reason"],
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 4
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "type",
+        "title",
+        "objective",
+        "parent",
+        "repository",
+        "integration_work",
+        "source_requirements",
+        "maintenance_objectives",
+        "acceptance_criteria",
+        "blocked_by",
+        "sequence_after",
+        "related_to",
+        "decision_required",
+        "decisions",
+        "mutex",
+        "risk",
+        "estimate",
+        "agent_eligibility",
+        "validation_commands",
+        "required_evidence",
+        "result_predicate"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/stableKey"
+        },
+        "type": {
+          "enum": [
+            "Initiative",
+            "Epic",
+            "Story",
+            "Task",
+            "Decision",
+            "Investigation",
+            "Bug"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 180
+        },
+        "objective": {
+          "type": "string",
+          "minLength": 12
+        },
+        "parent": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/stableKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "integration_work": {
+          "type": "boolean"
+        },
+        "source_requirements": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "maintenance_objectives": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/acceptanceCriterion"
+          }
+        },
+        "blocked_by": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableKey"
+          }
+        },
+        "sequence_after": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableKey"
+          }
+        },
+        "related_to": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableKey"
+          }
+        },
+        "decision_required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableKey"
+          }
+        },
+        "decisions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stableKey"
+          }
+        },
+        "mutex": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{2,63}$"
+          }
+        },
+        "risk": {
+          "enum": ["low", "medium", "high", "critical"]
+        },
+        "estimate": {
+          "enum": ["XS", "S", "M"]
+        },
+        "agent_eligibility": {
+          "$ref": "#/$defs/agentEligibility"
+        },
+        "validation_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "required_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/requiredEvidence"
+          }
+        },
+        "result_predicate": {
+          "$ref": "#/$defs/resultPredicate"
+        }
+      }
+    }
+  }
+}
+

@@ -1,0 +1,11 @@
+Planning Platform
+Copyright 2026 RausserHQ
+
+The planning methodology and artifact prompts under
+`packages/planning-artifacts/methodology/bmad/` are adapted from BMad Method
+v6.10.0 (commit 081e64ee5aab2316b912883f7bee528ee143ce36), which is
+licensed under the MIT License. See that directory's LICENSE and SOURCE files.
+
+This repository contains integration code for, but does not redistribute,
+OpenProject (GPL-3.0), Windmill (AGPL-3.0 source build), or LangGraph (MIT).
+

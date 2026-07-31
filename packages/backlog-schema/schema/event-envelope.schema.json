@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://planning.rausserhq.org/schema/event-envelope-1.0.0.json",
+  "title": "Planning Platform Event Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "event_type",
+    "source",
+    "source_delivery_id",
+    "occurred_at",
+    "received_at",
+    "trace_id",
+    "idempotency_key",
+    "actor",
+    "subject",
+    "signature",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "event_type": {
+      "enum": [
+        "github.check_run",
+        "github.pull_request",
+        "openproject.idea_comment",
+        "openproject.work_package_changed",
+        "planning.artifacts_ready",
+        "planning.pr_merged",
+        "reconciliation.scheduled",
+        "windmill.dead_letter_replayed"
+      ]
+    },
+    "source": {
+      "enum": ["github", "openproject", "scheduler", "windmill"]
+    },
+    "source_delivery_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "trace_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9:._/-]{7,255}$"
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "enum": ["human", "service", "system"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["idea_id", "plan_id", "plan_version", "node_key"],
+      "properties": {
+        "idea_id": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "plan_id": {
+          "type": ["string", "null"]
+        },
+        "plan_version": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "node_key": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified", "algorithm", "key_id"],
+      "properties": {
+        "verified": {
+          "type": "boolean"
+        },
+        "algorithm": {
+          "enum": ["github-hmac-sha256", "openproject-hmac-sha1", "internal", "none"]
+        },
+        "key_id": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}
+
