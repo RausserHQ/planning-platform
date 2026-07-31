@@ -62,7 +62,11 @@ def load_plan(path: str | Path) -> BacklogPlan:
 
 
 def load_artifact(path: str | Path) -> LoadedArtifact:
-    raw_bytes = Path(path).read_bytes()
+    return load_artifact_bytes(Path(path).read_bytes())
+
+
+def load_artifact_bytes(raw_bytes: bytes) -> LoadedArtifact:
+    """Load exact immutable bytes obtained from GitHub without a temp file."""
     data = _raw_mapping(raw_bytes)
     validate_schema(data)
     return LoadedArtifact(

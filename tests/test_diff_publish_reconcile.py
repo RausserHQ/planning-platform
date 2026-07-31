@@ -7,6 +7,7 @@ import pytest
 from planning_platform.diff import plan_diff
 from planning_platform.loader import load_artifact, load_plan
 from planning_platform.openproject import OpenProjectSnapshot, WorkPackageSnapshot, managed_hash
+from planning_platform.publication_journal import InMemoryPublicationJournal
 from planning_platform.publisher import PublicationEnvelope, PublicationRejected, publish
 from planning_platform.reconciliation import reconcile
 
@@ -39,6 +40,7 @@ def _envelope(artifact, snapshot: OpenProjectSnapshot) -> PublicationEnvelope:
         snapshot_sha256=snapshot.sha256,
         snapshot_etag=snapshot.etag,
         trace_id="trace",
+        publication_identity=artifact.plan.plan.publication_identity,
     )
 
 
@@ -84,6 +86,72 @@ def test_parent_removal_and_human_relation_preservation() -> None:
     assert not any(operation.kind == "remove_managed_relation" for operation in operations)
 
 
+def test_one_sided_reverse_related_to_has_canonical_global_owner() -> None:
+    plan = _plan()
+    lower = plan.items[0].model_copy(update={"key": "a", "related_to": ()})
+    higher = lower.model_copy(update={"key": "z", "related_to": ("a",)})
+    related = plan.model_copy(update={"items": (higher, lower)})
+    operations = plan_diff(related, _snapshot(related))
+    relation = next(operation for operation in operations if operation.kind == "create_relation")
+    assert relation.identity == (related.plan.id, "a")
+    assert relation.payload == {"type": "related_to", "target_identity": (related.plan.id, "z")}
+
+
+def test_related_to_snapshot_replay_does_not_oscillate_between_endpoints() -> None:
+    plan = _plan()
+    lower = plan.items[0].model_copy(update={"key": "a", "related_to": ()})
+    higher = lower.model_copy(update={"key": "z", "related_to": ("a",)})
+    related = plan.model_copy(update={"items": (higher, lower)})
+    snapshot = OpenProjectSnapshot(
+        "now",
+        "fixture",
+        related.plan.openproject_snapshot.sha256,
+        (
+            WorkPackageSnapshot(
+                1,
+                1,
+                related.plan.id,
+                "a",
+                related.plan.version,
+                managed_hash=managed_hash(related, lower),
+                managed_relations=(("related_to", (related.plan.id, "z")),),
+            ),
+            WorkPackageSnapshot(
+                2,
+                1,
+                related.plan.id,
+                "z",
+                related.plan.version,
+                managed_hash=managed_hash(related, higher),
+                managed_relations=(),
+            ),
+        ),
+    )
+    assert plan_diff(related, snapshot) == ()
+
+
+def test_topology_preconditions_distinguish_unmanaged_parent_from_none() -> None:
+    plan = _plan()
+    package = WorkPackageSnapshot(
+        1,
+        1,
+        plan.plan.id,
+        plan.items[0].key,
+        plan.plan.version,
+        managed_hash=managed_hash(plan, plan.items[0]),
+        parent_id=900,
+        parent_identity=None,
+    )
+    operation = next(
+        operation
+        for operation in plan_diff(plan, _snapshot(plan, package))
+        if operation.kind == "set_parent"
+    )
+    assert operation.preconditions["expected_parent_identity"] is None
+    assert operation.preconditions["expected_unmanaged_parent"] is True
+    assert operation.preconditions["expected_managed_relations"] == []
+
+
 def test_reapply_is_empty_and_removed_nodes_are_superseded() -> None:
     plan = _plan()
     package = WorkPackageSnapshot(
@@ -100,6 +168,35 @@ def test_reapply_is_empty_and_removed_nodes_are_superseded() -> None:
     operations = plan_diff(plan, _snapshot(plan, retired))
     assert any(operation.kind == "mark_superseded" for operation in operations)
     assert package.human_fields["status"] == "In progress"
+
+
+def test_reintroduced_superseded_node_is_reactivated_once() -> None:
+    plan = _plan()
+    package = WorkPackageSnapshot(
+        1,
+        4,
+        plan.plan.id,
+        plan.items[0].key,
+        plan.plan.version,
+        managed_hash=managed_hash(plan, plan.items[0]),
+        human_fields={"status_id": 29},
+        superseded=True,
+    )
+    operations = plan_diff(plan, _snapshot(plan, package))
+    assert [operation.kind for operation in operations] == [
+        "reactivate_work_package",
+        "record_audit",
+    ]
+    assert operations[0].payload == {"status": "Ready"}
+
+    ready = WorkPackageSnapshot(
+        **{
+            **package.__dict__,
+            "human_fields": {"status_id": 24},
+            "superseded": False,
+        }
+    )
+    assert plan_diff(plan, _snapshot(plan, ready)) == ()
 
 
 def test_operation_identity_changes_with_base_snapshot() -> None:
@@ -126,7 +223,13 @@ def test_publish_binds_exact_loaded_bytes_and_allows_null_proposal_commit() -> N
             assert idempotency_key == operation.operation_id
             applied.append(operation.kind)
 
-    result = publish(artifact, Adapter(), _envelope(artifact, snapshot), apply=True)
+    result = publish(
+        artifact,
+        Adapter(),
+        _envelope(artifact, snapshot),
+        apply=True,
+        journal=InMemoryPublicationJournal(),
+    )
     assert result.applied
     assert applied == ["create_work_package", "record_audit"]
     create = result.operations[0]
@@ -178,6 +281,7 @@ def test_publish_rejects_exact_hash_mismatch_and_stale_snapshot() -> None:
         snapshot.sha256,
         snapshot.etag,
         "trace",
+        artifact.plan.plan.publication_identity,
     )
     with pytest.raises(PublicationRejected, match="SHA-256"):
         publish(artifact, Adapter(), invalid_hash)

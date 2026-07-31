@@ -1,0 +1,45 @@
+# OpenProject Community Edition 17.6.0 only. Values are instance-local numeric
+# IDs discovered after bootstrap; the adapter never contains these IDs itself.
+base_url: https://openproject.example.internal
+project_id: 42
+timeout_seconds: 10
+page_size: 100
+max_collection_pages: 100
+max_collection_items: 10000
+type_ids:
+  Idea: 10
+  Initiative: 11
+  Epic: 12
+  Story: 13
+  Task: 14
+  Decision: 15
+  Investigation: 16
+  Bug: 17
+status_ids:
+  Draft: 20
+  Planning: 21
+  Needs Input: 22
+  Proposed: 23
+  Ready: 24
+  In Progress: 25
+  Blocked: 26
+  Review: 27
+  Done: 28
+  Superseded: 29
+  Rejected: 30
+custom_field_ids:
+  plan_id: 40
+  node_key: 41
+  plan_version: 42
+  managed_hash: 43
+  repository: 44
+  risk: 45
+  agent_eligible: 46
+  source_requirements: 47
+  planning_commit: 48
+  evidence_state: 49
+priority_ids:
+  low: 50
+  medium: 51
+  high: 52
+  critical: 53

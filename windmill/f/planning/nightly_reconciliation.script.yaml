@@ -1,0 +1,11 @@
+summary: Reconcile durable planning state
+description: Inspects canonical systems and applies only deterministic safe repairs.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    delivery_id:
+      type:
+        - string
+        - "null"

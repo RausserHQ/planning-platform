@@ -35,6 +35,7 @@ class WorkPackageSnapshot:
     managed_relations: tuple[tuple[str, tuple[str, str]], ...] = ()
     human_fields: dict[str, Any] = field(default_factory=dict)
     superseded: bool = False
+    evidence_state: str | None = None
 
     @property
     def identity(self) -> tuple[str, str] | None:
@@ -73,6 +74,7 @@ class WorkPackageSnapshot:
             managed_relations=managed_relations,
             human_fields=dict(value.get("human_fields", {})),
             superseded=bool(value.get("superseded", False)),
+            evidence_state=value.get("evidence_state"),
         )
 
 
@@ -119,39 +121,80 @@ def generated_description(item: BacklogItem) -> str:
     evidence = "\n".join(f"- {value.kind}: {value.description}" for value in item.required_evidence)
     sections = (
         "<!-- planning-platform:generated -->",
+        "## Type",
+        item.type,
         "## Objective",
         item.objective,
         "## Acceptance",
         criteria,
         "## Evidence",
         evidence,
+        "## Estimate",
+        item.estimate,
+        "## Repository",
+        item.repository,
+        "## Source requirements",
+        "\n".join(f"- {value}" for value in item.source_requirements),
+        "## Maintenance objectives",
+        "\n".join(f"- {value}" for value in item.maintenance_objectives),
+        "## Agent eligibility rationale",
+        item.agent_eligibility.reason,
+        "<!-- /planning-platform:generated -->",
     )
     return "\n".join(sections)
 
 
+_GENERATED_OPEN = "<!-- planning-platform:generated -->"
+_GENERATED_CLOSE = "<!-- /planning-platform:generated -->"
+
+
+def replace_generated_description(current: str, generated: str) -> str:
+    """Replace only the bounded publisher-owned region of a description.
+
+    A malformed or multiply-owned region is unsafe: choosing one would risk
+    overwriting a human edit, so callers must stop instead.
+    """
+    starts = current.count(_GENERATED_OPEN)
+    ends = current.count(_GENERATED_CLOSE)
+    if starts == 0 and ends == 0:
+        return generated if not current.strip() else f"{current.rstrip()}\n\n{generated}"
+    if starts != 1 or ends != 1:
+        raise ValueError("generated description markers are missing, duplicated, or unbalanced")
+    start = current.index(_GENERATED_OPEN)
+    end = current.index(_GENERATED_CLOSE, start) + len(_GENERATED_CLOSE)
+    if end <= start:
+        raise ValueError("generated description marker order is invalid")
+    return f"{current[:start]}{generated}{current[end:]}"
+
+
 def managed_fields(plan: BacklogPlan, item: BacklogItem) -> dict[str, Any]:
-    """Exact publisher-owned state; human-owned state is deliberately absent."""
+    """Canonical v1 observable publisher-owned projection.
+
+    Every member is either a native v3 field/custom field or the exact bounded
+    generated region, so an adapter can recompute this hash from a fresh read.
+    """
     return {
         "title": item.title,
+        "work_package_type": item.type,
         "generated_description": generated_description(item),
         "priority": item.risk,
-        "estimate": item.estimate,
         "risk": item.risk,
         "repository": item.repository,
         "source_requirements": list(item.source_requirements),
-        "maintenance_objectives": list(item.maintenance_objectives),
-        "acceptance_criteria": [criterion.model_dump() for criterion in item.acceptance_criteria],
         "plan_id": plan.plan.id,
         "node_key": item.key,
         "plan_version": plan.plan.version,
-        "agent_eligibility": item.agent_eligibility.model_dump(),
+        "agent_eligibility": item.agent_eligibility.eligible,
         "planning_commit": plan.plan.approved_planning_commit,
     }
 
 
 def create_fields(plan: BacklogPlan, item: BacklogItem) -> dict[str, Any]:
     """Publisher-owned fields plus lifecycle defaults used only at creation."""
-    return {**managed_fields(plan, item), "evidence_state": "pending"}
+    return {
+        **managed_fields(plan, item),
+        "evidence_state": "pending",
+    }
 
 
 def managed_hash(plan: BacklogPlan, item: BacklogItem) -> str:

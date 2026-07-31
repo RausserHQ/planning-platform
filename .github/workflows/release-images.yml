@@ -1,0 +1,186 @@
+name: Build planning platform images
+
+on:
+  push:
+    tags:
+      - v0.1.0
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: planning-platform-images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  PLANNER_IMAGE: ghcr.io/rausserhq/planning-platform/planner
+  PLANNER_TAG: v0.1.0
+  WINDMILL_IMAGE: ghcr.io/rausserhq/planning-platform/windmill
+  WINDMILL_SOURCE_IMAGE: ghcr.io/rausserhq/planning-platform/windmill-source
+  WINDMILL_TAG: v1.775.2-planning.1
+  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.1
+  WINDMILL_SHA: 64ec1aa490ab5537a73bcb6f6b7e926c6339af39
+
+jobs:
+  planner:
+    runs-on: rausserhq-docker-ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push planner
+        id: planner
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: apps/planner-api/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.PLANNER_IMAGE }}:${{ env.PLANNER_TAG }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=planning-platform-planner
+          cache-to: type=gha,mode=max,scope=planning-platform-planner
+
+      - name: Reject fixable critical planner vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.PLANNER_IMAGE }}@${{ steps.planner.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
+
+      - name: Verify planner image contract
+        env:
+          IMAGE_DIGEST: ${{ steps.planner.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="${PLANNER_IMAGE}:${PLANNER_TAG}@${IMAGE_DIGEST}"
+          docker pull --platform linux/amd64 "${image}"
+          test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "10001:10001"
+          docker run --rm --platform linux/amd64 --entrypoint planning "${image}" --help
+          echo "Planner: \`${image}\`" >>"${GITHUB_STEP_SUMMARY}"
+
+  windmill:
+    runs-on: rausserhq-docker-ci
+    steps:
+      - name: Check out planning source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Check out exact Windmill source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: windmill-labs/windmill
+          ref: ${{ env.WINDMILL_SHA }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Verify exact AGPL source and CE feature set
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = "${WINDMILL_SHA}"
+          test -z "$(git -C upstream status --porcelain)"
+          rg -n '^version = "1\.775\.2"$' upstream/backend/Cargo.toml
+          ! rg -n 'features=.enterprise.|features = .enterprise.' upstream/Dockerfile
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: 0.11.27
+          enable-cache: true
+
+      - name: Build planning wheel
+        run: |
+          rm -rf dist
+          uv build --wheel --out-dir dist
+          uv export --frozen --no-dev --no-emit-project --no-header \
+            --no-annotate --format requirements.txt \
+            --output-file dist/requirements.lock
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Windmill CE from exact source
+        id: source
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.WINDMILL_SOURCE_IMAGE }}:${{ env.WINDMILL_SOURCE_TAG }}
+          build-args: |
+            features=
+            WM_BUILD_VERSION=v1.775.2
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=planning-platform-windmill-source
+          cache-to: type=gha,mode=max,scope=planning-platform-windmill-source
+
+      - name: Add the deterministic lifecycle package
+        id: windmill
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/windmill/extend.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.WINDMILL_IMAGE }}:${{ env.WINDMILL_TAG }}
+          build-args: |
+            WINDMILL_BASE=${{ env.WINDMILL_SOURCE_IMAGE }}:${{ env.WINDMILL_SOURCE_TAG }}@${{ steps.source.outputs.digest }}
+            PLANNING_PLATFORM_VERSION=0.1.0
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=planning-platform-windmill-extension
+          cache-to: type=gha,mode=max,scope=planning-platform-windmill-extension
+
+      - name: Reject fixable critical Windmill vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.WINDMILL_IMAGE }}@${{ steps.windmill.outputs.digest }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL
+
+      - name: Verify Windmill image contract
+        env:
+          IMAGE_DIGEST: ${{ steps.windmill.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="${WINDMILL_IMAGE}:${WINDMILL_TAG}@${IMAGE_DIGEST}"
+          docker pull --platform linux/amd64 "${image}"
+          test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "1000:1000"
+          docker run --rm --platform linux/amd64 --entrypoint python3 "${image}" -c \
+            'from importlib.metadata import version; print(version("planning-platform"))'
+          docker run --rm --platform linux/amd64 --entrypoint wmill "${image}" --version \
+            | rg '1\.775\.2'
+          {
+            echo "Windmill source: \`${WINDMILL_SHA}\` (AGPL v3)"
+            echo "Windmill source image: \`${WINDMILL_SOURCE_IMAGE}:${WINDMILL_SOURCE_TAG}@${{ steps.source.outputs.digest }}\`"
+            echo "Windmill runtime: \`${image}\`"
+          } >>"${GITHUB_STEP_SUMMARY}"

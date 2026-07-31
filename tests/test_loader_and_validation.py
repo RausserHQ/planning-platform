@@ -150,7 +150,29 @@ def test_typed_model_cannot_bypass_schema_and_relation_projection_limits() -> No
     changed = plan.model_copy(update={"items": (invalid,)})
     codes = {issue.code for issue in validate_plan(changed)}
     assert "schema_contract" in codes
-    assert "conflicting_relation_semantics" in codes
+    assert "openproject_relation_collision" in codes
+
+
+def test_relation_collision_uses_exact_openproject_stored_direction() -> None:
+    plan = load_plan(FIXTURES / "single-repository/backlog.yaml")
+    aaa = plan.items[0].model_copy(update={"key": "aaa", "blocked_by": ("bbb",)})
+    bbb = plan.items[0].model_copy(update={"key": "bbb", "sequence_after": ("aaa",)})
+    colliding = plan.model_copy(update={"items": (aaa, bbb)})
+    assert "openproject_relation_collision" in {issue.code for issue in validate_plan(colliding)}
+
+    # `aaa blocked_by bbb` stores bbb -> aaa; `aaa sequence_after bbb`
+    # stores aaa -> bbb. OpenProject permits these opposite ordered pairs.
+    permitted = plan.model_copy(
+        update={
+            "items": (
+                aaa.model_copy(update={"sequence_after": ("bbb",)}),
+                bbb.model_copy(update={"sequence_after": (), "blocked_by": ()}),
+            )
+        }
+    )
+    assert "openproject_relation_collision" not in {
+        issue.code for issue in validate_plan(permitted)
+    }
 
 
 @given(st.text(min_size=1, max_size=20))

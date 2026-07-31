@@ -1,0 +1,7 @@
+schedule: "0 17 3 * * *"
+timezone: America/Los_Angeles
+script_path: f/planning/nightly_reconciliation
+is_flow: true
+args: {}
+on_failure: ""
+enabled: true

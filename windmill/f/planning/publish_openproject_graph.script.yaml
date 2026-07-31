@@ -1,0 +1,12 @@
+summary: Publish an approved planning graph
+description: Applies a merge-bound, journaled OpenProject publication.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - event

@@ -22,6 +22,7 @@ OperationKind = Literal[
     "set_parent",
     "create_relation",
     "remove_managed_relation",
+    "reactivate_work_package",
     "mark_superseded",
     "record_audit",
 ]
@@ -96,7 +97,16 @@ def _relations(plan: BacklogPlan, item: BacklogItem) -> set[ManagedRelation]:
     relations: set[ManagedRelation] = set()
     relations.update(("blocked_by", (plan_id, target)) for target in item.blocked_by)
     relations.update(("sequence_after", (plan_id, target)) for target in item.sequence_after)
-    relations.update(("related_to", (plan_id, target)) for target in item.related_to)
+    # OpenProject permits only one relation for an endpoint pair.  The lower
+    # identity owns it globally, irrespective of which endpoint declared the
+    # one-sided relation.  This retains a valid `z related_to a` declaration
+    # while making a two-sided declaration converge to one native relation.
+    related_pairs = {
+        tuple(sorted((source.key, target))) for source in plan.items for target in source.related_to
+    }
+    relations.update(
+        ("related_to", (plan_id, target)) for source, target in related_pairs if source == item.key
+    )
     relations.update(("decision_required", (plan_id, target)) for target in item.decision_required)
     relations.update(("governed_by", (plan_id, target)) for target in item.decisions)
     return relations
@@ -115,7 +125,37 @@ def _existing_preconditions(
 ) -> dict[str, Any]:
     conditions = _preconditions(plan, snapshot, expected)
     conditions["identity_resolved"] = True
+    conditions.update(_topology_preconditions(package))
     return conditions
+
+
+def _topology_preconditions(
+    package: WorkPackageSnapshot | None,
+    *,
+    parent_identity: Identity | None | object = ...,  # ... means observe package
+    managed_relations: set[ManagedRelation] | None = None,
+) -> dict[str, Any]:
+    """Record planning topology separately from managed content.
+
+    An unmanaged native parent is intentionally distinct from no parent: both
+    have no planning identity, but replacing either blindly would discard a
+    concurrent human topology edit.
+    """
+    if parent_identity is ...:
+        assert package is not None
+        parent_identity = package.parent_identity
+    if managed_relations is None:
+        assert package is not None
+        managed_relations = set(package.managed_relations)
+    return {
+        "expected_parent_identity": parent_identity,
+        "expected_unmanaged_parent": bool(
+            package is not None
+            and package.parent_id is not None
+            and package.parent_identity is None
+        ),
+        "expected_managed_relations": [list(value) for value in sorted(managed_relations)],
+    }
 
 
 def plan_diff(
@@ -156,7 +196,20 @@ def plan_diff(
         package = existing.get(identity)
         after = managed_hash(plan, item)
         initial_hash = None if package is None else package.managed_hash
-        if package is not None and (package.managed_hash != after or package.superseded):
+        if package is not None and package.superseded:
+            operations.append(
+                _operation(
+                    plan,
+                    "reactivate_work_package",
+                    identity,
+                    before=initial_hash,
+                    after=initial_hash,
+                    trace_id=trace_id,
+                    payload={"status": "Ready"},
+                    preconditions=_existing_preconditions(plan, snapshot, package, initial_hash),
+                )
+            )
+        if package is not None and package.managed_hash != after:
             operations.append(
                 _operation(
                     plan,
@@ -172,7 +225,10 @@ def plan_diff(
 
         desired_parent = None if item.parent is None else (plan.plan.id, item.parent)
         current_parent = None if package is None else package.parent_identity
-        if current_parent != desired_parent:
+        parent_changed = current_parent != desired_parent or (
+            desired_parent is None and package is not None and package.parent_id is not None
+        )
+        if parent_changed:
             if package is None:
                 conditions = _preconditions(plan, snapshot, after)
                 conditions["identity_resolved"] = True
@@ -187,9 +243,21 @@ def plan_diff(
                     after=after,
                     trace_id=trace_id,
                     payload={"parent_identity": desired_parent},
-                    preconditions=conditions,
+                    preconditions={
+                        **conditions,
+                        **_topology_preconditions(
+                            package,
+                            parent_identity=current_parent,
+                            managed_relations=(
+                                set() if package is None else set(package.managed_relations)
+                            ),
+                        ),
+                    },
                 )
             )
+        # Later mutations observe the hierarchy as it will exist after this
+        # deterministic parent operation, not the stale input snapshot.
+        virtual_parent = desired_parent if parent_changed else current_parent
 
         desired_relations = _relations(plan, item)
         current_relations: set[ManagedRelation] = (
@@ -198,9 +266,19 @@ def plan_diff(
         if package is None:
             relation_conditions = _preconditions(plan, snapshot, after)
             relation_conditions["identity_resolved"] = True
+            virtual_relations: set[ManagedRelation] = set()
         else:
             relation_conditions = _existing_preconditions(plan, snapshot, package, after)
+            virtual_relations = set(package.managed_relations)
         for relation in sorted(desired_relations - current_relations):
+            conditions = {
+                **relation_conditions,
+                **_topology_preconditions(
+                    package,
+                    parent_identity=virtual_parent,
+                    managed_relations=virtual_relations,
+                ),
+            }
             operations.append(
                 _operation(
                     plan,
@@ -210,10 +288,19 @@ def plan_diff(
                     after=after,
                     trace_id=trace_id,
                     payload=_relation_payload(relation),
-                    preconditions=relation_conditions,
+                    preconditions=conditions,
                 )
             )
+            virtual_relations.add(relation)
         for relation in sorted(current_relations - desired_relations):
+            conditions = {
+                **relation_conditions,
+                **_topology_preconditions(
+                    package,
+                    parent_identity=virtual_parent,
+                    managed_relations=virtual_relations,
+                ),
+            }
             operations.append(
                 _operation(
                     plan,
@@ -223,9 +310,10 @@ def plan_diff(
                     after=after,
                     trace_id=trace_id,
                     payload=_relation_payload(relation),
-                    preconditions=relation_conditions,
+                    preconditions=conditions,
                 )
             )
+            virtual_relations.remove(relation)
 
     for identity, package in sorted(existing.items()):
         if identity[0] != plan.plan.id or identity[1] in desired_keys or package.superseded:

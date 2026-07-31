@@ -1,0 +1,53 @@
+name: Validate planning platform
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: planning-platform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.9
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PLANNER_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/postgres
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: 0.11.27
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Validate source, contracts, and PostgreSQL recovery
+        run: make check
+
+      - name: Validate OpenProject bootstrap syntax
+        run: ruby -c openproject/bootstrap/17.6.0/bootstrap.rb
+
+      - name: Validate clean generated state
+        run: git diff --exit-code

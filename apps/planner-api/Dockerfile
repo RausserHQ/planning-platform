@@ -4,9 +4,14 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
 WORKDIR /build
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
-RUN python -m pip wheel --wheel-dir /wheels .
+RUN python -m pip install "uv==0.11.27" \
+    && uv export --frozen --no-dev --no-emit-project --no-header \
+      --no-annotate --format requirements.txt --output-file requirements.lock \
+    && python -m pip wheel --require-hashes --wheel-dir /wheels \
+      --requirement requirements.lock \
+    && python -m pip wheel --no-deps --wheel-dir /wheels .
 
 FROM python:3.12.11-slim-bookworm@sha256:519591d6871b7bc437060736b9f7456b8731f1499a57e22e6c285135ae657bf7
 
@@ -18,7 +23,8 @@ RUN groupadd --gid 10001 planner \
     && useradd --uid 10001 --gid planner --no-create-home --shell /usr/sbin/nologin planner \
     && python -m venv /opt/venv
 COPY --from=builder /wheels /wheels
-RUN /opt/venv/bin/pip install --no-cache-dir /wheels/* \
+RUN /opt/venv/bin/pip install --no-cache-dir --no-index \
+      --find-links=/wheels planning-platform==0.1.0 \
     && rm -rf /wheels
 
 USER 10001:10001

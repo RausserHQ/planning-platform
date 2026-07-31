@@ -98,27 +98,53 @@ def validate_plan(
     dependency_edges = {
         item.key: {key for key in item.blocked_by if key in known} for item in plan.items
     }
+    # OpenProject enforces uniqueness by stored endpoint pair, irrespective of
+    # relation type.  Reject semantic combinations that cannot coexist before
+    # publication rather than making an adapter choose a destructive winner.
+    stored_pairs: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    symmetric_pairs: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for item in plan.items:
-        relation_fields = {
-            "blocked_by": item.blocked_by,
-            "sequence_after": item.sequence_after,
-            "related_to": item.related_to,
-            "decision_required": item.decision_required,
-            "decisions": item.decisions,
-        }
-        relation_uses: dict[str, list[str]] = {}
-        for field, targets in relation_fields.items():
-            for target in targets:
-                relation_uses.setdefault(target, []).append(field)
-        for target, fields in sorted(relation_uses.items()):
-            if len(fields) > 1:
+        for field in ("blocked_by", "sequence_after", "decision_required", "decisions"):
+            semantic = "governed_by" if field == "decisions" else field
+            for target in getattr(item, field):
+                # These are the canonical OpenProject v17.6 `(from, to)`
+                # endpoints after relation-type projection. Uniqueness is
+                # enforced on that ordered pair irrespective of native type.
+                pair = (target, item.key) if semantic == "blocked_by" else (item.key, target)
+                stored_pairs.setdefault(pair, []).append((semantic, item.key))
+        for target in item.related_to:
+            pair = (item.key, target) if item.key <= target else (target, item.key)
+            symmetric_pairs.setdefault(pair, []).append(("related_to", item.key))
+    for pair, uses in sorted(stored_pairs.items()):
+        if len(uses) > 1:
+            for _, node_key in uses:
                 issues.append(
                     ValidationIssue(
-                        "conflicting_relation_semantics",
-                        f"{target} is referenced by multiple relation kinds: {', '.join(fields)}",
-                        item.key,
+                        "openproject_relation_collision",
+                        f"stored endpoint pair {pair[0]}:{pair[1]} has incompatible semantics",
+                        node_key,
                     )
                 )
+    # `related_to` is canonicalized by OpenProject numeric ID, which is not
+    # knowable from a plan. Any directed relation on the same unordered pair
+    # can therefore collide in one of the two possible ID orders.
+    for pair, related_uses in sorted(symmetric_pairs.items()):
+        directed_uses = [
+            use
+            for endpoints, uses in stored_pairs.items()
+            if tuple(sorted(endpoints)) == pair
+            for use in uses
+        ]
+        if directed_uses:
+            for _, node_key in (*related_uses, *directed_uses):
+                issues.append(
+                    ValidationIssue(
+                        "openproject_relation_collision",
+                        f"stored endpoint pair {pair[0]}:{pair[1]} has incompatible semantics",
+                        node_key,
+                    )
+                )
+    for item in plan.items:
         if item.repository not in repositories:
             issues.append(
                 ValidationIssue(

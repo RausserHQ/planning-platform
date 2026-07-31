@@ -1,0 +1,15 @@
+*
+!LICENSE
+!README.md
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!apps/
+!apps/planner-api/
+!apps/planner-api/Dockerfile
+!deploy/
+!deploy/windmill/
+!deploy/windmill/extend.Dockerfile
+!dist/
+!dist/**

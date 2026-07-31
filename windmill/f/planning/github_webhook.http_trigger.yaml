@@ -1,0 +1,10 @@
+script_path: f/planning/github_webhook
+is_flow: true
+route_path: planning/github
+http_method: post
+request_type: async
+authentication_method: none
+is_static_website: false
+workspaced_route: false
+wrap_body: false
+raw_string: true

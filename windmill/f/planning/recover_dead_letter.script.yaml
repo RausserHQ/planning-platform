@@ -1,0 +1,22 @@
+summary: Recover one trusted dead-lettered delivery
+description: Requires an operator identity and reason, audits authorization, and token-fences the replay.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+    operator:
+      type: string
+      minLength: 1
+      maxLength: 255
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 1024
+  required:
+    - event
+    - operator
+    - reason

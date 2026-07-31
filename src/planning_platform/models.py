@@ -108,9 +108,5 @@ class BacklogPlan(ContractModel):
 def with_approved_commit(plan: BacklogPlan, approved_commit: str) -> BacklogPlan:
     """Materialize the merge commit in memory without changing the approved artifact bytes."""
     return plan.model_copy(
-        update={
-            "plan": plan.plan.model_copy(
-                update={"approved_planning_commit": approved_commit}
-            )
-        }
+        update={"plan": plan.plan.model_copy(update={"approved_planning_commit": approved_commit})}
     )

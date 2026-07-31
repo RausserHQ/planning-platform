@@ -1,0 +1,32 @@
+summary: Scheduled full planning reconciliation
+description: Detects durable drift and performs only unambiguous deterministic repairs.
+value:
+  modules:
+    - id: reconcile
+      value:
+        type: script
+        path: f/planning/nightly_reconciliation
+        input_transforms: {}
+      retry:
+        exponential:
+          attempts: 3
+          seconds: 30
+          multiplier: 4
+          random_factor: 0
+  failure_module:
+    id: failure
+    value:
+      type: script
+      path: f/planning/dead_letter
+      input_transforms:
+        event:
+          type: javascript
+          expr: previous_result.event ?? {}
+        error:
+          type: javascript
+          expr: previous_result
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties: {}
+  required: []
