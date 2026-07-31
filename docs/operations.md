@@ -1,0 +1,116 @@
+# Operator runbook
+
+Production state is reconciled from `RausserHQ/homelab-platform`; this
+repository supplies application images, OpenProject bootstrap logic, and the
+Git-synced Windmill workspace. Do not make durable configuration changes in a
+pod.
+
+## Deployment order
+
+1. Reconcile the CloudNativePG roles/databases and SOPS secrets.
+   `PLANNING_RECOVERY_KEY_B64` must be canonical base64 for exactly 32 random
+   bytes and must be mounted only in Windmill workers and lifecycle migration
+   Jobs.
+2. Run `planning-planner-migrate` against the planner database.
+3. Run `planning-lifecycle-migrate` against the Windmill lifecycle database.
+   This creates the delivery, correlation, audit, and publication-journal
+   schemas under one advisory migration fence.
+4. Install OpenProject 17.6.0 and run
+   `openproject/bootstrap/17.6.0/bootstrap.rb` once through the pinned seeder
+   image.
+5. Install Windmill CE 1.775.2 and sync `windmill/` with CLI 1.775.2.
+6. Start planner and Windmill workers, then enable the signed webhook routes.
+
+All migrations are explicit Jobs. Application startup is read-only with
+respect to schema and reports not-ready when any required table is absent.
+
+## Readiness checks
+
+```bash
+curl -fsS http://planner-api.planning-platform.svc:8080/health/ready
+curl -fsS http://openproject.planning-platform.svc/api/v3
+curl -fsS http://windmill.planning-platform.svc/api/version
+```
+
+Confirm the planner Deployment and OpenProject/Windmill HelmReleases are
+Available/Ready, the three databases accept only their owning roles, the
+nightly schedule is enabled, and both webhook triggers retain `raw_string:
+true`.
+
+## Windmill sync
+
+Use an installation-scoped deploy token injected into the one-shot sync Job.
+Preview before the first production import:
+
+```bash
+wmill sync push --dry-run
+wmill sync push
+```
+
+The workspace is `planning`; Git owns scripts, flows, schedules, and triggers.
+Secrets, users, groups, and settings are deliberately excluded from sync.
+The custom worker image supplies this package through
+`ADDITIONAL_PYTHON_PATHS`; it filters only the local
+`planning-platform` dependency.
+
+## Recovery
+
+- A retryable failure expires only its token-fenced lease. A heartbeat keeps a
+  live owner from being reclaimed.
+- A terminal failure is visible in Windmill and
+  `planning_lifecycle.delivery_deduplications`.
+- Run `dead_letter_recovery` only with the original trusted envelope, an
+  operator identity, and a written reason. Recovery is audited and rotates the
+  claim token. A failed recovery atomically returns the delivery to
+  `dead_letter`, so a later authorized attempt remains possible.
+- Publication conflicts move the Idea to `Blocked`, post the exact safe
+  conflict, and perform no overwrite. Regenerate against a fresh snapshot.
+- Nightly reconciliation repairs missed merged-planning-PR events, restores a
+  missing `Needs Input` status, and unblocks or blocks work only when the
+  approved graph makes the transition unambiguous. Other drift is reported.
+
+Never edit a delivery row, publication journal, LangGraph checkpoint, or
+OpenProject managed hash by hand.
+
+Crash-only planner start/resume payloads are AES-256-GCM ciphertext bound to
+the exact thread and operation purpose. Raw Idea text, repository file
+content, and human answers are not stored in lifecycle tables. Back up the
+SOPS recovery key with the database; losing it makes only an interrupted
+request unrecoverable. Key rotation requires draining lifecycle workers and
+re-encrypting any nonterminal ciphertext before the old key is removed.
+
+## Backup and restore
+
+CloudNativePG/Barman is the database backup authority. OpenProject attachments
+use the dedicated versioned S3 bucket. A restore drill must create isolated
+databases and a test namespace, restore all three databases plus attachment
+objects, keep webhook routes disabled, and prove:
+
+1. planner thread reads and an interrupted resume;
+2. Windmill delivery/audit history;
+3. OpenProject work packages, relations, comments, and attachments;
+4. an unchanged approved plan dry-runs to zero operations.
+
+The isolated restore must receive the matching SOPS recovery key without
+printing it. Prove that one nonterminal encrypted crash payload can be opened
+through the normal service path; do not query or dump its plaintext from SQL.
+
+Delete the isolated restore only after recording backup identifiers, timestamps,
+row/object counts, and redacted command results.
+
+## Upgrade and rollback
+
+Change one pinned application image/chart at a time. Back up first, retain the
+previous digest, run migrations before workloads, and exercise a canary Idea.
+Rollback application images through Git. Never roll a database schema backward
+unless the release runbook includes a tested reverse migration; otherwise
+restore the pre-upgrade backup into isolated databases and promote only after
+validation.
+
+## Image release
+
+Only the exact `v0.1.0` Git tag starts the image workflow. The workflow builds
+runtime dependencies from the committed `uv.lock` with hash enforcement,
+builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
+blocks on fixable critical Trivy findings. GitOps consumes the resulting
+immutable digests, never the mutable display tags.

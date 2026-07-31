@@ -1,0 +1,41 @@
+summary: Explicit audited dead-letter recovery
+description: Replays one trusted event only after an operator supplies its original envelope.
+value:
+  modules:
+    - id: lifecycle
+      value:
+        type: script
+        path: f/planning/recover_dead_letter
+        input_transforms:
+          event:
+            type: javascript
+            expr: flow_input.event
+          operator:
+            type: javascript
+            expr: flow_input.operator
+          reason:
+            type: javascript
+            expr: flow_input.reason
+      retry:
+        constant:
+          attempts: 1
+          seconds: 1
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+    operator:
+      type: string
+      minLength: 1
+      maxLength: 255
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 1024
+  required:
+    - event
+    - operator
+    - reason

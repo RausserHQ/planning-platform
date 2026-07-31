@@ -1,0 +1,12 @@
+summary: Execute one verified planning lifecycle delivery
+description: Claims a durable delivery lease and coordinates deterministic external effects.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - event

@@ -1,0 +1,59 @@
+summary: Verified OpenProject planning webhook ingress
+description: Preserves the exact HTTP request, verifies HMAC SHA-1, then executes one durable lifecycle delivery.
+value:
+  modules:
+    - id: verify
+      value:
+        type: script
+        path: f/planning/verify_webhook
+        input_transforms:
+          source:
+            type: static
+            value: openproject
+          event:
+            type: javascript
+            expr: flow_input.event
+    - id: lifecycle
+      value:
+        type: script
+        path: f/planning/lifecycle_job
+        input_transforms:
+          event:
+            type: javascript
+            expr: results.verify
+      retry:
+        exponential:
+          attempts: 4
+          seconds: 1
+          multiplier: 5
+          random_factor: 0
+  preprocessor_module:
+    id: preprocessor
+    value:
+      type: rawscript
+      language: python3
+      content: |
+        def preprocessor(event):
+            return {"event": event}
+      input_transforms: {}
+  failure_module:
+    id: failure
+    value:
+      type: script
+      path: f/planning/dead_letter
+      input_transforms:
+        event:
+          type: javascript
+          expr: results.verify ?? flow_input.event
+        error:
+          type: javascript
+          expr: previous_result
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - event

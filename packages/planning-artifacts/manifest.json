@@ -1,0 +1,14 @@
+{
+  "source": "https://github.com/bmad-code-org/BMAD-METHOD",
+  "version": "6.10.0",
+  "commit": "081e64ee5aab2316b912883f7bee528ee143ce36",
+  "license": "MIT",
+  "adapted_concepts": [
+    "compact specification",
+    "product requirements",
+    "architecture",
+    "decisions",
+    "epic and story decomposition",
+    "decomposition critique"
+  ]
+}

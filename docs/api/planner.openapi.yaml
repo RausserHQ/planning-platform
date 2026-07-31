@@ -16,9 +16,9 @@ paths:
       operationId: ready
       responses:
         "200":
-          description: Database and graph are ready
+          description: Database, planner migration, and checkpoint tables are ready
         "503":
-          description: A required dependency is unavailable
+          description: A required dependency or migration is unavailable
   /metrics:
     get:
       operationId: metrics
@@ -28,7 +28,9 @@ paths:
   /v1/plans:
     post:
       operationId: startPlan
-      summary: Start or idempotently resume a planning thread
+      summary: Start or recover a planning thread idempotently
+      security:
+        - InternalToken: []
       requestBody:
         required: true
         content:
@@ -37,7 +39,7 @@ paths:
               $ref: "#/components/schemas/StartPlanRequest"
       responses:
         "200":
-          description: Existing idempotent result
+          description: Existing idempotent result or recovered durable result
           content:
             application/json:
               schema:
@@ -48,11 +50,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlanResponse"
+        "401":
+          description: Internal authentication failed
         "409":
-          description: Same idempotency key with a different request
+          description: Request identity conflicts or the matching claim is still in progress
+        "422":
+          description: Request, binding digest, date, or immutable repository snapshot is invalid
   /v1/plans/{thread_id}:
     get:
       operationId: getPlan
+      security:
+        - InternalToken: []
       parameters:
         - $ref: "#/components/parameters/ThreadId"
       responses:
@@ -62,11 +70,40 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlanResponse"
+        "401":
+          description: Internal authentication failed
         "404":
           description: Thread not found
+        "422":
+          description: Thread ID is invalid
+  /v1/plans/{thread_id}/artifacts:
+    get:
+      operationId: getPlanArtifacts
+      summary: Retrieve exact hash-verified artifact bytes for internal publication
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/ThreadId"
+      responses:
+        "200":
+          description: Exact durable artifact bytes and hashes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactBundle"
+        "401":
+          description: Internal authentication failed
+        "404":
+          description: Thread not found
+        "409":
+          description: Artifacts are not ready
+        "422":
+          description: Thread ID is invalid
   /v1/plans/{thread_id}/resume:
     post:
       operationId: resumePlan
+      security:
+        - InternalToken: []
       parameters:
         - $ref: "#/components/parameters/ThreadId"
       requestBody:
@@ -77,14 +114,26 @@ paths:
               $ref: "#/components/schemas/ResumePlanRequest"
       responses:
         "200":
-          description: Thread resumed or an existing resume replayed
+          description: Thread resumed, recovered, or an existing resume replayed
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PlanResponse"
+        "401":
+          description: Internal authentication failed
+        "404":
+          description: Thread not found
         "409":
-          description: Comment is stale, already bound, or does not match interrupt
+          description: Comment is stale, already bound, mismatched, or currently in progress
+        "422":
+          description: Thread ID, request, or date is invalid
 components:
+  securitySchemes:
+    InternalToken:
+      type: apiKey
+      in: header
+      name: X-Planning-Internal-Token
+      description: Internal credential for authenticated planner operations.
   parameters:
     ThreadId:
       in: path
@@ -94,30 +143,87 @@ components:
         type: string
         pattern: "^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$"
   schemas:
+    PlannerEvent:
+      type: object
+      required: [idempotency_key, trace_id]
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 255
+        trace_id:
+          type: string
+          format: uuid
+      additionalProperties: true
+    IdeaSnapshot:
+      type: object
+      additionalProperties: false
+      required: [work_package_id, lock_version, updated_at, title]
+      properties:
+        work_package_id:
+          type: integer
+          minimum: 1
+        lock_version:
+          type: integer
+          minimum: 0
+        updated_at:
+          type: string
+          format: date-time
+        title:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          default: ""
+          maxLength: 65536
+    OpenProjectSnapshotInput:
+      type: object
+      additionalProperties: false
+      required: [captured_at, etag, sha256]
+      properties:
+        captured_at:
+          type: string
+          format: date-time
+        etag:
+          type: string
+          minLength: 1
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+    RepositoryFile:
+      type: object
+      additionalProperties: false
+      required: [path, sha256, content]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 512
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        content:
+          type: string
+          maxLength: 262144
     RepositorySnapshot:
       type: object
       additionalProperties: false
-      required: [name, commit, files]
+      required: [name, commit, snapshot_sha256, files]
       properties:
         name:
           type: string
+          pattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
         commit:
           type: string
           pattern: "^[0-9a-f]{40}$"
+        snapshot_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
         files:
           type: array
+          maxItems: 500
           items:
-            type: object
-            additionalProperties: false
-            required: [path, sha256, content]
-            properties:
-              path:
-                type: string
-              sha256:
-                type: string
-                pattern: "^[0-9a-f]{64}$"
-              content:
-                type: string
+            $ref: "#/components/schemas/RepositoryFile"
     StartPlanRequest:
       type: object
       additionalProperties: false
@@ -126,23 +232,29 @@ components:
         - idea
         - plan_id
         - plan_version
+        - idea_sha256
         - openproject_snapshot
         - repositories
       properties:
         event:
-          type: object
+          $ref: "#/components/schemas/PlannerEvent"
         idea:
-          type: object
+          $ref: "#/components/schemas/IdeaSnapshot"
         plan_id:
           type: string
+          pattern: "^[a-z0-9][a-z0-9-]{2,63}$"
         plan_version:
           type: integer
           minimum: 1
+        idea_sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
         openproject_snapshot:
-          type: object
+          $ref: "#/components/schemas/OpenProjectSnapshotInput"
         repositories:
           type: array
           minItems: 1
+          maxItems: 20
           items:
             $ref: "#/components/schemas/RepositorySnapshot"
     ResumePlanRequest:
@@ -151,9 +263,10 @@ components:
       required: [event, interrupt_id, comment_id, comment_created_at, answer]
       properties:
         event:
-          type: object
+          $ref: "#/components/schemas/PlannerEvent"
         interrupt_id:
           type: string
+          minLength: 1
         comment_id:
           type: integer
           minimum: 1
@@ -163,22 +276,78 @@ components:
         answer:
           type: string
           minLength: 1
+          maxLength: 65536
+    ArtifactManifestEntry:
+      type: object
+      additionalProperties: false
+      required: [path, sha256]
+      properties:
+        path:
+          type: string
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        required:
+          type: boolean
+          default: true
+    PendingInterrupt:
+      type: object
+      additionalProperties: false
+      required: [interrupt_id, questions, impact, created_at]
+      properties:
+        interrupt_id:
+          type: string
+        questions:
+          type: array
+          items:
+            type: string
+        impact:
+          type: string
+          minLength: 1
+          maxLength: 1024
+        created_at:
+          type: string
+          format: date-time
     PlanResponse:
       type: object
       additionalProperties: false
-      required: [thread_id, status, trace_id, artifact_manifest]
+      required: [thread_id, status, trace_id, interrupt, artifact_manifest]
       properties:
         thread_id:
           type: string
         status:
+          type: string
           enum: [planning, needs_input, artifacts_ready, failed]
         trace_id:
           type: string
-          format: uuid
         interrupt:
-          type: [object, "null"]
+          anyOf:
+            - $ref: "#/components/schemas/PendingInterrupt"
+            - type: "null"
         artifact_manifest:
           type: array
           items:
-            type: object
-
+            $ref: "#/components/schemas/ArtifactManifestEntry"
+    ArtifactContent:
+      type: object
+      additionalProperties: false
+      required: [path, sha256, content]
+      properties:
+        path:
+          type: string
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        content:
+          type: string
+    ArtifactBundle:
+      type: object
+      additionalProperties: false
+      required: [thread_id, artifacts]
+      properties:
+        thread_id:
+          type: string
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ArtifactContent"

@@ -1,0 +1,18 @@
+summary: Verify and normalize a planning webhook
+description: Verifies the exact raw request body before producing a trusted event envelope.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    source:
+      type: string
+      enum:
+        - github
+        - openproject
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - source
+    - event

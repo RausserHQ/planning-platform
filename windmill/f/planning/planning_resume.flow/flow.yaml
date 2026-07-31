@@ -1,0 +1,26 @@
+summary: Resume the exact durable LangGraph interrupt
+description: Resumes only the matching thread and interrupt with replay protection.
+value:
+  modules:
+    - id: lifecycle
+      value:
+        type: script
+        path: f/planning/lifecycle_job
+        input_transforms:
+          event: {type: javascript, expr: flow_input.event}
+      retry:
+        exponential: {attempts: 4, seconds: 1, multiplier: 5, random_factor: 0}
+  failure_module:
+    id: failure
+    value:
+      type: script
+      path: f/planning/dead_letter
+      input_transforms:
+        event: {type: javascript, expr: flow_input.event}
+        error: {type: javascript, expr: previous_result}
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event: {type: object, additionalProperties: true}
+  required: [event]

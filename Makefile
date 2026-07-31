@@ -1,16 +1,15 @@
 .PHONY: test lint typecheck validate-fixtures check
 
 test:
-	python -m pytest
+	uv run python -m pytest
 
 lint:
-	python -m ruff check .
+	uv run python -m ruff check .
 
 typecheck:
-	python -m mypy src
+	uv run python -m mypy src
 
 validate-fixtures:
-	@find evals/fixtures -name backlog.yaml -print0 | xargs -0 -n1 planning validate
+	@find evals/fixtures -name backlog.yaml -exec uv run planning validate {} \;
 
 check: lint typecheck test validate-fixtures
-

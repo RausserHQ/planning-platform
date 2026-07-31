@@ -33,7 +33,6 @@ platform. Kubernetes production desired state remains in
 ```bash
 python -m pytest
 python -m ruff check .
-python -m mypy src packages
+python -m mypy src
 planning validate evals/fixtures/single-repository/backlog.yaml
 ```
-
