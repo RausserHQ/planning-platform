@@ -25,8 +25,10 @@ docs                             architecture, API, security, and operations
 
 Production uses the MIT LangGraph libraries and PostgreSQL checkpointer through
 our own API. It does not use the licensed LangGraph Agent Server. Windmill is
-built from its AGPL source without the `enterprise` feature; the official Helm
-chart is used with that image override.
+the official Community Edition image pinned to its exact linux/amd64 digest;
+the release verifies its version, upstream revision, and CE build identity
+before adding the deterministic lifecycle package. The official Helm chart is
+used with that image override.
 
 Evaluation command safety is a syntax-level, fail-closed screen. It accepts
 only known read-only tool forms and rejects absolute, home-relative, URI, and

@@ -29,8 +29,24 @@ def test_release_workflow_matches_package_version_and_windmill_revision() -> Non
         in windmill_dockerfile
     )
 
-    runtime = re.search(r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.(\d+)$", workflow)
-    source = re.search(r"(?m)^\s+WINDMILL_SOURCE_TAG: v1\.775\.2-ce-source\.(\d+)$", workflow)
-    assert runtime is not None
-    assert source is not None
-    assert runtime.group(1) == source.group(1)
+    assert re.search(
+        r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.9$",
+        workflow,
+    )
+    assert (
+        "WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@"
+        "sha256:ef39329523f4806e5cd5169ffa7af2618f39439bcf659115e8bb804c592d7132"
+        in workflow
+    )
+    assert "WINDMILL_BASE=${{ env.WINDMILL_BASE }}" in workflow
+    assert "{{.Image.OS}}/{{.Image.Architecture}}" in workflow
+    assert '"linux/amd64"' in workflow
+    assert "org.opencontainers.image.version" in workflow
+    assert "org.opencontainers.image.revision" in workflow
+    assert "org.opencontainers.image.source" in workflow
+    assert "grep -F 'features=ce'" in workflow
+    assert "grep -F 'features=ee'" in workflow
+    assert "Check out exact Windmill source" not in workflow
+    assert "Build and push Windmill CE from exact source" not in workflow
+    assert "WINDMILL_SOURCE_IMAGE" not in workflow
+    assert "WINDMILL_SOURCE_TAG" not in workflow

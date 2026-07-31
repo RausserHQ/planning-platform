@@ -48,7 +48,9 @@ Release jobs are tag-only. Every privileged third-party action is pinned to a
 commit, Python runtime dependencies are installed from the hash-bearing lock
 export, images include SBOM/provenance attestations, and a pinned Trivy action
 rejects fixable critical findings before a digest is promoted to GitOps. The
-Windmill extension upgrades the runtime npm bundle to exact npm `11.19.0` and
-asserts its fixed `tar` `7.5.19` dependency before installing the pinned
-Windmill CLI; this closes the upstream runtime image's fixable
-`CVE-2026-59873` without weakening the scanner.
+Windmill extension starts from the official CE linux/amd64 image pinned by
+digest. The release verifies the base image's version, source-revision labels,
+and CE build history before use. It then upgrades the runtime npm bundle to
+exact npm `11.19.0` and asserts its fixed `tar` `7.5.19` dependency before
+installing the pinned Windmill CLI; this closes the upstream runtime image's
+fixable `CVE-2026-59873` without weakening the scanner.

@@ -58,7 +58,8 @@ links, human notes, and runtime failures are outside the managed field set.
 ## Deployment
 
 - OpenProject 17.6.0 through official chart 13.9.0.
-- Windmill chart 4.0.223 with a source-built Windmill 1.775.2 AGPL image.
+- Windmill chart 4.0.223 with the official Windmill 1.775.2 CE image pinned by
+  linux/amd64 digest and extended with the deterministic lifecycle package.
 - Planner API built from this repository.
 - One CloudNativePG cluster with separate `openproject`, `windmill`, and
   `planner` databases and login roles.

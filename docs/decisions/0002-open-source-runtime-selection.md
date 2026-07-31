@@ -1,9 +1,11 @@
 # ADR 0002: Fully open-source runtime selection
 
-- Status: Accepted
+- Status: Superseded by ADR 0003 on 2026-07-31
 - Date: 2026-07-30
 
 ## Decision
+
+This section records the original decision and is no longer active.
 
 Build the planner as a FastAPI service around the MIT LangGraph libraries and
 `langgraph-checkpoint-postgres`. Do not use the licensed LangGraph Agent
@@ -21,7 +23,6 @@ Deploy OpenProject Community 17.6.0 with official Helm chart 13.9.0.
 
 ## Consequences
 
-The platform has no runtime license-key dependency on LangChain. Windmill image
-builds are slower and must carry AGPL source/offering obligations. Upstream
-versions are explicit and reviewable.
-
+The platform had no runtime license-key dependency on LangChain. Windmill image
+builds were slower and carried AGPL source/offering obligations. Upstream
+versions remained explicit and reviewable.
