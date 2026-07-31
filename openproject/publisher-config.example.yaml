@@ -2,6 +2,7 @@
 # IDs discovered after bootstrap; the adapter never contains these IDs itself.
 base_url: https://openproject.example.internal
 project_id: 42
+alert_assignee_id: 77
 timeout_seconds: 10
 page_size: 100
 max_collection_pages: 100
@@ -38,6 +39,7 @@ custom_field_ids:
   source_requirements: 47
   planning_commit: 48
   evidence_state: 49
+  alert_fingerprint: 50
 priority_ids:
   low: 50
   medium: 51

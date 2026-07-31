@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -632,24 +632,27 @@ class PostgresLifecycleStore:
         action: str,
         outcome: str,
         details: dict[str, object],
+        connection: psycopg.Connection[Any] | None = None,
     ) -> None:
-        with psycopg.connect(self._database_url) as connection:
-            connection.execute(
-                f"""
-                INSERT INTO {self._SCHEMA}.audit
-                    (occurred_at,event_id,trace_id,action,outcome,details)
-                VALUES (%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (event_id,action,outcome) DO NOTHING
-                """,
-                (
-                    datetime.now(UTC),
-                    event_id,
-                    trace_id,
-                    action,
-                    outcome,
-                    Jsonb(details),
-                ),
-            )
+        statement = f"""
+            INSERT INTO {self._SCHEMA}.audit
+                (occurred_at,event_id,trace_id,action,outcome,details)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (event_id,action,outcome) DO NOTHING
+        """
+        parameters = (
+            datetime.now(UTC),
+            event_id,
+            trace_id,
+            action,
+            outcome,
+            Jsonb(details),
+        )
+        if connection is not None:
+            connection.execute(statement, parameters)
+            return
+        with psycopg.connect(self._database_url) as owned_connection:
+            owned_connection.execute(statement, parameters)
 
     @staticmethod
     def _restore(row: tuple[object, ...]) -> PlanRun:

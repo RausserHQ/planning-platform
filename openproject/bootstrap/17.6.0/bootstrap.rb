@@ -9,7 +9,8 @@ abort "OpenProject version mismatch" unless OpenProject::VERSION.to_semver == EX
 
 required = %w[
   PLANNING_PLATFORM_SERVICE_USER PLANNING_PLATFORM_PROJECT
-  PLANNING_PLATFORM_WEBHOOK_URL OPENPROJECT_API_TOKEN_FILE OPENPROJECT_WEBHOOK_SECRET_FILE
+  PLANNING_PLATFORM_ALERT_ASSIGNEE_LOGIN PLANNING_PLATFORM_WEBHOOK_URL
+  OPENPROJECT_API_TOKEN_FILE OPENPROJECT_WEBHOOK_SECRET_FILE
 ]
 abort "required configuration is absent" unless required.all? { |name| ENV[name].to_s.strip != "" }
 token = File.read(ENV.fetch("OPENPROJECT_API_TOKEN_FILE")).strip
@@ -29,7 +30,8 @@ FIELD_ROWS = {
   "Plan ID" => "string", "Node key" => "string", "Plan version" => "int",
   "Managed hash" => "string", "Repository" => "string", "Risk" => "string",
   "Agent eligible" => "bool", "Source requirements" => "text",
-  "Planning commit" => "string", "Evidence state" => "string"
+  "Planning commit" => "string", "Evidence state" => "string",
+  "Alert fingerprint" => "string"
 }.freeze
 IDEA_HEADINGS = ["Problem", "Desired outcome", "Why now", "Constraints", "Non-goals", "Relevant repositories", "Existing context", "Success signal"].freeze
 
@@ -72,6 +74,12 @@ ActiveRecord::Base.transaction do
     )
   end
   abort "publisher identity must be an active non-admin user" unless service_user.active? && !service_user.admin?
+  alert_login = ENV.fetch("PLANNING_PLATFORM_ALERT_ASSIGNEE_LOGIN")
+  alert_assignee = one!(
+    User.where("LOWER(login) = ?", alert_login.downcase),
+    "human alert assignee"
+  ) { abort "human alert assignee is absent" }
+  abort "alert assignee must be a distinct active person" unless alert_assignee.active? && alert_assignee != service_user
 
   api_token = Token::API.find_by_plaintext_value(token)
   if api_token.nil?
@@ -123,6 +131,36 @@ ActiveRecord::Base.transaction do
   member = Member.find_or_initialize_by(project: project, principal: service_user)
   member.roles = [role]
   member.save!
+
+  alert_role = one!(
+    ProjectRole.where("LOWER(name) = ?", "planning platform alert assignee"),
+    "alert assignee ProjectRole"
+  ) { ProjectRole.create!(name: "Planning Platform Alert Assignee") }
+  alert_role.permissions = %i[view_work_packages work_package_assigned]
+  alert_role.save!
+  Member
+    .where(project: project)
+    .joins(:member_roles)
+    .where(member_roles: { role_id: alert_role.id })
+    .where.not(user_id: alert_assignee.id)
+    .distinct
+    .find_each do |stale_member|
+      stale_member.member_roles.where(role: alert_role).destroy_all
+      stale_member.destroy! unless stale_member.member_roles.reload.exists?
+    end
+  alert_member = Member.find_or_initialize_by(project: project, principal: alert_assignee)
+  if alert_member.new_record?
+    alert_member.roles = [alert_role]
+    alert_member.save!
+  else
+    alert_member.member_roles.only_inherited.where(role: alert_role).destroy_all
+    direct_alert_roles = alert_member.member_roles.only_non_inherited.where(role: alert_role)
+    abort "duplicate direct alert assignee role" if direct_alert_roles.count > 1
+    alert_member.member_roles.create!(role: alert_role) unless direct_alert_roles.exists?
+  end
+  abort "alert assignee role mismatch" unless \
+    alert_member.member_roles.only_non_inherited.where(role: alert_role).count == 1 &&
+    alert_member.member_roles.only_inherited.where(role: alert_role).none?
 
   # Exhaustive status matrix for every publisher type/required status edge.
   types.each_value do |type|

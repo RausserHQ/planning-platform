@@ -28,6 +28,12 @@ It preserves status, assignee, comments, time entries, actual effort, PR links,
 human notes, and runtime failure information unless an approved migration
 explicitly names them.
 
+Operational alert Tasks are a separate bounded projection: `Alert fingerprint`
+is their stable identity, their generated region, priority, and Blocked/Done
+state are automation-owned, and the initial assignee is the one bootstrapped
+human alert recipient. Subject and assignee become human-owned immediately
+after creation.
+
 ## Publication operation vocabulary
 
 `create_work_package`, `update_managed_fields`, `set_parent`,

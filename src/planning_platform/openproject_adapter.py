@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -45,6 +45,7 @@ _CUSTOM_FIELD_NAMES = frozenset(
         "source_requirements",
         "planning_commit",
         "evidence_state",
+        "alert_fingerprint",
     }
 )
 
@@ -66,6 +67,7 @@ class OpenProjectAdapterConfig:
     type_ids: Mapping[str, int]
     status_ids: Mapping[str, int]
     custom_field_ids: Mapping[str, int]
+    alert_assignee_id: int
     priority_ids: Mapping[str, int] = field(default_factory=dict)
     timeout_seconds: float = 10.0
     page_size: int = 100
@@ -78,6 +80,8 @@ class OpenProjectAdapterConfig:
         if (
             type(self.project_id) is not int
             or self.project_id <= 0
+            or type(self.alert_assignee_id) is not int
+            or self.alert_assignee_id <= 0
             or self.timeout_seconds <= 0
             or type(self.page_size) is not int
             or not 1 <= self.page_size <= 1000
@@ -143,6 +147,23 @@ class PublicationEffect:
     identity: tuple[str, str]
     outcome: str
     work_package_id: int | None = None
+
+
+@dataclass(frozen=True)
+class OperationalAlert:
+    """Bounded Alertmanager state projected into one human-visible work package."""
+
+    fingerprint: str
+    name: str
+    severity: Literal["warning", "critical"]
+    state: Literal["firing", "resolved"]
+    summary: str
+    description: str
+    namespace: str
+    starts_at: str
+    ends_at: str | None
+    runbook_url: str | None
+    labels: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -934,6 +955,324 @@ class OpenProjectPublicationAdapter:
                 "OpenProject lifecycle evidence postcondition is absent"
             )
         return result
+
+    @staticmethod
+    def _operational_alert_subject(alert: OperationalAlert) -> str:
+        subject = f"[Planning alert {alert.fingerprint}] {alert.name}"
+        if len(subject) > 255:
+            raise ValueError("operational alert subject exceeds 255 characters")
+        return subject
+
+    @staticmethod
+    def _operational_alert_region(alert: OperationalAlert) -> str:
+        labels = json.dumps(
+            dict(sorted(alert.labels.items())),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        lines = [
+            "<!-- planning-platform:generated -->",
+            "## Operational alert",
+            "",
+            f"- State: **{alert.state}**",
+            f"- Severity: **{alert.severity}**",
+            f"- Fingerprint: `{alert.fingerprint}`",
+            f"- Namespace: `{alert.namespace or 'none'}`",
+            f"- Started: `{alert.starts_at}`",
+        ]
+        if alert.ends_at is not None:
+            lines.append(f"- Ended: `{alert.ends_at}`")
+        lines.extend(["", alert.summary])
+        if alert.description:
+            lines.extend(["", alert.description])
+        if alert.runbook_url is not None:
+            lines.extend(["", f"[Runbook]({alert.runbook_url})"])
+        lines.extend(["", "### Alert labels", ""])
+        lines.extend(f"    {line}" for line in labels.splitlines())
+        lines.append("<!-- /planning-platform:generated -->")
+        rendered = "\n".join(lines)
+        if len(rendered.encode("utf-8")) > 65_536:
+            raise ValueError("operational alert description exceeds 65536 bytes")
+        return rendered
+
+    def _find_operational_alert(self, fingerprint: str) -> _ResolvedPackage | None:
+        matches = [
+            raw
+            for raw in self._project_work_packages()
+            if self._field_value(raw, self._field_name("alert_fingerprint"))
+            == fingerprint
+        ]
+        if len(matches) > 1:
+            raise OpenProjectPublicationError(
+                "duplicate operational alert work packages exist"
+            )
+        if not matches:
+            marker = f"- Fingerprint: `{fingerprint}`"
+            orphaned = [
+                raw
+                for raw in self._project_work_packages()
+                if marker in self._description(raw)
+                and "<!-- planning-platform:generated -->" in self._description(raw)
+            ]
+            if orphaned:
+                raise OpenProjectPublicationError(
+                    "operational alert identity field was removed or changed"
+                )
+            return None
+        raw = matches[0]
+        description = self._description(raw)
+        if (
+            description.count("<!-- planning-platform:generated -->") != 1
+            or description.count("<!-- /planning-platform:generated -->") != 1
+            or f"- Fingerprint: `{fingerprint}`" not in description
+        ):
+            raise OpenProjectPublicationError(
+                "operational alert identity collides with non-alert content"
+            )
+        return _ResolvedPackage(snapshot=self._work_package(raw), raw=raw)
+
+    def _operational_alert_matches(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        fingerprint: str,
+        description: str,
+        status_id: int,
+        priority_id: int,
+        required_assignee_id: int | None = None,
+    ) -> bool:
+        links = raw.get("_links")
+        return (
+            self._field_value(raw, self._field_name("alert_fingerprint"))
+            == fingerprint
+            and self._description(raw) == description
+            and isinstance(links, Mapping)
+            and self._id_from_link(links.get("status")) == status_id
+            and self._id_from_link(links.get("priority")) == priority_id
+            and (
+                required_assignee_id is None
+                or self._id_from_link(links.get("assignee")) == required_assignee_id
+            )
+        )
+
+    def ensure_operational_alert(self, alert: OperationalAlert) -> PublicationEffect:
+        """Create or converge one Alertmanager fingerprint without touching human text."""
+        subject = self._operational_alert_subject(alert)
+        generated = self._operational_alert_region(alert)
+        status_id = self.config.status_ids[
+            "Blocked" if alert.state == "firing" else "Done"
+        ]
+        priority_id = self.config.priority_ids[
+            "critical" if alert.severity == "critical" else "high"
+        ]
+        identity = ("operational-alert", alert.fingerprint)
+        resolved = self._find_operational_alert(alert.fingerprint)
+        if resolved is None:
+            payload: dict[str, Any] = {
+                "subject": subject,
+                "description": {"raw": generated},
+                self._field_name("alert_fingerprint"): alert.fingerprint,
+                "_links": {
+                    "project": self._link("projects", self.config.project_id),
+                    "type": self._link("types", self.config.type_ids["Task"]),
+                    "status": self._link("statuses", status_id),
+                    "priority": self._link("priorities", priority_id),
+                    "assignee": self._link("users", self.config.alert_assignee_id),
+                },
+            }
+            validated, method, target = self._validated_form(
+                f"{_API_PREFIX}/work_packages/form",
+                payload,
+                commit_paths=(f"{_API_PREFIX}/work_packages",),
+                methods={"POST"},
+            )
+            try:
+                response = self._client.request(method, target, json=validated)
+            except httpx.TransportError as error:
+                recovered = self._find_operational_alert(alert.fingerprint)
+                if recovered is not None and self._operational_alert_matches(
+                    recovered.raw,
+                    fingerprint=alert.fingerprint,
+                    description=generated,
+                    status_id=status_id,
+                    priority_id=priority_id,
+                    required_assignee_id=self.config.alert_assignee_id,
+                ):
+                    return PublicationEffect(
+                        operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                        kind="operational_alert",
+                        identity=identity,
+                        outcome="created",
+                        work_package_id=recovered.snapshot.id,
+                    )
+                raise AmbiguousPublicationEffect(
+                    "OpenProject alert create response was lost and postcondition is absent"
+                ) from error
+            if response.status_code != 201:
+                if response.status_code == 408 or response.status_code >= 500:
+                    recovered = self._find_operational_alert(alert.fingerprint)
+                    if recovered is not None and self._operational_alert_matches(
+                        recovered.raw,
+                        fingerprint=alert.fingerprint,
+                        description=generated,
+                        status_id=status_id,
+                        priority_id=priority_id,
+                        required_assignee_id=self.config.alert_assignee_id,
+                    ):
+                        return PublicationEffect(
+                            operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                            kind="operational_alert",
+                            identity=identity,
+                            outcome="created",
+                            work_package_id=recovered.snapshot.id,
+                        )
+                    raise AmbiguousPublicationEffect(
+                        "OpenProject alert create returned a possibly committed failure"
+                    )
+                raise OpenProjectPublicationError(
+                    f"OpenProject alert create returned {response.status_code}"
+                )
+            raw = self._json(response)
+            created = self._work_package(raw)
+            if not self._operational_alert_matches(
+                raw,
+                fingerprint=alert.fingerprint,
+                description=generated,
+                status_id=status_id,
+                priority_id=priority_id,
+                required_assignee_id=self.config.alert_assignee_id,
+            ):
+                raise OpenProjectPublicationError(
+                    "OpenProject alert create postcondition is absent"
+                )
+            return PublicationEffect(
+                operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                kind="operational_alert",
+                identity=identity,
+                outcome="created",
+                work_package_id=created.id,
+            )
+
+        for attempt in range(2):
+            current = (
+                resolved
+                if attempt == 0
+                else self._find_operational_alert(alert.fingerprint)
+            )
+            if current is None:
+                raise OpenProjectConflict(
+                    "operational alert disappeared during update"
+                )
+            try:
+                description = replace_generated_description(
+                    self._description(current.raw),
+                    generated,
+                )
+            except ValueError as error:
+                raise OpenProjectPublicationError(
+                    "operational alert generated markers are malformed"
+                ) from error
+            if self._operational_alert_matches(
+                current.raw,
+                fingerprint=alert.fingerprint,
+                description=description,
+                status_id=status_id,
+                priority_id=priority_id,
+            ):
+                return PublicationEffect(
+                    operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                    kind="operational_alert",
+                    identity=identity,
+                    outcome="unchanged",
+                    work_package_id=current.snapshot.id,
+                )
+            payload = {
+                "lockVersion": current.snapshot.lock_version,
+                "description": {"raw": description},
+                "_links": {
+                    "status": self._link("statuses", status_id),
+                    "priority": self._link("priorities", priority_id),
+                },
+            }
+            validated, method, target = self._validated_form(
+                f"{_API_PREFIX}/work_packages/{current.snapshot.id}/form",
+                payload,
+                commit_paths=(
+                    f"{_API_PREFIX}/work_packages/{current.snapshot.id}",
+                ),
+                methods={"PATCH"},
+            )
+            commit_payload = dict(validated)
+            commit_payload["lockVersion"] = current.snapshot.lock_version
+            try:
+                response = self._client.request(method, target, json=commit_payload)
+            except httpx.TransportError as error:
+                recovered = self._find_operational_alert(alert.fingerprint)
+                if recovered is not None and self._operational_alert_matches(
+                    recovered.raw,
+                    fingerprint=alert.fingerprint,
+                    description=description,
+                    status_id=status_id,
+                    priority_id=priority_id,
+                ):
+                    return PublicationEffect(
+                        operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                        kind="operational_alert",
+                        identity=identity,
+                        outcome="updated",
+                        work_package_id=recovered.snapshot.id,
+                    )
+                raise AmbiguousPublicationEffect(
+                    "OpenProject alert update response was lost and postcondition is absent"
+                ) from error
+            if response.status_code == 409 and attempt == 0:
+                continue
+            if response.status_code == 409:
+                raise OpenProjectConflict("OpenProject alert update conflicted")
+            if response.status_code != 200:
+                if response.status_code == 408 or response.status_code >= 500:
+                    recovered = self._find_operational_alert(alert.fingerprint)
+                    if recovered is not None and self._operational_alert_matches(
+                        recovered.raw,
+                        fingerprint=alert.fingerprint,
+                        description=description,
+                        status_id=status_id,
+                        priority_id=priority_id,
+                    ):
+                        return PublicationEffect(
+                            operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                            kind="operational_alert",
+                            identity=identity,
+                            outcome="updated",
+                            work_package_id=recovered.snapshot.id,
+                        )
+                    raise AmbiguousPublicationEffect(
+                        "OpenProject alert update returned a possibly committed failure"
+                    )
+                raise OpenProjectPublicationError(
+                    f"OpenProject alert update returned {response.status_code}"
+                )
+            raw = self._json(response)
+            updated = self._work_package(raw)
+            if not self._operational_alert_matches(
+                raw,
+                fingerprint=alert.fingerprint,
+                description=description,
+                status_id=status_id,
+                priority_id=priority_id,
+            ):
+                raise OpenProjectPublicationError(
+                    "OpenProject alert update postcondition is absent"
+                )
+            return PublicationEffect(
+                operation_id=f"alert:{alert.fingerprint}:{alert.state}",
+                kind="operational_alert",
+                identity=identity,
+                outcome="updated",
+                work_package_id=updated.id,
+            )
+        raise OpenProjectConflict("OpenProject alert update did not converge")
 
     def ensure_comment(self, package_id: int, body: str, *, idempotency_key: str) -> int:
         """Add one marker-bound comment and converge after delivery replay."""

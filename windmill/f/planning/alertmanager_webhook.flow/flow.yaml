@@ -1,0 +1,48 @@
+summary: Authenticated Planning Platform alert delivery
+description: Converges firing and resolved Alertmanager notifications into OpenProject.
+value:
+  modules:
+    - id: deliver
+      value:
+        type: script
+        path: f/planning/alertmanager_delivery
+        input_transforms:
+          event:
+            type: javascript
+            expr: flow_input.event
+      retry:
+        exponential:
+          attempts: 2
+          seconds: 1
+          multiplier: 2
+          random_factor: 0
+  preprocessor_module:
+    id: preprocessor
+    value:
+      type: rawscript
+      language: python3
+      content: |
+        def preprocessor(event):
+            return {"event": event}
+      input_transforms: {}
+  failure_module:
+    id: failure
+    value:
+      type: script
+      path: f/planning/alert_delivery_failure
+      input_transforms:
+        event:
+          type: javascript
+          expr: flow_input.event
+        error:
+          type: javascript
+          expr: previous_result
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - event

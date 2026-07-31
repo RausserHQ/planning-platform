@@ -53,6 +53,7 @@ _CUSTOM_FIELD_NAMES = {
     "Source requirements": "source_requirements",
     "Planning commit": "planning_commit",
     "Evidence state": "evidence_state",
+    "Alert fingerprint": "alert_fingerprint",
 }
 _PRIORITY_ALIASES = {
     "low": frozenset({"low"}),
@@ -254,12 +255,36 @@ def discover_openproject_config(
             "work-package schema",
         )
         custom_fields = _custom_field_ids(idea_schema)
+        assignee_filters = json.dumps(
+            [{"type": {"operator": "=", "values": ["User"]}}],
+            separators=(",", ":"),
+        )
+        assignees = _elements(
+            _document(
+                session.get(
+                    f"/api/v3/workspaces/{project_id}/available_assignees",
+                    params={"filters": assignee_filters},
+                ),
+                "alert assignee",
+            ),
+            "alert assignee",
+        )
+        if (
+            len(assignees) != 1
+            or assignees[0].get("_type") != "User"
+            or type(assignees[0].get("id")) is not int
+            or int(assignees[0]["id"]) <= 0
+        ):
+            raise OpenProjectDiscoveryError(
+                "OpenProject human alert assignee is missing or ambiguous"
+            )
         return OpenProjectAdapterConfig(
             base_url=base_url,
             project_id=project_id,
             type_ids=types,
             status_ids=statuses,
             custom_field_ids=custom_fields,
+            alert_assignee_id=int(assignees[0]["id"]),
             priority_ids=priorities,
             timeout_seconds=timeout_seconds,
             page_size=page_size,

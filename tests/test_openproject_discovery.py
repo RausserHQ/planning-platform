@@ -44,6 +44,7 @@ FIELD_NAMES = (
     "Source requirements",
     "Planning commit",
     "Evidence state",
+    "Alert fingerprint",
 )
 
 
@@ -101,6 +102,21 @@ def _client(*, duplicate_type: bool = False) -> httpx.Client:
                     },
                 },
             )
+        if request.url.path == "/api/v3/workspaces/42/available_assignees":
+            filters = json.loads(request.url.params["filters"])
+            assert filters == [{"type": {"operator": "=", "values": ["User"]}}]
+            return httpx.Response(
+                200,
+                json=_collection(
+                    [
+                        {
+                            "_type": "User",
+                            "id": 77,
+                            "name": "Planning Platform Administrator",
+                        }
+                    ]
+                ),
+            )
         return httpx.Response(404)
 
     return httpx.Client(
@@ -121,6 +137,8 @@ def test_discovers_exact_bootstrapped_openproject_contract() -> None:
     assert config.type_ids["Idea"] == 10
     assert config.status_ids["Done"] == 28
     assert config.custom_field_ids["evidence_state"] == 49
+    assert config.custom_field_ids["alert_fingerprint"] == 50
+    assert config.alert_assignee_id == 77
     assert config.priority_ids == {
         "low": 50,
         "medium": 51,

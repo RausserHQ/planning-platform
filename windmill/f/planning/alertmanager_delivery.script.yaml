@@ -1,0 +1,12 @@
+summary: Deliver Planning Platform alerts to OpenProject
+description: Authenticates Alertmanager and converges one human-visible work package per fingerprint.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    event:
+      type: object
+      additionalProperties: true
+  required:
+    - event
