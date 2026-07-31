@@ -24,7 +24,10 @@ from .idempotency import (
     IdempotencyInProgress,
     PostgresIdempotencyRepository,
 )
-from .model import ChatOpenAIPlanningModel
+from .model import (
+    ChatOpenAIPlanningModel,
+    validate_model_configuration,
+)
 from .models import ArtifactBundle, PlanResponse, ResumePlanRequest, StartPlanRequest
 from .service import (
     ArtifactsNotReady,
@@ -36,7 +39,6 @@ from .service import (
 PLANS_STARTED = Counter("planning_platform_plans_started_total", "New planner threads started")
 PLANS_RESUMED = Counter("planning_platform_plans_resumed_total", "Planner interrupts resumed")
 THREAD_PATTERN = r"^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$"
-REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 INTERNAL_TOKEN = APIKeyHeader(
     name="X-Planning-Internal-Token",
     auto_error=False,
@@ -61,11 +63,10 @@ class PlannerSettings:
         if not model:
             raise RuntimeError("PLANNER_OPENAI_MODEL is required")
         reasoning_effort = os.environ.get("PLANNER_OPENAI_REASONING_EFFORT", "medium")
-        if reasoning_effort not in REASONING_EFFORTS:
-            raise RuntimeError(
-                "PLANNER_OPENAI_REASONING_EFFORT must be one of "
-                f"{', '.join(sorted(REASONING_EFFORTS))}"
-            )
+        try:
+            validate_model_configuration(model, reasoning_effort)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         internal_token = os.environ.get("PLANNER_INTERNAL_TOKEN")
         if not internal_token:
             raise RuntimeError("PLANNER_INTERNAL_TOKEN is required")
