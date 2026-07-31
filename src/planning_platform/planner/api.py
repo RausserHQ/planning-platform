@@ -36,6 +36,7 @@ from .service import (
 PLANS_STARTED = Counter("planning_platform_plans_started_total", "New planner threads started")
 PLANS_RESUMED = Counter("planning_platform_plans_resumed_total", "Planner interrupts resumed")
 THREAD_PATTERN = r"^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$"
+REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
 INTERNAL_TOKEN = APIKeyHeader(
     name="X-Planning-Internal-Token",
     auto_error=False,
@@ -48,6 +49,7 @@ INTERNAL_TOKEN = APIKeyHeader(
 class PlannerSettings:
     database_url: str
     model: str
+    reasoning_effort: str
     internal_token: str
 
     @classmethod
@@ -58,12 +60,19 @@ class PlannerSettings:
         model = os.environ.get("PLANNER_OPENAI_MODEL")
         if not model:
             raise RuntimeError("PLANNER_OPENAI_MODEL is required")
+        reasoning_effort = os.environ.get("PLANNER_OPENAI_REASONING_EFFORT", "medium")
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise RuntimeError(
+                "PLANNER_OPENAI_REASONING_EFFORT must be one of "
+                f"{', '.join(sorted(REASONING_EFFORTS))}"
+            )
         internal_token = os.environ.get("PLANNER_INTERNAL_TOKEN")
         if not internal_token:
             raise RuntimeError("PLANNER_INTERNAL_TOKEN is required")
         return cls(
             database_url=database_url,
             model=model,
+            reasoning_effort=reasoning_effort,
             internal_token=internal_token,
         )
 
@@ -86,7 +95,10 @@ def _production_lifespan() -> Any:
         await pool.open()
         checkpointer = AsyncPostgresSaver(pool)
         idempotency = PostgresIdempotencyRepository(pool)
-        model = ChatOpenAIPlanningModel(settings.model)
+        model = ChatOpenAIPlanningModel(
+            settings.model,
+            reasoning_effort=settings.reasoning_effort,
+        )
         app.state.service = PlannerService(
             build_planner_graph(model, checkpointer),
             idempotency,

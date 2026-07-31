@@ -38,8 +38,14 @@ class PlanningModel(Protocol):
 class ChatOpenAIPlanningModel:
     """Production model; every stage is parsed against a Pydantic schema."""
 
-    def __init__(self, model: str, *, temperature: float = 0) -> None:
-        self._client = ChatOpenAI(model=model, temperature=temperature)
+    def __init__(self, model: str, *, reasoning_effort: str = "medium") -> None:
+        self._client = ChatOpenAI(
+            model=model,
+            use_responses_api=True,
+            output_version="responses/v1",
+            reasoning={"effort": reasoning_effort},
+            store=False,
+        )
 
     async def generate(
         self, stage: str, schema: type[Structured], payload: dict[str, Any]

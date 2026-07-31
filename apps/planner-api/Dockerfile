@@ -15,6 +15,8 @@ RUN python -m pip install "uv==0.11.27" \
 
 FROM python:3.12.13-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
+ARG PLANNING_PLATFORM_VERSION=0.1.4
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH=/opt/venv/bin:$PATH
@@ -24,7 +26,7 @@ RUN groupadd --gid 10001 planner \
     && python -m venv /opt/venv
 COPY --from=builder /wheels /wheels
 RUN /opt/venv/bin/pip install --no-cache-dir --no-index \
-      --find-links=/wheels planning-platform==0.1.0 \
+      --find-links=/wheels "planning-platform==${PLANNING_PLATFORM_VERSION}" \
     && rm -rf /wheels
 
 USER 10001:10001

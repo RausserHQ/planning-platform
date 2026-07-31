@@ -104,8 +104,13 @@ Required environment:
 
 - `PLANNER_DATABASE_URL`
 - `PLANNER_OPENAI_MODEL`
+- `PLANNER_OPENAI_REASONING_EFFORT` (optional; defaults to `medium`)
 - `OPENAI_API_KEY`
 - `PLANNER_INTERNAL_TOKEN`
+
+The production adapter uses the OpenAI Responses API, native JSON-schema
+structured output, and `store=false`. Supported reasoning efforts are `none`,
+`low`, `medium`, `high`, `xhigh`, and `max`.
 
 Stable threads are derived as
 `openproject:<idea-work-package-id>:planning:<plan-version>`. Clients cannot
