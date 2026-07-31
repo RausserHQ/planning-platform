@@ -54,9 +54,9 @@ wmill sync push
 
 The workspace is `planning`; Git owns scripts, flows, schedules, and triggers.
 Secrets, users, groups, and settings are deliberately excluded from sync.
-The custom worker image supplies this package through
-`ADDITIONAL_PYTHON_PATHS`; it filters only the local
-`planning-platform` dependency.
+The custom worker image supplies this package through `PYTHONPATH` for ordinary
+Python discovery and Windmill's `ADDITIONAL_PYTHON_PATHS`; it filters only the
+local `planning-platform` dependency.
 
 ## Recovery
 
@@ -127,7 +127,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.4` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.5` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
 blocks on fixable critical Trivy findings. The Windmill image also contains the
