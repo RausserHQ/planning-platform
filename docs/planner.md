@@ -104,8 +104,14 @@ Required environment:
 
 - `PLANNER_DATABASE_URL`
 - `PLANNER_OPENAI_MODEL`
+- `PLANNER_OPENAI_REASONING_EFFORT` (optional; defaults to `medium`)
 - `OPENAI_API_KEY`
 - `PLANNER_INTERNAL_TOKEN`
+
+The production adapter accepts only `gpt-5.6-sol`. It uses the OpenAI Responses
+API, native strict JSON-schema structured output, and `store=false`. Supported
+reasoning efforts for that model are `none`, `low`, `medium`, `high`, `xhigh`,
+and `max`.
 
 Stable threads are derived as
 `openproject:<idea-work-package-id>:planning:<plan-version>`. Clients cannot
