@@ -34,6 +34,7 @@ from planning_platform.publisher import (
 DATABASE_URL = os.environ.get("PLANNER_TEST_DATABASE_URL")
 pytestmark = pytest.mark.postgres
 FIXTURE = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+TARGET_SHA256 = "e" * 64
 
 
 def _envelope(event: str) -> PublicationEnvelope:
@@ -46,6 +47,7 @@ def _envelope(event: str) -> PublicationEnvelope:
         "d" * 64,
         "etag",
         "trace",
+        "e" * 64,
         f"{plan_id}:v1",
     )
 
@@ -86,6 +88,7 @@ def _publication(event: str):
         snapshot.sha256,
         snapshot.etag,
         str(uuid.uuid4()),
+        "e" * 64,
         artifact.plan.plan.publication_identity,
     )
     operations = plan_diff(
@@ -144,6 +147,110 @@ def test_postgres_journal_serializes_concurrent_schema_setup() -> None:
         thread.join(timeout=30)
     assert not any(thread.is_alive() for thread in threads)
     assert not errors
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_postgres_journal_repairs_malformed_required_index() -> None:
+    assert DATABASE_URL is not None
+    with _temporary_database_url() as database_url:
+        journal = PostgresPublicationJournal(database_url)
+        journal.setup()
+        assert journal.ready()
+        with psycopg.connect(database_url) as connection, connection.transaction():
+            connection.execute(
+                "DROP INDEX planning_publication.publication_operations_ordinal"
+            )
+            connection.execute(
+                """
+                CREATE INDEX publication_operations_ordinal
+                ON planning_publication.operations(approval_event_id, ordinal)
+                """
+            )
+
+        assert not journal.ready()
+        journal.setup()
+        assert journal.ready()
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_postgres_journal_refuses_constraint_owned_malformed_index() -> None:
+    assert DATABASE_URL is not None
+    with _temporary_database_url() as database_url:
+        journal = PostgresPublicationJournal(database_url)
+        journal.setup()
+        with psycopg.connect(database_url) as connection, connection.transaction():
+            connection.execute(
+                "DROP INDEX planning_publication.publication_operations_ordinal"
+            )
+            connection.execute(
+                """
+                ALTER TABLE planning_publication.operations
+                ADD CONSTRAINT publication_operations_ordinal
+                UNIQUE (approval_event_id, operation_id)
+                """
+            )
+
+        assert not journal.ready()
+        with pytest.raises(
+            PublicationJournalMismatch,
+            match="malformed required publication index is constraint-owned",
+        ):
+            journal.setup()
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_postgres_journal_refuses_malformed_required_constraint() -> None:
+    assert DATABASE_URL is not None
+    with _temporary_database_url() as database_url:
+        journal = PostgresPublicationJournal(database_url)
+        journal.setup()
+        with psycopg.connect(database_url) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_publication.publications
+                DROP CONSTRAINT publications_target_sha256
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE planning_publication.publications
+                ADD CONSTRAINT publications_target_sha256
+                CHECK (publication_target_sha256 <> '')
+                """
+            )
+
+        assert not journal.ready()
+        with pytest.raises(
+            PublicationJournalMismatch,
+            match="required publication constraint does not match its contract",
+        ):
+            journal.setup()
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_postgres_journal_restores_missing_key_constraints() -> None:
+    assert DATABASE_URL is not None
+    with _temporary_database_url() as database_url:
+        journal = PostgresPublicationJournal(database_url)
+        journal.setup()
+        with psycopg.connect(database_url) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_publication.operations
+                DROP CONSTRAINT operations_approval_event_id_fkey,
+                DROP CONSTRAINT operations_pkey
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE planning_publication.publications
+                DROP CONSTRAINT publications_pkey
+                """
+            )
+
+        assert not journal.ready()
+        journal.setup()
+        assert journal.ready()
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
@@ -264,6 +371,123 @@ def test_postgres_journal_backfills_legacy_ordinals_before_not_null() -> None:
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_v5_migration_refuses_unfinished_v4_rows_and_archives_terminal_rows() -> None:
+    assert DATABASE_URL is not None
+    with _temporary_database_url() as legacy_database_url:
+        journal = PostgresPublicationJournal(legacy_database_url)
+        journal.setup()
+        event = f"v4-targetless-{uuid.uuid4()}"
+        operation = _operation("legacy-operation")
+        with (
+            psycopg.connect(legacy_database_url) as connection,
+            connection.transaction(),
+        ):
+            connection.execute(
+                "DELETE FROM planning_publication.schema_migrations WHERE marker=%s",
+                (PostgresPublicationJournal.MIGRATION_MARKER,),
+            )
+            connection.execute(
+                "INSERT INTO planning_publication.schema_migrations(marker) VALUES ('publication-journal-v4')"
+            )
+            connection.execute(
+                "ALTER TABLE planning_publication.publications DROP CONSTRAINT publications_target_sha256"
+            )
+            connection.execute(
+                "ALTER TABLE planning_publication.publications DROP COLUMN publication_target_sha256"
+            )
+            connection.execute(
+                """
+                INSERT INTO planning_publication.publications(
+                  approval_event_id, publication_identity, envelope_sha256,
+                  operations_sha256, state
+                ) VALUES (%s, %s, %s, %s, 'in_progress')
+                """,
+                (event, "v4-targetless:v1", "a" * 64, "b" * 64),
+            )
+            connection.execute(
+                """
+                INSERT INTO planning_publication.operations(
+                  approval_event_id, operation_id, ordinal,
+                  operation_sha256, operation, state
+                ) VALUES (%s, %s, 0, %s, %s, 'planned')
+                """,
+                (event, operation.operation_id, "c" * 64, Jsonb(operation.__dict__)),
+            )
+
+        with pytest.raises(
+            PublicationJournalMismatch,
+            match="unfinished pre-target publication",
+        ):
+            journal.setup()
+
+        with (
+            psycopg.connect(legacy_database_url) as connection,
+            connection.transaction(),
+        ):
+            connection.execute(
+                "UPDATE planning_publication.publications SET state='completed' WHERE approval_event_id=%s",
+                (event,),
+            )
+            connection.execute(
+                "UPDATE planning_publication.operations SET state='applied' WHERE approval_event_id=%s",
+                (event,),
+            )
+            connection.execute("CREATE SCHEMA planning_lifecycle")
+            connection.execute(
+                """
+                CREATE TABLE planning_lifecycle.plan_runs (
+                  plan_id text NOT NULL,
+                  plan_version integer NOT NULL,
+                  state text NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO planning_lifecycle.plan_runs(plan_id, plan_version, state)
+                VALUES ('v4-targetless', 1, 'publishing')
+                """
+            )
+
+        with pytest.raises(
+            PublicationJournalMismatch,
+            match="terminal pre-target publication requires lifecycle resolution",
+        ):
+            journal.setup()
+
+        with (
+            psycopg.connect(legacy_database_url) as connection,
+            connection.transaction(),
+        ):
+            connection.execute(
+                """
+                UPDATE planning_lifecycle.plan_runs
+                SET state='published'
+                WHERE plan_id='v4-targetless' AND plan_version=1
+                """
+            )
+
+        journal.setup()
+        assert journal.ready()
+        with psycopg.connect(legacy_database_url) as connection:
+            migrated = connection.execute(
+                """
+                SELECT publication_identity, legacy_archive,
+                       publication_target_sha256
+                FROM planning_publication.publications
+                WHERE approval_event_id=%s
+                """,
+                (event,),
+            ).fetchone()
+        assert migrated == (f"legacy:{event}", True, "0" * 64)
+        with pytest.raises(
+            PublicationJournalMismatch,
+            match="archived and cannot be replayed",
+        ):
+            PostgresPublicationJournal(legacy_database_url).resume(_envelope(event))
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
 def test_postgres_journal_round_trips_tuple_identities_and_terminal_replay() -> None:
     assert DATABASE_URL is not None
     journal = PostgresPublicationJournal(DATABASE_URL)
@@ -354,6 +578,7 @@ def test_postgres_journal_rejects_reused_approval_with_different_envelope() -> N
         "d" * 64,
         "etag",
         "trace",
+        original.publication_target_sha256,
         original.publication_identity,
     )
     with pytest.raises(PublicationJournalMismatch):
@@ -390,6 +615,7 @@ def test_publisher_terminal_replay_has_no_adapter_effects() -> None:
     artifact, snapshot, envelope, _ = _publication(f"journal-terminal-{uuid.uuid4()}")
 
     class ApplyingAdapter:
+        publication_target_sha256 = TARGET_SHA256
         effects = 0
 
         def snapshot(self):
@@ -409,9 +635,12 @@ def test_publisher_terminal_replay_has_no_adapter_effects() -> None:
     journal.setup()
     initial = publish(artifact, first, envelope, apply=True, journal=journal)
     assert initial.applied and first.effects == len(initial.operations)
+    assert initial.applied_operations == initial.operations
 
     class NoEffectAdapter:
         def __getattribute__(self, name):
+            if name == "publication_target_sha256":
+                return TARGET_SHA256
             if name.startswith("_"):
                 return super().__getattribute__(name)
             raise AssertionError(f"terminal replay called adapter.{name}")
@@ -424,6 +653,8 @@ def test_publisher_terminal_replay_has_no_adapter_effects() -> None:
         journal=PostgresPublicationJournal(DATABASE_URL),
     )
     assert replayed.operations == initial.operations
+    assert replayed.resumed is True
+    assert replayed.applied_operations == ()
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
@@ -439,6 +670,8 @@ def test_publisher_rejects_different_artifact_before_journal_resume() -> None:
     )
 
     class NoEffectAdapter:
+        publication_target_sha256 = TARGET_SHA256
+
         def __getattribute__(self, name):
             if name.startswith("_"):
                 return super().__getattribute__(name)
@@ -467,6 +700,8 @@ def test_publisher_exception_releases_postgres_fence() -> None:
     setup.setup()
 
     class BrokenSnapshotAdapter:
+        publication_target_sha256 = TARGET_SHA256
+
         def snapshot(self):
             raise RuntimeError("injected snapshot failure")
 
@@ -504,6 +739,8 @@ def test_two_concurrent_publishers_allow_only_one_effecting_attempt() -> None:
     first_error: list[BaseException] = []
 
     class BlockingAdapter:
+        publication_target_sha256 = TARGET_SHA256
+
         def snapshot(self):
             return snapshot
 
@@ -558,7 +795,15 @@ def test_plan_identity_fence_serializes_different_events_but_not_other_plans() -
     setup.setup()
     identity = f"plan-fence-{uuid.uuid4()}:v1"
     first_envelope = PublicationEnvelope(
-        "a" * 40, "b" * 64, "c" * 40, f"event-a-{uuid.uuid4()}", "d" * 64, "etag", "trace", identity
+        "a" * 40,
+        "b" * 64,
+        "c" * 40,
+        f"event-a-{uuid.uuid4()}",
+        "d" * 64,
+        "etag",
+        "trace",
+        "e" * 64,
+        identity,
     )
     same_plan_other_event = PublicationEnvelope(
         "a" * 40,
@@ -568,6 +813,7 @@ def test_plan_identity_fence_serializes_different_events_but_not_other_plans() -
         "d" * 64,
         "etag",
         "trace",
+        "e" * 64,
         identity.removesuffix(":v1") + ":v2",
     )
     other_plan = PublicationEnvelope(
@@ -578,6 +824,7 @@ def test_plan_identity_fence_serializes_different_events_but_not_other_plans() -
         "d" * 64,
         "etag",
         "trace",
+        "e" * 64,
         f"plan-other-{uuid.uuid4()}:v1",
     )
     first = PostgresPublicationJournal(DATABASE_URL)
@@ -647,6 +894,8 @@ def test_publisher_recovery_respects_recorded_effect_state(
     applies: list[str] = []
 
     class RecoveryAdapter:
+        publication_target_sha256 = TARGET_SHA256
+
         def snapshot(self):
             raise AssertionError("journal replay must not take a new base snapshot")
 
@@ -674,7 +923,9 @@ def test_publisher_recovery_respects_recorded_effect_state(
         with pytest.raises(PublicationRejected, match="ambiguous"):
             call()
     else:
-        call()
+        result = call()
+        assert result.resumed is True
+        assert len(result.applied_operations) == expected_applies
     assert len(applies) == expected_applies
 
 
@@ -690,6 +941,8 @@ def test_retryable_resume_rechecks_current_state_before_new_intent() -> None:
     journal.close()
 
     class StaleAdapter:
+        publication_target_sha256 = TARGET_SHA256
+
         def snapshot(self):
             raise AssertionError("journal replay must not snapshot")
 

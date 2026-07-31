@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import psycopg
 from psycopg import sql
@@ -21,6 +21,20 @@ from .diff import PublicationOperation
 
 if TYPE_CHECKING:
     from .publisher import PublicationEnvelope
+
+_IndexShape = tuple[
+    str,
+    bool,
+    bool,
+    bool,
+    str,
+    bool,
+    bool,
+    tuple[str, ...],
+    bool,
+]
+_ConstraintSpec = tuple[str, str, str, tuple[str, ...], str]
+_ConstraintShape = tuple[str, bool, tuple[str, ...], str]
 
 
 class PublicationJournalMismatch(ValueError):
@@ -170,23 +184,145 @@ class InMemoryPublicationJournal:
 
 
 class PostgresPublicationJournal:
-    MIGRATION_MARKER = "publication-journal-v4"
+    MIGRATION_MARKER = "publication-journal-v5"
+    _LEGACY_TARGET_SHA256 = "0" * 64
     _PUBLICATION_STATES = frozenset({"in_progress", "completed", "failed"})
     _OPERATION_STATES = frozenset({"planned", "intent", "ambiguous", "retryable", "applied"})
-    _REQUIRED_CONSTRAINTS = frozenset(
-        {
-            "publications_approval_event_nonempty",
-            "publications_envelope_sha256",
-            "publications_operations_sha256",
-            "publications_state",
-            "publications_publication_identity",
-            "publications_legacy_archive_identity",
-            "operations_ordinal_nonnegative",
-            "operations_operation_sha256",
-            "operations_document_object",
-            "operations_state",
-        }
-    )
+    _REQUIRED_CONSTRAINTS: ClassVar[dict[str, _ConstraintSpec]] = {
+        "publications_pkey": (
+            "publications",
+            "p",
+            "PRIMARY KEY (approval_event_id)",
+            ("approval_event_id",),
+            "PRIMARY KEY (approval_event_id)",
+        ),
+        "operations_pkey": (
+            "operations",
+            "p",
+            "PRIMARY KEY (approval_event_id, operation_id)",
+            ("approval_event_id", "operation_id"),
+            "PRIMARY KEY (approval_event_id, operation_id)",
+        ),
+        "operations_approval_event_id_fkey": (
+            "operations",
+            "f",
+            "FOREIGN KEY (approval_event_id) REFERENCES planning_publication.publications(approval_event_id)",
+            ("approval_event_id",),
+            "FOREIGN KEY (approval_event_id) REFERENCES planning_publication.publications(approval_event_id)",
+        ),
+        "publications_approval_event_nonempty": (
+            "publications",
+            "c",
+            "CHECK (approval_event_id <> '')",
+            ("approval_event_id",),
+            "CHECK ((approval_event_id <> ''::text))",
+        ),
+        "publications_envelope_sha256": (
+            "publications",
+            "c",
+            "CHECK (envelope_sha256 ~ '^[0-9a-f]{64}$')",
+            ("envelope_sha256",),
+            "CHECK ((envelope_sha256 ~ '^[0-9a-f]{64}$'::text))",
+        ),
+        "publications_operations_sha256": (
+            "publications",
+            "c",
+            "CHECK (operations_sha256 ~ '^[0-9a-f]{64}$')",
+            ("operations_sha256",),
+            "CHECK ((operations_sha256 ~ '^[0-9a-f]{64}$'::text))",
+        ),
+        "publications_state": (
+            "publications",
+            "c",
+            "CHECK (state IN ('in_progress','completed','failed'))",
+            ("state",),
+            "CHECK ((state = ANY (ARRAY['in_progress'::text, 'completed'::text, 'failed'::text])))",
+        ),
+        "publications_publication_identity": (
+            "publications",
+            "c",
+            "CHECK (publication_identity <> '')",
+            ("publication_identity",),
+            "CHECK ((publication_identity <> ''::text))",
+        ),
+        "publications_legacy_archive_identity": (
+            "publications",
+            "c",
+            "CHECK ((legacy_archive AND publication_identity LIKE 'legacy:%') OR (NOT legacy_archive AND publication_identity ~ '^[a-z0-9][a-z0-9-]{2,63}:v[1-9][0-9]*$'))",
+            ("legacy_archive", "publication_identity"),
+            "CHECK (((legacy_archive AND (publication_identity ~~ 'legacy:%'::text)) OR ((NOT legacy_archive) AND (publication_identity ~ '^[a-z0-9][a-z0-9-]{2,63}:v[1-9][0-9]*$'::text))))",
+        ),
+        "publications_target_sha256": (
+            "publications",
+            "c",
+            "CHECK ((legacy_archive AND publication_target_sha256 = '0000000000000000000000000000000000000000000000000000000000000000') OR (NOT legacy_archive AND publication_target_sha256 ~ '^[0-9a-f]{64}$' AND publication_target_sha256 <> '0000000000000000000000000000000000000000000000000000000000000000'))",
+            ("legacy_archive", "publication_target_sha256"),
+            "CHECK (((legacy_archive AND (publication_target_sha256 = '0000000000000000000000000000000000000000000000000000000000000000'::text)) OR ((NOT legacy_archive) AND (publication_target_sha256 ~ '^[0-9a-f]{64}$'::text) AND (publication_target_sha256 <> '0000000000000000000000000000000000000000000000000000000000000000'::text))))",
+        ),
+        "operations_ordinal_nonnegative": (
+            "operations",
+            "c",
+            "CHECK (ordinal >= 0)",
+            ("ordinal",),
+            "CHECK ((ordinal >= 0))",
+        ),
+        "operations_operation_sha256": (
+            "operations",
+            "c",
+            "CHECK (operation_sha256 ~ '^[0-9a-f]{64}$')",
+            ("operation_sha256",),
+            "CHECK ((operation_sha256 ~ '^[0-9a-f]{64}$'::text))",
+        ),
+        "operations_document_object": (
+            "operations",
+            "c",
+            "CHECK (jsonb_typeof(operation) = 'object')",
+            ("operation",),
+            "CHECK ((jsonb_typeof(operation) = 'object'::text))",
+        ),
+        "operations_state": (
+            "operations",
+            "c",
+            "CHECK (state IN ('planned','intent','ambiguous','retryable','applied'))",
+            ("state",),
+            "CHECK ((state = ANY (ARRAY['planned'::text, 'intent'::text, 'ambiguous'::text, 'retryable'::text, 'applied'::text])))",
+        ),
+    }
+    _REQUIRED_INDEXES: ClassVar[dict[str, _IndexShape]] = {
+        "publication_operations_ordinal": (
+            "operations",
+            True,
+            True,
+            True,
+            "btree",
+            True,
+            True,
+            ("approval_event_id", "ordinal"),
+            True,
+        ),
+        "publication_operations_pending": (
+            "operations",
+            False,
+            True,
+            True,
+            "btree",
+            True,
+            True,
+            ("approval_event_id", "state"),
+            True,
+        ),
+        "publications_publication_identity": (
+            "publications",
+            False,
+            True,
+            True,
+            "btree",
+            True,
+            True,
+            ("publication_identity",),
+            True,
+        ),
+    }
 
     def __init__(self, database_url: str) -> None:
         if not database_url:
@@ -194,6 +330,107 @@ class PostgresPublicationJournal:
         self._database_url = database_url
         self._active = ""
         self._fence: psycopg.Connection[tuple[object, ...]] | None = None
+
+    @staticmethod
+    def _constraint_shapes(
+        connection: psycopg.Connection[tuple[object, ...]],
+    ) -> dict[tuple[str, str], _ConstraintShape]:
+        rows = connection.execute(
+            """
+            SELECT relation.relname,
+                   constraint_record.conname,
+                   constraint_record.contype,
+                   constraint_record.convalidated,
+                   ARRAY(
+                     SELECT attribute.attname
+                     FROM unnest(constraint_record.conkey) WITH ORDINALITY
+                          AS constraint_column(attnum, position)
+                     JOIN pg_attribute AS attribute
+                       ON attribute.attrelid = constraint_record.conrelid
+                      AND attribute.attnum = constraint_column.attnum
+                     ORDER BY constraint_column.position
+                   ),
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_constraint AS constraint_record
+            JOIN pg_class AS relation
+              ON relation.oid = constraint_record.conrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = 'planning_publication'
+            """
+        ).fetchall()
+        shapes: dict[tuple[str, str], _ConstraintShape] = {}
+        for row in rows:
+            columns = row[4]
+            if not isinstance(columns, list):
+                continue
+            shapes[(str(row[0]), str(row[1]))] = (
+                str(row[2]),
+                bool(row[3]),
+                tuple(str(column) for column in columns),
+                " ".join(str(row[5]).split()),
+            )
+        return shapes
+
+    @staticmethod
+    def _index_shapes(
+        connection: psycopg.Connection[tuple[object, ...]],
+    ) -> dict[str, _IndexShape]:
+        rows = connection.execute(
+            """
+            SELECT index_class.relname,
+                   table_class.relname,
+                   index_metadata.indisunique,
+                   index_metadata.indisvalid,
+                   index_metadata.indisready,
+                   access_method.amname,
+                   index_metadata.indpred IS NULL,
+                   index_metadata.indexprs IS NULL,
+                   ARRAY(
+                     SELECT attribute.attname
+                     FROM unnest(index_metadata.indkey) WITH ORDINALITY
+                          AS key_column(attnum, position)
+                     JOIN pg_attribute AS attribute
+                       ON attribute.attrelid = index_metadata.indrelid
+                      AND attribute.attnum = key_column.attnum
+                     WHERE key_column.position <= index_metadata.indnkeyatts
+                     ORDER BY key_column.position
+                   ),
+                   index_metadata.indnatts = index_metadata.indnkeyatts
+            FROM pg_index AS index_metadata
+            JOIN pg_class AS index_class
+              ON index_class.oid = index_metadata.indexrelid
+            JOIN pg_namespace AS index_namespace
+              ON index_namespace.oid = index_class.relnamespace
+            JOIN pg_class AS table_class
+              ON table_class.oid = index_metadata.indrelid
+            JOIN pg_namespace AS table_namespace
+              ON table_namespace.oid = table_class.relnamespace
+            JOIN pg_am AS access_method
+              ON access_method.oid = index_class.relam
+            WHERE index_namespace.nspname = 'planning_publication'
+              AND table_namespace.nspname = 'planning_publication'
+              AND index_class.relname = ANY(%s)
+            """,
+            (list(PostgresPublicationJournal._REQUIRED_INDEXES),),
+        ).fetchall()
+        shapes: dict[str, _IndexShape] = {}
+        for row in rows:
+            columns = row[8]
+            if not isinstance(columns, list):
+                continue
+            shapes[str(row[0])] = (
+                str(row[1]),
+                bool(row[2]),
+                bool(row[3]),
+                bool(row[4]),
+                str(row[5]),
+                bool(row[6]),
+                bool(row[7]),
+                tuple(str(column) for column in columns),
+                bool(row[9]),
+            )
+        return shapes
 
     def setup(self) -> None:
         with psycopg.connect(self._database_url) as connection, connection.transaction():
@@ -210,7 +447,7 @@ class PostgresPublicationJournal:
                 """CREATE TABLE IF NOT EXISTS planning_publication.schema_migrations (marker text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"""
             )
             connection.execute("""CREATE TABLE IF NOT EXISTS planning_publication.publications (
-              approval_event_id text PRIMARY KEY, publication_identity text NOT NULL, legacy_archive boolean NOT NULL DEFAULT false, envelope_sha256 text NOT NULL, operations_sha256 text NOT NULL,
+              approval_event_id text PRIMARY KEY, publication_identity text NOT NULL, legacy_archive boolean NOT NULL DEFAULT false, publication_target_sha256 text NOT NULL, envelope_sha256 text NOT NULL, operations_sha256 text NOT NULL,
               state text NOT NULL DEFAULT 'in_progress' CHECK (state IN ('in_progress','completed','failed')), created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), CHECK (envelope_sha256 ~ '^[0-9a-f]{64}$'), CHECK (operations_sha256 ~ '^[0-9a-f]{64}$'))""")
             connection.execute("""CREATE TABLE IF NOT EXISTS planning_publication.operations (
               approval_event_id text NOT NULL REFERENCES planning_publication.publications(approval_event_id), operation_id text NOT NULL,
@@ -225,6 +462,27 @@ class PostgresPublicationJournal:
             connection.execute(
                 "ALTER TABLE planning_publication.publications ADD COLUMN IF NOT EXISTS legacy_archive boolean NOT NULL DEFAULT false"
             )
+            connection.execute(
+                "ALTER TABLE planning_publication.publications ADD COLUMN IF NOT EXISTS publication_target_sha256 text"
+            )
+            constraint_shapes = self._constraint_shapes(connection)
+            for name, (
+                table,
+                constraint_type,
+                _definition,
+                columns,
+                expected_constraint_definition,
+            ) in self._REQUIRED_CONSTRAINTS.items():
+                observed = constraint_shapes.get((table, name))
+                if observed is not None and observed != (
+                    constraint_type,
+                    True,
+                    columns,
+                    expected_constraint_definition,
+                ):
+                    raise PublicationJournalMismatch(
+                        "required publication constraint does not match its contract"
+                    )
             unfinished_legacy = connection.execute(
                 """
                 SELECT EXISTS (
@@ -299,65 +557,77 @@ class PostgresPublicationJournal:
             connection.execute(
                 "UPDATE planning_publication.publications SET publication_identity='legacy:' || approval_event_id WHERE publication_identity IS NULL"
             )
+            unfinished_pre_target = connection.execute(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM planning_publication.publications AS publication
+                  WHERE publication.publication_target_sha256 IS NULL
+                    AND (
+                      publication.state <> 'completed'
+                      OR EXISTS (
+                        SELECT 1
+                        FROM planning_publication.operations AS operation
+                        WHERE operation.approval_event_id = publication.approval_event_id
+                          AND operation.state <> 'applied'
+                      )
+                    )
+                )
+                """
+            ).fetchone()
+            if unfinished_pre_target is not None and bool(unfinished_pre_target[0]):
+                raise PublicationJournalMismatch(
+                    "unfinished pre-target publication requires explicit operator resolution"
+                )
+            lifecycle_table = connection.execute(
+                "SELECT to_regclass('planning_lifecycle.plan_runs')"
+            ).fetchone()
+            if lifecycle_table is not None and lifecycle_table[0] is not None:
+                unresolved_lifecycle = connection.execute(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1
+                      FROM planning_publication.publications AS publication
+                      JOIN planning_lifecycle.plan_runs AS plan_run
+                        ON publication.publication_identity =
+                           plan_run.plan_id || ':v' || plan_run.plan_version::text
+                      WHERE publication.publication_target_sha256 IS NULL
+                        AND publication.state = 'completed'
+                        AND plan_run.state = 'publishing'
+                    )
+                    """
+                ).fetchone()
+                if unresolved_lifecycle is not None and bool(unresolved_lifecycle[0]):
+                    raise PublicationJournalMismatch(
+                        "terminal pre-target publication requires lifecycle resolution"
+                    )
+            # v4 envelopes did not bind their OpenProject target. Terminal rows
+            # are safe audit records but cannot be authenticated for replay;
+            # archive them explicitly instead of guessing or backfilling a
+            # target. Unfinished rows were rejected above.
+            connection.execute(
+                """
+                UPDATE planning_publication.publications
+                SET legacy_archive = true,
+                    publication_identity = 'legacy:' || approval_event_id,
+                    publication_target_sha256 = %s
+                WHERE publication_target_sha256 IS NULL
+                """,
+                (self._LEGACY_TARGET_SHA256,),
+            )
             connection.execute(
                 "ALTER TABLE planning_publication.publications ALTER COLUMN publication_identity SET NOT NULL"
             )
             connection.execute(
+                "ALTER TABLE planning_publication.publications ALTER COLUMN publication_target_sha256 SET NOT NULL"
+            )
+            connection.execute(
                 "ALTER TABLE planning_publication.operations ALTER COLUMN ordinal SET NOT NULL"
             )
-            constraints = {
-                "publications_approval_event_nonempty": (
-                    "publications",
-                    "CHECK (approval_event_id <> '')",
-                ),
-                "publications_envelope_sha256": (
-                    "publications",
-                    "CHECK (envelope_sha256 ~ '^[0-9a-f]{64}$')",
-                ),
-                "publications_operations_sha256": (
-                    "publications",
-                    "CHECK (operations_sha256 ~ '^[0-9a-f]{64}$')",
-                ),
-                "publications_state": (
-                    "publications",
-                    "CHECK (state IN ('in_progress','completed','failed'))",
-                ),
-                "publications_publication_identity": (
-                    "publications",
-                    "CHECK (publication_identity <> '')",
-                ),
-                "publications_legacy_archive_identity": (
-                    "publications",
-                    "CHECK ((legacy_archive AND publication_identity LIKE 'legacy:%') OR (NOT legacy_archive AND publication_identity ~ '^[a-z0-9][a-z0-9-]{2,63}:v[1-9][0-9]*$'))",
-                ),
-                "operations_ordinal_nonnegative": (
-                    "operations",
-                    "CHECK (ordinal >= 0)",
-                ),
-                "operations_operation_sha256": (
-                    "operations",
-                    "CHECK (operation_sha256 ~ '^[0-9a-f]{64}$')",
-                ),
-                "operations_document_object": (
-                    "operations",
-                    "CHECK (jsonb_typeof(operation) = 'object')",
-                ),
-                "operations_state": (
-                    "operations",
-                    "CHECK (state IN ('planned','intent','ambiguous','retryable','applied'))",
-                ),
-            }
-            for name, (table, definition) in constraints.items():
-                exists = connection.execute(
-                    """
-                    SELECT 1
-                    FROM pg_constraint
-                    WHERE connamespace = 'planning_publication'::regnamespace
-                      AND conname = %s
-                    """,
-                    (name,),
-                ).fetchone()
-                if exists is None:
+            for name, (table, _constraint_type, definition, _columns, _expected) in (
+                self._REQUIRED_CONSTRAINTS.items()
+            ):
+                if (table, name) not in constraint_shapes:
                     connection.execute(
                         sql.SQL("ALTER TABLE planning_publication.{} ADD CONSTRAINT {} {}").format(
                             sql.Identifier(table),
@@ -365,21 +635,57 @@ class PostgresPublicationJournal:
                             sql.SQL(definition),
                         )
                     )
-            connection.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS publication_operations_ordinal ON planning_publication.operations(approval_event_id, ordinal)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS publication_operations_pending ON planning_publication.operations(approval_event_id, state)"
-            )
-            # The advisory fence serializes concurrent writers. Historical
-            # publications remain immutable audit records, so this is not a
-            # uniqueness constraint across distinct approval events.
-            connection.execute(
-                "DROP INDEX IF EXISTS planning_publication.publications_publication_identity"
-            )
-            connection.execute(
-                "CREATE INDEX publications_publication_identity ON planning_publication.publications(publication_identity)"
-            )
+            final_constraint_shapes = self._constraint_shapes(connection)
+            if any(
+                final_constraint_shapes.get((table, name))
+                != (constraint_type, True, columns, expected)
+                for name, (
+                    table,
+                    constraint_type,
+                    _definition,
+                    columns,
+                    expected,
+                ) in self._REQUIRED_CONSTRAINTS.items()
+            ):
+                raise PublicationJournalMismatch(
+                    "required publication constraint does not match its contract"
+                )
+            definitions = {
+                "publication_operations_ordinal": (
+                    "CREATE UNIQUE INDEX publication_operations_ordinal ON planning_publication.operations(approval_event_id, ordinal)"
+                ),
+                "publication_operations_pending": (
+                    "CREATE INDEX publication_operations_pending ON planning_publication.operations(approval_event_id, state)"
+                ),
+                # The advisory fence serializes concurrent writers. Historical
+                # publications remain immutable audit records, so this is not a
+                # uniqueness constraint across distinct approval events.
+                "publications_publication_identity": (
+                    "CREATE INDEX publications_publication_identity ON planning_publication.publications(publication_identity)"
+                ),
+            }
+            observed_indexes = self._index_shapes(connection)
+            for name, expected_index in self._REQUIRED_INDEXES.items():
+                if observed_indexes.get(name) == expected_index:
+                    continue
+                constraint_owner = connection.execute(
+                    """
+                    SELECT constraint_record.conname
+                    FROM pg_constraint AS constraint_record
+                    WHERE constraint_record.conindid = to_regclass(%s)
+                    """,
+                    (f"planning_publication.{name}",),
+                ).fetchone()
+                if constraint_owner is not None:
+                    raise PublicationJournalMismatch(
+                        "malformed required publication index is constraint-owned"
+                    )
+                connection.execute(
+                    sql.SQL("DROP INDEX IF EXISTS planning_publication.{}").format(
+                        sql.Identifier(name)
+                    )
+                )
+                connection.execute(sql.SQL(definitions[name]))
             connection.execute(
                 "INSERT INTO planning_publication.schema_migrations(marker) VALUES (%s) ON CONFLICT DO NOTHING",
                 (self.MIGRATION_MARKER,),
@@ -408,20 +714,8 @@ class PostgresPublicationJournal:
                       AND table_name='publications'
                     """
                 ).fetchall()
-                constraints = connection.execute(
-                    """
-                    SELECT conname
-                    FROM pg_constraint
-                    WHERE connamespace = 'planning_publication'::regnamespace
-                    """
-                ).fetchall()
-                indexes = connection.execute(
-                    """
-                    SELECT indexname
-                    FROM pg_indexes
-                    WHERE schemaname='planning_publication'
-                    """
-                ).fetchall()
+                constraint_shapes = self._constraint_shapes(connection)
+                index_shapes = self._index_shapes(connection)
                 required_operations = {
                     "approval_event_id",
                     "operation_id",
@@ -440,6 +734,7 @@ class PostgresPublicationJournal:
                     "operations_sha256",
                     "publication_identity",
                     "legacy_archive",
+                    "publication_target_sha256",
                     "state",
                     "created_at",
                     "updated_at",
@@ -452,8 +747,6 @@ class PostgresPublicationJournal:
                 nonnull_publications = {
                     str(column[0]) for column in publication_columns if column[1] == "NO"
                 }
-                constraint_names = {str(value[0]) for value in constraints}
-                index_names = {str(value[0]) for value in indexes}
                 return (
                     row is not None
                     and required_operations <= operation_names
@@ -471,6 +764,7 @@ class PostgresPublicationJournal:
                         "approval_event_id",
                         "publication_identity",
                         "legacy_archive",
+                        "publication_target_sha256",
                         "envelope_sha256",
                         "operations_sha256",
                         "state",
@@ -478,13 +772,21 @@ class PostgresPublicationJournal:
                         "updated_at",
                     }
                     <= nonnull_publications
-                    and constraint_names >= self._REQUIRED_CONSTRAINTS
-                    and {
-                        "publication_operations_ordinal",
-                        "publication_operations_pending",
-                        "publications_publication_identity",
-                    }
-                    <= index_names
+                    and all(
+                        constraint_shapes.get((table, name))
+                        == (constraint_type, True, columns, expected)
+                        for name, (
+                            table,
+                            constraint_type,
+                            _definition,
+                            columns,
+                            expected,
+                        ) in self._REQUIRED_CONSTRAINTS.items()
+                    )
+                    and all(
+                        index_shapes.get(name) == expected
+                        for name, expected in self._REQUIRED_INDEXES.items()
+                    )
                 )
         except psycopg.Error:
             return False
@@ -525,7 +827,7 @@ class PostgresPublicationJournal:
         try:
             with psycopg.connect(self._database_url) as connection:
                 row = connection.execute(
-                    "SELECT publication_identity,envelope_sha256,operations_sha256,state,legacy_archive FROM planning_publication.publications WHERE approval_event_id=%s",
+                    "SELECT publication_identity,envelope_sha256,operations_sha256,state,legacy_archive,publication_target_sha256 FROM planning_publication.publications WHERE approval_event_id=%s",
                     (event,),
                 ).fetchone()
                 if row is None:
@@ -534,6 +836,8 @@ class PostgresPublicationJournal:
                     raise PublicationJournalMismatch(
                         "legacy publication is archived and cannot be replayed"
                     )
+                if str(row[5]) != envelope.publication_target_sha256:
+                    raise PublicationJournalMismatch("OpenProject publication target changed")
                 if str(row[0]) != envelope.publication_identity or str(row[1]) != digest:
                     raise PublicationJournalMismatch(
                         "publication approval event has a different immutable envelope"
@@ -601,8 +905,14 @@ class PostgresPublicationJournal:
                         )
                     return self.resume(envelope) or ((), set())
                 connection.execute(
-                    "INSERT INTO planning_publication.publications(approval_event_id,publication_identity,envelope_sha256,operations_sha256) VALUES (%s,%s,%s,%s)",
-                    (event, envelope.publication_identity, digest, operations_digest),
+                    "INSERT INTO planning_publication.publications(approval_event_id,publication_identity,publication_target_sha256,envelope_sha256,operations_sha256) VALUES (%s,%s,%s,%s,%s)",
+                    (
+                        event,
+                        envelope.publication_identity,
+                        envelope.publication_target_sha256,
+                        digest,
+                        operations_digest,
+                    ),
                 )
                 for ordinal, operation in enumerate(operations):
                     connection.execute(

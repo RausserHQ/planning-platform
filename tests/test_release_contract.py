@@ -23,6 +23,10 @@ def test_release_workflow_matches_package_version_and_windmill_revision() -> Non
     assert f"ARG PLANNING_PLATFORM_VERSION={version}" in planner_dockerfile
     assert '"planning-platform==${PLANNING_PLATFORM_VERSION}"' in planner_dockerfile
     assert f"ARG PLANNING_PLATFORM_VERSION={version}" in windmill_dockerfile
+    assert windmill_dockerfile.startswith(
+        "ARG WINDMILL_BASE=ghcr.io/windmill-labs/windmill:1.775.2@"
+        "sha256:ef39329523f4806e5cd5169ffa7af2618f39439bcf659115e8bb804c592d7132\n"
+    )
     assert (
         '"/tmp/planning-platform-dist/'
         'planning_platform-${PLANNING_PLATFORM_VERSION}-py3-none-any.whl"'
@@ -30,7 +34,7 @@ def test_release_workflow_matches_package_version_and_windmill_revision() -> Non
     )
 
     assert re.search(
-        r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.9$",
+        r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.10$",
         workflow,
     )
     assert (

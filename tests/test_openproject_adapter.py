@@ -20,6 +20,7 @@ from planning_platform.openproject_adapter import (
     OpenProjectPublicationAdapter,
     OpenProjectPublicationError,
     OperationalAlert,
+    openproject_target_sha256,
 )
 from planning_platform.publication_journal import (
     AmbiguousPublicationEffect,
@@ -71,6 +72,32 @@ def _config() -> OpenProjectAdapterConfig:
         alert_assignee_id=77,
         priority_ids={"low": 50, "medium": 51, "high": 52, "critical": 53},
     )
+
+
+def test_openproject_target_hash_binds_semantic_instance_config() -> None:
+    config = _config()
+    assert openproject_target_sha256(config) == openproject_target_sha256(
+        replace(config, base_url=config.base_url + "/")
+    )
+    assert openproject_target_sha256(config) != openproject_target_sha256(
+        replace(config, project_id=config.project_id + 1)
+    )
+    assert openproject_target_sha256(config) != openproject_target_sha256(
+        replace(config, timeout_seconds=config.timeout_seconds + 1)
+    )
+
+
+def test_openproject_target_config_copies_and_freezes_id_mappings() -> None:
+    source_type_ids = dict(_config().type_ids)
+    config = replace(_config(), type_ids=source_type_ids)
+    expected_hash = openproject_target_sha256(config)
+
+    source_type_ids["Task"] = 999
+    assert config.type_ids["Task"] == 14
+    assert openproject_target_sha256(config) == expected_hash
+    mutable_view: Any = config.type_ids
+    with pytest.raises(TypeError):
+        mutable_view["Task"] = 999
 
 
 def _projection(
@@ -1676,6 +1703,7 @@ def test_http_publication_parent_relation_roundtrip_replays_to_zero_diff(tmp_pat
         base.sha256,
         base.etag,
         "trace",
+        openproject_target_sha256(_config()),
         plan.plan.publication_identity,
     )
     state: dict[int, dict[str, Any]] = {}

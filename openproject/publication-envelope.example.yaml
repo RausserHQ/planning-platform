@@ -1,0 +1,10 @@
+# Non-secret shape example. Generate every hash and identifier from the exact
+# merged planning artifact and approval delivery; never hand-edit it for apply.
+approved_commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+backlog_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+artifact_blob_sha1: cccccccccccccccccccccccccccccccccccccccc
+approval_event_id: merged-planning-pr:delivery-id
+snapshot_sha256: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+snapshot_etag: exact-openproject-snapshot-etag
+trace_id: exact-planning-trace-id
+publication_identity: example-plan:v1

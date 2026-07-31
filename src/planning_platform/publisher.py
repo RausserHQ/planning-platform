@@ -22,6 +22,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 class PublicationAdapter(Protocol):
     """The sole mutation seam; it refreshes identity/lock state before each effect."""
 
+    publication_target_sha256: str
+
     def snapshot(self) -> OpenProjectSnapshot: ...
 
     def resolve(self, identity: tuple[str, str]) -> WorkPackageSnapshot | None: ...
@@ -50,6 +52,7 @@ class PublicationEnvelope:
     snapshot_sha256: str
     snapshot_etag: str
     trace_id: str
+    publication_target_sha256: str
     publication_identity: str = ""
 
 
@@ -57,6 +60,8 @@ class PublicationEnvelope:
 class PublishResult:
     operations: tuple[PublicationOperation, ...]
     applied: bool
+    resumed: bool = False
+    applied_operations: tuple[PublicationOperation, ...] = ()
 
 
 def _check_artifact_envelope(artifact: LoadedArtifact, envelope: PublicationEnvelope) -> None:
@@ -66,6 +71,8 @@ def _check_artifact_envelope(artifact: LoadedArtifact, envelope: PublicationEnve
         raise PublicationRejected("immutable envelope has an invalid artifact blob SHA")
     if not _SHA256.fullmatch(envelope.backlog_sha256) or not envelope.approval_event_id:
         raise PublicationRejected("immutable envelope has invalid approval identity")
+    if not _SHA256.fullmatch(envelope.publication_target_sha256):
+        raise PublicationRejected("immutable envelope has an invalid publication target")
     if artifact.sha256 != envelope.backlog_sha256:
         raise PublicationRejected("artifact SHA-256 does not match immutable envelope")
     if artifact.blob_sha1 != envelope.artifact_blob_sha1:
@@ -78,6 +85,13 @@ def _check_artifact_envelope(artifact: LoadedArtifact, envelope: PublicationEnve
         raise PublicationRejected("plan snapshot does not match immutable envelope")
     if envelope.publication_identity != artifact.plan.plan.publication_identity:
         raise PublicationRejected("immutable envelope has an invalid plan publication identity")
+
+
+def _check_publication_target(
+    adapter: PublicationAdapter, envelope: PublicationEnvelope
+) -> None:
+    if adapter.publication_target_sha256 != envelope.publication_target_sha256:
+        raise PublicationRejected("OpenProject publication target changed")
 
 
 def _check_envelope(
@@ -139,6 +153,7 @@ def _publish(
     if issues:
         raise SemanticValidationError(issues)
     _check_artifact_envelope(artifact, envelope)
+    _check_publication_target(adapter, envelope)
     if apply:
         if journal is None or not journal.ready():
             raise PublicationRejected("apply requires a ready durable publication journal")
@@ -148,6 +163,7 @@ def _publish(
             raise PublicationRejected(str(error)) from error
         if resumed is not None:
             recorded_operations, completed = resumed
+            resumed_applied_operations: list[PublicationOperation] = []
             for operation in recorded_operations:
                 if operation.operation_id in completed:
                     continue
@@ -188,12 +204,19 @@ def _publish(
                     journal.failure(operation, error)
                     raise
                 journal.outcome(operation, result="recovered")
+                resumed_applied_operations.append(operation)
             journal.finalize()
-            return PublishResult(recorded_operations, applied=True)
+            return PublishResult(
+                recorded_operations,
+                applied=True,
+                resumed=True,
+                applied_operations=tuple(resumed_applied_operations),
+            )
     snapshot = adapter.snapshot()
     _check_envelope(artifact, envelope, snapshot)
     publication_plan = with_approved_commit(artifact.plan, envelope.approved_commit)
     operations = plan_diff(publication_plan, snapshot, trace_id=envelope.trace_id)
+    applied_operations: list[PublicationOperation] = []
     if apply:
         assert journal is not None
         recorded_operations, completed = journal.begin(envelope, operations)
@@ -211,9 +234,14 @@ def _publish(
                 journal.failure(operation, error)
                 raise
             journal.outcome(operation)
+            applied_operations.append(operation)
         journal.finalize()
         operations = recorded_operations
-    return PublishResult(operations=operations, applied=apply)
+    return PublishResult(
+        operations=operations,
+        applied=apply,
+        applied_operations=tuple(applied_operations),
+    )
 
 
 def publish(

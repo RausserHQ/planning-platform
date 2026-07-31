@@ -13,6 +13,79 @@ The publisher authenticates as Basic `apikey:<token>` and uses bounded HTTP
 timeouts.  Give the token only to the Windmill publication worker.  Never put
 it in this repository, a runner argument, a log, or a planning artifact.
 
+## Deterministic CLI publication
+
+Use a captured, immutable OpenProject snapshot for review-only output:
+
+```bash
+planning publish backlog.yaml \
+  --dry-run \
+  --against-openproject openproject-snapshot.json
+```
+
+Apply uses the same fail-closed publisher as the Windmill lifecycle worker. It
+loads the exact backlog bytes, a non-secret instance-ID config, and the exact
+merge-bound publication envelope; then it refreshes live OpenProject state
+before each side effect and writes intent/outcome to the PostgreSQL journal.
+The journal schema must already be migrated and Ready. The CLI never performs
+schema setup implicitly.
+
+```bash
+export OPENPROJECT_API_TOKEN="$(read-token-from-approved-secret-source)"
+export PLANNING_LIFECYCLE_DATABASE_URL="$(read-dsn-from-approved-secret-source)"
+export PLANNING_PUBLICATION_POLICY=/operator-owned/publication-policy.yaml
+
+planning publish backlog.yaml \
+  --apply \
+  --publisher-config openproject/publisher-config.yaml \
+  --publication-envelope publication-envelope.yaml
+```
+
+The two file options may instead be provided as
+`PLANNING_OPENPROJECT_PUBLISHER_CONFIG` and
+`PLANNING_PUBLICATION_ENVELOPE`. Secrets have no command-line option: supply
+them only through the worker's environment. `PLANNING_PUBLICATION_POLICY` is
+mandatory and has no caller option. Provision it as operator-owned policy using
+the shape in `openproject/publication-policy.example.yaml`; it pins the local
+repository root, exact `origin` URL, trusted protected ref, repository-relative
+backlog path, and canonical non-secret OpenProject target/config hash.
+
+Generate that policy hash from the exact non-secret publisher config:
+
+```bash
+planning publication-target \
+  --publisher-config openproject/publisher-config.yaml
+```
+
+Copy the single 64-character result into `openproject_target_sha256`. Re-run
+the command after any URL, project, ID mapping, timeout, or collection-bound
+change; an in-progress publication must be resolved under its original target
+instead of updating policy mid-retry.
+
+Before apply, refresh the configured trusted ref through the repository's
+normal authenticated Git workflow. The CLI verifies that the approved commit
+is an exact commit reachable from that ref, that the selected path is a regular
+Git blob (not a symlink or submodule), and that its blob ID and bytes exactly
+match both the local artifact and envelope. The OpenProject target hash is
+derived from the loaded publisher config and must match policy; it is then
+included in the durable journal envelope, so a retry cannot move to another
+instance, project, ID map, or runtime bound.
+
+The envelope file must contain exactly the fields shown in
+`openproject/publication-envelope.example.yaml`, all bound to the approved
+artifact, merge, source blob, snapshot, and stable publication identity.
+`--against-openproject` is deliberately rejected with `--apply` because a
+static snapshot cannot authorize a live mutation. Output `operation_count`
+reports only adapter effects completed by that invocation; `resumed: true`
+distinguishes a durable retry, and a terminal replay reports zero effects.
+
+This local command is an explicit human fallback: repository/ref policy plus
+the operator's `--apply` invocation authorizes it, but local Git reachability
+does not independently prove GitHub review or required-check evidence. Normal
+production publication must use the lifecycle path, which re-verifies the
+merged PR, current human approval, required checks, immutable GitHub blob, and
+durable approval record before calling the same publisher.
+
 ## Bootstrap
 
 Mount the following pre-created secret files into the official 17.6.0
@@ -94,8 +167,13 @@ a hard collision. The projection is: `blocked_by` → reverse `blocks`,
 `relates`. Every plan version shares a PostgreSQL advisory publication fence
 with every other version of the same stable plan ID; distinct approval
 deliveries therefore cannot publish two versions of one plan concurrently.
-The explicit v4 journal migration refuses any unfinished legacy publication
-because its original operation order cannot be recovered. Only terminal,
-fully-applied legacy rows receive deterministic display ordinals and an
-explicit archive identity; archived rows cannot be replayed. New publications
-remain fully ordered and hash-verified.
+The explicit v5 journal migration refuses any unfinished pre-v4 publication
+whose original operation order cannot be recovered and any unfinished v4
+publication that predates target binding. It also refuses a terminal v4
+publication while the matching lifecycle run is still `publishing`; inspect
+the already-recorded effects and explicitly resolve that lifecycle run before
+retrying the migration. Only terminal, fully applied legacy rows whose
+lifecycle is already closed receive deterministic display ordinals, a sentinel
+target, and an explicit archive identity; archived rows cannot be replayed.
+New publications remain fully ordered, hash-verified, and bound to one
+OpenProject target.

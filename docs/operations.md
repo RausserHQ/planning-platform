@@ -84,6 +84,11 @@ root-home Bun link with the pinned npm-installed `wmill` executable under
   `dead_letter`, so a later authorized attempt remains possible.
 - Publication conflicts move the Idea to `Blocked`, post the exact safe
   conflict, and perform no overwrite. Regenerate against a fresh snapshot.
+- The v5 publication migration fails closed when a fully applied pre-target
+  journal row still has a matching lifecycle run in `publishing`. Inspect the
+  journal audit and OpenProject effects, then resolve the lifecycle run through
+  the supported recovery procedure before rerunning migration; never backfill
+  a guessed target or edit either table by hand.
 - Nightly reconciliation selects workflow recovery from the newest run and
   graph authority independently from the newest successfully published run.
   It repairs missed merged-planning-PR events and durable
@@ -148,7 +153,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.8` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.9` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits
