@@ -109,8 +109,10 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.1` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.2` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
-blocks on fixable critical Trivy findings. GitOps consumes the resulting
-immutable digests, never the mutable display tags.
+blocks on fixable critical Trivy findings. The Windmill image also contains the
+reviewed workspace snapshot at `/opt/planning-platform-workspace`, so the
+one-shot sync Job does not fetch mutable source at runtime. GitOps consumes the
+resulting immutable digests, never the mutable display tags.

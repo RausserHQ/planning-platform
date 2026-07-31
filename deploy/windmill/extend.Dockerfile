@@ -5,6 +5,7 @@ ARG PLANNING_PLATFORM_VERSION=0.1.0
 
 USER root
 COPY dist/ /tmp/planning-platform-dist/
+COPY windmill/ /opt/planning-platform-workspace/
 RUN uv pip install --require-hashes \
       --target /opt/planning-platform \
       --requirement /tmp/planning-platform-dist/requirements.lock \
@@ -14,7 +15,9 @@ RUN uv pip install --require-hashes \
     && bun install -g windmill-cli@1.775.2 \
     && rm -rf /tmp/planning-platform-dist \
     && find /opt/planning-platform -type d -exec chmod 0755 {} + \
-    && find /opt/planning-platform -type f -exec chmod 0644 {} +
+    && find /opt/planning-platform -type f -exec chmod 0644 {} + \
+    && find /opt/planning-platform-workspace -type d -exec chmod 0755 {} + \
+    && find /opt/planning-platform-workspace -type f -exec chmod 0644 {} +
 
 ENV ADDITIONAL_PYTHON_PATHS=/opt/planning-platform \
     PIP_LOCAL_DEPENDENCIES="^planning-platform([<=> !].*)?$"

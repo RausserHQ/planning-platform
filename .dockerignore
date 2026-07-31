@@ -11,5 +11,9 @@
 !deploy/
 !deploy/windmill/
 !deploy/windmill/extend.Dockerfile
+!windmill/
+!windmill/**
+windmill/**/__pycache__/
+windmill/**/*.pyc
 !dist/
 !dist/**
