@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -36,26 +37,58 @@ class PlanningPullRequest(GitHubModel):
 
 
 class CheckEvidence(GitHubModel):
+    id: int = Field(ge=1)
     name: str = Field(min_length=1)
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    app_id: int = Field(ge=1)
+    app_slug: str = Field(min_length=1)
     status: Literal["queued", "in_progress", "completed"]
     conclusion: str | None = None
     details_url: str | None = None
+
+
+class ReviewEvidence(GitHubModel):
+    id: int = Field(ge=1)
+    actor_id: int = Field(ge=1)
+    actor_login: str = Field(min_length=1)
+    state: Literal["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED"]
+    submitted_at: datetime
+    commit_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
 class PullRequestEvidence(GitHubModel):
     repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     number: int = Field(ge=1)
     head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    state: Literal["open", "closed"]
     merged: bool
     merge_commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
-    approvals: int = Field(ge=0)
+    reviews: tuple[ReviewEvidence, ...]
     checks: tuple[CheckEvidence, ...]
 
-    def required_checks_pass(self, required: set[str]) -> bool:
-        by_name = {check.name: check for check in self.checks}
+    @property
+    def approvals(self) -> int:
+        return sum(
+            review.state == "APPROVED" and review.commit_sha == self.head_sha
+            for review in self.reviews
+        )
+
+    def required_checks_pass(
+        self,
+        required: set[str],
+        *,
+        trusted_app_slug: str = "github-actions",
+    ) -> bool:
+        by_name: dict[str, list[CheckEvidence]] = {}
+        for check in self.checks:
+            if check.app_slug == trusted_app_slug and check.head_sha == self.head_sha:
+                by_name.setdefault(check.name, []).append(check)
         return all(
             name in by_name
-            and by_name[name].status == "completed"
-            and by_name[name].conclusion == "success"
+            and bool(by_name[name])
+            and all(
+                check.status == "completed" and check.conclusion == "success"
+                for check in by_name[name]
+            )
             for name in required
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal, cast
@@ -39,8 +40,24 @@ class PlanRun:
     pull_request_number: int | None = None
     pull_request_url: str | None = None
     approved_commit: str | None = None
+    approval_evidence_sha256: str | None = None
     backlog_blob_sha1: str | None = None
     backlog_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class ImplementationPrAssociation:
+    repository: str
+    pull_request_number: int
+    plan_id: str
+    node_key: str
+    work_package_id: int
+    pull_request_url: str
+    head_sha: str
+    head_observed_at: datetime
+    pull_request_state: Literal["open", "closed"] = "open"
+    merged_commit: str | None = None
+    successful_check_sha: str | None = None
 
 
 class LifecycleStoreMismatch(ValueError):
@@ -70,6 +87,7 @@ class PostgresLifecycleStore:
             ("plan_runs", "pull_request_number", "int4", False),
             ("plan_runs", "pull_request_url", "text", False),
             ("plan_runs", "approved_commit", "text", False),
+            ("plan_runs", "approval_evidence_sha256", "text", False),
             ("plan_runs", "backlog_blob_sha1", "text", False),
             ("plan_runs", "backlog_sha256", "text", False),
             ("plan_runs", "created_at", "timestamptz", True),
@@ -81,6 +99,64 @@ class PostgresLifecycleStore:
             ("audit", "action", "text", True),
             ("audit", "outcome", "text", True),
             ("audit", "details", "jsonb", True),
+            ("implementation_pr_associations", "repository", "text", True),
+            (
+                "implementation_pr_associations",
+                "pull_request_number",
+                "int4",
+                True,
+            ),
+            ("implementation_pr_associations", "plan_id", "text", True),
+            ("implementation_pr_associations", "node_key", "text", True),
+            (
+                "implementation_pr_associations",
+                "work_package_id",
+                "int8",
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "pull_request_url",
+                "text",
+                True,
+            ),
+            ("implementation_pr_associations", "head_sha", "text", True),
+            (
+                "implementation_pr_associations",
+                "head_observed_at",
+                "timestamptz",
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "pull_request_state",
+                "text",
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "merged_commit",
+                "text",
+                False,
+            ),
+            (
+                "implementation_pr_associations",
+                "successful_check_sha",
+                "text",
+                False,
+            ),
+            (
+                "implementation_pr_associations",
+                "created_at",
+                "timestamptz",
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "updated_at",
+                "timestamptz",
+                True,
+            ),
         }
     )
     _REQUIRED_CONSTRAINTS: ClassVar[frozenset[tuple[str, str, tuple[str, ...], str]]] = frozenset(
@@ -125,8 +201,169 @@ class PostgresLifecycleStore:
                 ("event_id", "action", "outcome"),
                 "UNIQUE (event_id, action, outcome)",
             ),
+            (
+                "implementation_pr_associations",
+                "p",
+                ("repository", "pull_request_number"),
+                "PRIMARY KEY (repository, pull_request_number)",
+            ),
         }
     )
+    _REQUIRED_NAMED_CHECKS: ClassVar[
+        frozenset[tuple[str, str, tuple[str, ...], bool]]
+    ] = frozenset(
+        {
+            (
+                "plan_runs",
+                "plan_runs_approval_evidence_sha256_format",
+                ("approval_evidence_sha256",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_repository_format",
+                ("repository",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_number_positive",
+                ("pull_request_number",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_plan_id_present",
+                ("plan_id",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_node_key_present",
+                ("node_key",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_work_package_positive",
+                ("work_package_id",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_url_format",
+                ("pull_request_url",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_head_sha_format",
+                ("head_sha",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_state_valid",
+                ("pull_request_state",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_merge_sha_format",
+                ("merged_commit",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_success_sha_format",
+                ("successful_check_sha",),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_success_current_head",
+                ("head_sha", "successful_check_sha"),
+                True,
+            ),
+            (
+                "implementation_pr_associations",
+                "implementation_pr_merge_is_closed",
+                ("merged_commit", "pull_request_state"),
+                True,
+            ),
+        }
+    )
+    _REQUIRED_NAMED_CHECK_DEFINITIONS: ClassVar[
+        dict[tuple[str, str], str]
+    ] = {
+        (
+            "plan_runs",
+            "plan_runs_approval_evidence_sha256_format",
+        ): (
+            "CHECK (((approval_evidence_sha256 IS NULL) OR "
+            "(approval_evidence_sha256 ~ '^[0-9a-f]{64}$'::text)))"
+        ),
+        (
+            "implementation_pr_associations",
+            "implementation_pr_repository_format",
+        ): "CHECK ((repository ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'::text))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_number_positive",
+        ): "CHECK ((pull_request_number > 0))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_plan_id_present",
+        ): "CHECK ((length(plan_id) > 0))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_node_key_present",
+        ): "CHECK ((length(node_key) > 0))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_work_package_positive",
+        ): "CHECK ((work_package_id > 0))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_url_format",
+        ): "CHECK ((pull_request_url ~~ 'https://github.com/%'::text))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_head_sha_format",
+        ): "CHECK ((head_sha ~ '^[0-9a-f]{40}$'::text))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_state_valid",
+        ): "CHECK ((pull_request_state = ANY (ARRAY['open'::text, 'closed'::text])))",
+        (
+            "implementation_pr_associations",
+            "implementation_pr_merge_sha_format",
+        ): (
+            "CHECK (((merged_commit IS NULL) OR "
+            "(merged_commit ~ '^[0-9a-f]{40}$'::text)))"
+        ),
+        (
+            "implementation_pr_associations",
+            "implementation_pr_success_sha_format",
+        ): (
+            "CHECK (((successful_check_sha IS NULL) OR "
+            "(successful_check_sha ~ '^[0-9a-f]{40}$'::text)))"
+        ),
+        (
+            "implementation_pr_associations",
+            "implementation_pr_success_current_head",
+        ): (
+            "CHECK (((successful_check_sha IS NULL) OR "
+            "(successful_check_sha = head_sha)))"
+        ),
+        (
+            "implementation_pr_associations",
+            "implementation_pr_merge_is_closed",
+        ): (
+            "CHECK (((merged_commit IS NULL) OR "
+            "(pull_request_state = 'closed'::text)))"
+        ),
+    }
     _STATES = (
         "planning",
         "needs_input",
@@ -141,7 +378,12 @@ class PostgresLifecycleStore:
         artifact_prefix, backlog_path, snapshot_sha256, snapshot_etag, state,
         start_request_ciphertext, pending_resume_ciphertext, planning_commit,
         pull_request_number, pull_request_url, approved_commit,
-        backlog_blob_sha1, backlog_sha256
+        approval_evidence_sha256, backlog_blob_sha1, backlog_sha256
+    """
+    _IMPLEMENTATION_SELECT = """
+        repository, pull_request_number, plan_id, node_key, work_package_id,
+        pull_request_url, head_sha, head_observed_at, pull_request_state,
+        merged_commit, successful_check_sha
     """
     _TRANSITIONS: ClassVar[dict[PlanRunState, frozenset[PlanRunState]]] = {
         "planning": frozenset({"planning", "needs_input", "pr_open", "blocked", "failed"}),
@@ -189,6 +431,7 @@ class PostgresLifecycleStore:
                     pull_request_url text,
                     approved_commit text
                         CHECK (approved_commit IS NULL OR approved_commit ~ '^[0-9a-f]{{40}}$'),
+                    approval_evidence_sha256 text,
                     backlog_blob_sha1 text
                         CHECK (backlog_blob_sha1 IS NULL OR backlog_blob_sha1 ~ '^[0-9a-f]{{40}}$'),
                     backlog_sha256 text
@@ -197,6 +440,11 @@ class PostgresLifecycleStore:
                     updated_at timestamptz NOT NULL DEFAULT now(),
                     PRIMARY KEY (plan_id, plan_version),
                     UNIQUE (idea_id, plan_version),
+                    CONSTRAINT plan_runs_approval_evidence_sha256_format
+                        CHECK (
+                            approval_evidence_sha256 IS NULL
+                            OR approval_evidence_sha256 ~ '^[0-9a-f]{{64}}$'
+                        ),
                     CHECK (
                         (pull_request_number IS NULL AND pull_request_url IS NULL)
                         OR (pull_request_number IS NOT NULL AND pull_request_url IS NOT NULL)
@@ -208,6 +456,7 @@ class PostgresLifecycleStore:
                 "start_request_ciphertext text NOT NULL DEFAULT ''",
                 "pending_resume_ciphertext text",
                 "approved_commit text",
+                "approval_evidence_sha256 text",
                 "backlog_blob_sha1 text",
                 "backlog_sha256 text",
             ):
@@ -247,6 +496,171 @@ class PostgresLifecycleStore:
                 )
                 """
             )
+            connection.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {self._SCHEMA}.implementation_pr_associations (
+                    repository text NOT NULL,
+                    pull_request_number integer NOT NULL,
+                    plan_id text NOT NULL,
+                    node_key text NOT NULL,
+                    work_package_id bigint NOT NULL,
+                    pull_request_url text NOT NULL,
+                    head_sha text NOT NULL,
+                    head_observed_at timestamptz NOT NULL,
+                    pull_request_state text NOT NULL DEFAULT 'open',
+                    merged_commit text,
+                    successful_check_sha text,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    updated_at timestamptz NOT NULL DEFAULT now(),
+                    PRIMARY KEY (repository, pull_request_number),
+                    CONSTRAINT implementation_pr_repository_format
+                        CHECK (repository ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'),
+                    CONSTRAINT implementation_pr_number_positive
+                        CHECK (pull_request_number > 0),
+                    CONSTRAINT implementation_pr_plan_id_present
+                        CHECK (length(plan_id) > 0),
+                    CONSTRAINT implementation_pr_node_key_present
+                        CHECK (length(node_key) > 0),
+                    CONSTRAINT implementation_pr_work_package_positive
+                        CHECK (work_package_id > 0),
+                    CONSTRAINT implementation_pr_url_format
+                        CHECK (pull_request_url LIKE 'https://github.com/%'),
+                    CONSTRAINT implementation_pr_head_sha_format
+                        CHECK (head_sha ~ '^[0-9a-f]{{40}}$'),
+                    CONSTRAINT implementation_pr_state_valid
+                        CHECK (pull_request_state IN ('open','closed')),
+                    CONSTRAINT implementation_pr_merge_sha_format
+                        CHECK (
+                            merged_commit IS NULL
+                            OR merged_commit ~ '^[0-9a-f]{{40}}$'
+                        ),
+                    CONSTRAINT implementation_pr_success_sha_format
+                        CHECK (
+                            successful_check_sha IS NULL
+                            OR successful_check_sha ~ '^[0-9a-f]{{40}}$'
+                        ),
+                    CONSTRAINT implementation_pr_success_current_head
+                        CHECK (
+                            successful_check_sha IS NULL
+                            OR successful_check_sha = head_sha
+                        ),
+                    CONSTRAINT implementation_pr_merge_is_closed
+                        CHECK (
+                            merged_commit IS NULL
+                            OR pull_request_state = 'closed'
+                        )
+                )
+                """
+            )
+            connection.execute(
+                f"""
+                ALTER TABLE {self._SCHEMA}.implementation_pr_associations
+                ADD COLUMN IF NOT EXISTS pull_request_state text NOT NULL DEFAULT 'open'
+                """
+            )
+            connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.implementation_pr_associations
+                SET pull_request_state='closed'
+                WHERE merged_commit IS NOT NULL
+                  AND pull_request_state != 'closed'
+                """
+            )
+            named_constraints = (
+                (
+                    "plan_runs",
+                    "plan_runs_approval_evidence_sha256_format",
+                    (
+                        "approval_evidence_sha256 IS NULL OR "
+                        "approval_evidence_sha256 ~ '^[0-9a-f]{64}$'"
+                    ),
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_repository_format",
+                    "repository ~ '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_number_positive",
+                    "pull_request_number > 0",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_plan_id_present",
+                    "length(plan_id) > 0",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_node_key_present",
+                    "length(node_key) > 0",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_work_package_positive",
+                    "work_package_id > 0",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_url_format",
+                    "pull_request_url LIKE 'https://github.com/%'",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_head_sha_format",
+                    "head_sha ~ '^[0-9a-f]{40}$'",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_state_valid",
+                    "pull_request_state IN ('open','closed')",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_merge_sha_format",
+                    "merged_commit IS NULL OR merged_commit ~ '^[0-9a-f]{40}$'",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_success_sha_format",
+                    (
+                        "successful_check_sha IS NULL OR "
+                        "successful_check_sha ~ '^[0-9a-f]{40}$'"
+                    ),
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_success_current_head",
+                    "successful_check_sha IS NULL OR successful_check_sha = head_sha",
+                ),
+                (
+                    "implementation_pr_associations",
+                    "implementation_pr_merge_is_closed",
+                    "merged_commit IS NULL OR pull_request_state = 'closed'",
+                ),
+            )
+            for table, name, expression in named_constraints:
+                exists = connection.execute(
+                    """
+                    SELECT 1
+                    FROM pg_constraint AS constraint_record
+                    JOIN pg_class AS relation
+                      ON relation.oid = constraint_record.conrelid
+                    JOIN pg_namespace AS namespace
+                      ON namespace.oid = relation.relnamespace
+                    WHERE namespace.nspname=%s
+                      AND relation.relname=%s
+                      AND constraint_record.conname=%s
+                    """,
+                    (self._SCHEMA, table, name),
+                ).fetchone()
+                if exists is None:
+                    connection.execute(
+                        f"""
+                        ALTER TABLE {self._SCHEMA}.{table}
+                        ADD CONSTRAINT {name} CHECK ({expression})
+                        """
+                    )
 
     def ready(self) -> bool:
         try:
@@ -256,7 +670,11 @@ class PostgresLifecycleStore:
                     SELECT table_name, column_name, udt_name, is_nullable = 'NO'
                     FROM information_schema.columns
                     WHERE table_schema = %s
-                      AND table_name IN ('plan_runs', 'audit')
+                      AND table_name IN (
+                        'plan_runs',
+                        'audit',
+                        'implementation_pr_associations'
+                      )
                     """,
                     (self._SCHEMA,),
                 ).fetchall()
@@ -283,10 +701,45 @@ class PostgresLifecycleStore:
                       ON attribute.attrelid = relation.oid
                      AND attribute.attnum = key.attnum
                     WHERE namespace.nspname = %s
-                      AND relation.relname IN ('plan_runs', 'audit')
+                      AND relation.relname IN (
+                        'plan_runs',
+                        'audit',
+                        'implementation_pr_associations'
+                      )
                     GROUP BY relation.relname,
                              constraint_record.oid,
                              constraint_record.contype
+                    """,
+                    (self._SCHEMA,),
+                ).fetchall()
+                named_check_rows = connection.execute(
+                    """
+                    SELECT relation.relname,
+                           constraint_record.conname,
+                           COALESCE(
+                               array_agg(attribute.attname ORDER BY attribute.attname)
+                                   FILTER (WHERE attribute.attname IS NOT NULL),
+                               ARRAY[]::name[]
+                           ),
+                           constraint_record.convalidated,
+                           pg_get_constraintdef(constraint_record.oid)
+                    FROM pg_constraint AS constraint_record
+                    JOIN pg_class AS relation
+                      ON relation.oid = constraint_record.conrelid
+                    JOIN pg_namespace AS namespace
+                      ON namespace.oid = relation.relnamespace
+                    LEFT JOIN LATERAL
+                      unnest(constraint_record.conkey) AS key(attnum)
+                      ON true
+                    LEFT JOIN pg_attribute AS attribute
+                      ON attribute.attrelid = relation.oid
+                     AND attribute.attnum = key.attnum
+                    WHERE namespace.nspname = %s
+                      AND constraint_record.contype = 'c'
+                    GROUP BY relation.relname,
+                             constraint_record.conname,
+                             constraint_record.convalidated,
+                             constraint_record.oid
                     """,
                     (self._SCHEMA,),
                 ).fetchall()
@@ -331,6 +784,19 @@ class PostgresLifecycleStore:
             )
             for row in constraint_rows
         }
+        named_checks = {
+            (
+                str(row[0]),
+                str(row[1]),
+                tuple(str(column) for column in row[2]),
+                bool(row[3]),
+            )
+            for row in named_check_rows
+        }
+        named_check_definitions = {
+            (str(row[0]), str(row[1])): " ".join(str(row[4]).split())
+            for row in named_check_rows
+        }
         indexes = {
             str(row[0]): (
                 bool(row[1]),
@@ -348,6 +814,11 @@ class PostgresLifecycleStore:
             }
             & {(table, column) for table, column, _type, _required in columns}
             and constraints >= self._REQUIRED_CONSTRAINTS
+            and named_checks >= self._REQUIRED_NAMED_CHECKS
+            and all(
+                named_check_definitions.get(identity) == definition
+                for identity, definition in self._REQUIRED_NAMED_CHECK_DEFINITIONS.items()
+            )
             and repository_pr is not None
             and repository_pr[0]
             and repository_pr[1] == ("repository", "pull_request_number")
@@ -477,6 +948,51 @@ class PostgresLifecycleStore:
             raise LifecycleStoreMismatch("lifecycle run changed before its state transition")
         return self._restore(row)
 
+    def approve_for_publication(
+        self,
+        run: PlanRun,
+        *,
+        merge_commit: str,
+        evidence_sha256: str,
+    ) -> PlanRun:
+        """Atomically bind verified GitHub approval evidence before any publication."""
+        if run.state not in {"pr_open", "publishing"}:
+            raise LifecycleStoreMismatch(
+                f"cannot approve publication from lifecycle state {run.state}"
+            )
+        with psycopg.connect(self._database_url) as connection, connection.transaction():
+            row = connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.plan_runs
+                SET state='publishing', approved_commit=%s,
+                    approval_evidence_sha256=%s, updated_at=now()
+                WHERE plan_id=%s AND plan_version=%s
+                  AND state IN ('pr_open','publishing')
+                  AND (
+                    approved_commit IS NULL
+                    OR approved_commit=%s
+                  )
+                  AND (
+                    approval_evidence_sha256 IS NULL
+                    OR approval_evidence_sha256=%s
+                  )
+                RETURNING {self._SELECT}
+                """,
+                (
+                    merge_commit,
+                    evidence_sha256,
+                    run.plan_id,
+                    run.plan_version,
+                    merge_commit,
+                    evidence_sha256,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LifecycleStoreMismatch(
+                "planning approval evidence conflicts with the durable run"
+            )
+        return self._restore(row)
+
     def record_pending_resume(self, run: PlanRun, request_ciphertext: str) -> PlanRun:
         if not request_ciphertext:
             raise ValueError("pending planner resume request is required")
@@ -543,9 +1059,15 @@ class PostgresLifecycleStore:
                   AND state IN ('pr_open','publishing','published')
                   AND (
                     approved_commit IS NULL
+                    OR approved_commit=%s
+                  )
+                  AND (
+                    (
+                      backlog_blob_sha1 IS NULL
+                      AND backlog_sha256 IS NULL
+                    )
                     OR (
-                      approved_commit=%s
-                      AND backlog_blob_sha1=%s
+                      backlog_blob_sha1=%s
                       AND backlog_sha256=%s
                     )
                   )
@@ -590,6 +1112,199 @@ class PostgresLifecycleStore:
             ).fetchone()
         return None if row is None else self._restore(row)
 
+    def bind_implementation_pull_request(
+        self,
+        *,
+        repository: str,
+        number: int,
+        plan_id: str,
+        node_key: str,
+        work_package_id: int,
+        url: str,
+        head_sha: str,
+        observed_at: datetime,
+        pull_request_state: str,
+        merged_commit: str | None,
+    ) -> ImplementationPrAssociation:
+        """Persist an immutable PR-to-work-package identity and monotonic PR facts."""
+        self._validate_implementation_values(
+            repository=repository,
+            number=number,
+            plan_id=plan_id,
+            node_key=node_key,
+            work_package_id=work_package_id,
+            url=url,
+            head_sha=head_sha,
+            observed_at=observed_at,
+            pull_request_state=pull_request_state,
+            merged_commit=merged_commit,
+        )
+        with psycopg.connect(self._database_url) as connection, connection.transaction():
+            connection.execute(
+                f"""
+                INSERT INTO {self._SCHEMA}.implementation_pr_associations (
+                    repository, pull_request_number, plan_id, node_key,
+                    work_package_id, pull_request_url, head_sha,
+                    head_observed_at, pull_request_state, merged_commit
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (repository, pull_request_number) DO NOTHING
+                """,
+                (
+                    repository,
+                    number,
+                    plan_id,
+                    node_key,
+                    work_package_id,
+                    url,
+                    head_sha,
+                    observed_at,
+                    pull_request_state,
+                    merged_commit,
+                ),
+            )
+            row = connection.execute(
+                f"""
+                SELECT {self._IMPLEMENTATION_SELECT}
+                FROM {self._SCHEMA}.implementation_pr_associations
+                WHERE repository=%s AND pull_request_number=%s
+                FOR UPDATE
+                """,
+                (repository, number),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("implementation PR binding could not be observed")
+            current = self._restore_implementation(row)
+            immutable = (
+                current.plan_id == plan_id
+                and current.node_key == node_key
+                and current.work_package_id == work_package_id
+                and current.pull_request_url == url
+            )
+            if not immutable:
+                raise LifecycleStoreMismatch(
+                    "implementation PR replay changed its work-package identity"
+                )
+            if (
+                current.merged_commit is not None
+                and merged_commit is not None
+                and current.merged_commit != merged_commit
+            ):
+                raise LifecycleStoreMismatch(
+                    "implementation PR replay changed its merge commit"
+                )
+            if (
+                observed_at == current.head_observed_at
+                and (
+                    head_sha != current.head_sha
+                    or pull_request_state != current.pull_request_state
+                )
+            ):
+                raise LifecycleStoreMismatch(
+                    "implementation PR has conflicting facts at one observation time"
+                )
+            if current.merged_commit is not None and head_sha != current.head_sha:
+                raise LifecycleStoreMismatch(
+                    "merged implementation PR replay changed its head"
+                )
+            next_head = current.head_sha
+            next_observed = current.head_observed_at
+            next_state: Literal["open", "closed"] = current.pull_request_state
+            next_success = current.successful_check_sha
+            if (
+                current.merged_commit is None
+                and merged_commit is None
+                and observed_at > current.head_observed_at
+                and (
+                    head_sha != current.head_sha
+                    or pull_request_state != current.pull_request_state
+                )
+            ):
+                next_head = head_sha
+                next_observed = observed_at
+                next_state = cast(
+                    Literal["open", "closed"],
+                    pull_request_state,
+                )
+                if next_head != current.head_sha:
+                    next_success = None
+            next_merge = current.merged_commit or merged_commit
+            if next_merge is not None:
+                next_state = "closed"
+            row = connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.implementation_pr_associations
+                SET head_sha=%s, head_observed_at=%s, pull_request_state=%s,
+                    merged_commit=%s, successful_check_sha=%s, updated_at=now()
+                WHERE repository=%s AND pull_request_number=%s
+                RETURNING {self._IMPLEMENTATION_SELECT}
+                """,
+                (
+                    next_head,
+                    next_observed,
+                    next_state,
+                    next_merge,
+                    next_success,
+                    repository,
+                    number,
+                ),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("implementation PR binding update could not be observed")
+        return self._restore_implementation(row)
+
+    def record_implementation_check_result(
+        self,
+        repository: str,
+        number: int,
+        *,
+        head_sha: str,
+        passed: bool,
+    ) -> ImplementationPrAssociation | None:
+        """Converge required-check evidence for the association's current head."""
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise ValueError("implementation check head must be a full commit SHA")
+        value = head_sha if passed else None
+        with psycopg.connect(self._database_url) as connection, connection.transaction():
+            row = connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.implementation_pr_associations
+                SET successful_check_sha=%s, updated_at=now()
+                WHERE repository=%s AND pull_request_number=%s
+                  AND head_sha=%s
+                RETURNING {self._IMPLEMENTATION_SELECT}
+                """,
+                (value, repository, number, head_sha),
+            ).fetchone()
+        return None if row is None else self._restore_implementation(row)
+
+    def by_implementation_pull_request(
+        self,
+        repository: str,
+        number: int,
+    ) -> ImplementationPrAssociation | None:
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT {self._IMPLEMENTATION_SELECT}
+                FROM {self._SCHEMA}.implementation_pr_associations
+                WHERE repository=%s AND pull_request_number=%s
+                """,
+                (repository, number),
+            ).fetchone()
+        return None if row is None else self._restore_implementation(row)
+
+    def implementation_associations(self) -> tuple[ImplementationPrAssociation, ...]:
+        with psycopg.connect(self._database_url) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {self._IMPLEMENTATION_SELECT}
+                FROM {self._SCHEMA}.implementation_pr_associations
+                ORDER BY repository, pull_request_number
+                """
+            ).fetchall()
+        return tuple(self._restore_implementation(row) for row in rows)
+
     def latest_for_idea(self, idea_id: int) -> PlanRun | None:
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(
@@ -600,6 +1315,19 @@ class PostgresLifecycleStore:
                 LIMIT 1
                 """,
                 (idea_id,),
+            ).fetchone()
+        return None if row is None else self._restore(row)
+
+    def latest_published(self, plan_id: str) -> PlanRun | None:
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT {self._SELECT} FROM {self._SCHEMA}.plan_runs
+                WHERE plan_id=%s AND state='published'
+                ORDER BY plan_version DESC
+                LIMIT 1
+                """,
+                (plan_id,),
             ).fetchone()
         return None if row is None else self._restore(row)
 
@@ -682,6 +1410,70 @@ class PostgresLifecycleStore:
             pull_request_number=row[14],
             pull_request_url=None if row[15] is None else str(row[15]),
             approved_commit=None if row[16] is None else str(row[16]),
-            backlog_blob_sha1=None if row[17] is None else str(row[17]),
-            backlog_sha256=None if row[18] is None else str(row[18]),
+            approval_evidence_sha256=None if row[17] is None else str(row[17]),
+            backlog_blob_sha1=None if row[18] is None else str(row[18]),
+            backlog_sha256=None if row[19] is None else str(row[19]),
+        )
+
+    @staticmethod
+    def _validate_implementation_values(
+        *,
+        repository: str,
+        number: int,
+        plan_id: str,
+        node_key: str,
+        work_package_id: int,
+        url: str,
+        head_sha: str,
+        observed_at: datetime,
+        pull_request_state: str,
+        merged_commit: str | None,
+    ) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+            raise ValueError("implementation PR repository is invalid")
+        if number <= 0 or work_package_id <= 0:
+            raise ValueError("implementation PR identifiers must be positive")
+        if not plan_id or not node_key:
+            raise ValueError("implementation PR plan identity is required")
+        if not url.startswith("https://github.com/"):
+            raise ValueError("implementation PR URL must be a GitHub HTTPS URL")
+        if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise ValueError("implementation PR head must be a full commit SHA")
+        if (
+            merged_commit is not None
+            and not re.fullmatch(r"[0-9a-f]{40}", merged_commit)
+        ):
+            raise ValueError("implementation PR merge commit must be a full commit SHA")
+        if observed_at.tzinfo is None:
+            raise ValueError("implementation PR observation time must be timezone aware")
+        if pull_request_state not in {"open", "closed"}:
+            raise ValueError("implementation PR state must be open or closed")
+        if merged_commit is not None and pull_request_state != "closed":
+            raise ValueError("a merged implementation PR must be closed")
+
+    @staticmethod
+    def _restore_implementation(
+        row: tuple[object, ...],
+    ) -> ImplementationPrAssociation:
+        if (
+            not isinstance(row[1], int)
+            or not isinstance(row[4], int)
+            or not isinstance(row[7], datetime)
+            or str(row[8]) not in {"open", "closed"}
+        ):
+            raise LifecycleStoreMismatch(
+                "implementation PR association has an invalid database shape"
+            )
+        return ImplementationPrAssociation(
+            repository=str(row[0]),
+            pull_request_number=row[1],
+            plan_id=str(row[2]),
+            node_key=str(row[3]),
+            work_package_id=row[4],
+            pull_request_url=str(row[5]),
+            head_sha=str(row[6]),
+            head_observed_at=row[7],
+            pull_request_state=cast(Literal["open", "closed"], str(row[8])),
+            merged_commit=None if row[9] is None else str(row[9]),
+            successful_check_sha=None if row[10] is None else str(row[10]),
         )

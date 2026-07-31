@@ -17,8 +17,10 @@ RUN npm install --global "npm@${NPM_VERSION}" \
     && uv pip install --no-deps \
       --target /opt/planning-platform \
       "/tmp/planning-platform-dist/planning_platform-${PLANNING_PLATFORM_VERSION}-py3-none-any.whl" \
-    && bun install -g windmill-cli@1.775.2 \
-    && rm -rf /root/.bun/install/cache \
+    && rm -f /usr/bin/wmill \
+    && npm install --global "windmill-cli@1.775.2" \
+    && wmill_version="$(wmill --version)" \
+    && printf '%s\n' "$wmill_version" | grep -Fqx "CLI version: 1.775.2" \
     && rm -rf /tmp/planning-platform-dist \
     && find /opt/planning-platform -type d -exec chmod 0755 {} + \
     && find /opt/planning-platform -type f -exec chmod 0644 {} + \

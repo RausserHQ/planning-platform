@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,7 +11,13 @@ from uuid import uuid4
 import pytest
 import yaml
 
-from planning_platform.github_models import ImmutableArtifactBinding
+from planning_platform.github_adapter import GitHubAdapterError
+from planning_platform.github_models import (
+    CheckEvidence,
+    ImmutableArtifactBinding,
+    PullRequestEvidence,
+    ReviewEvidence,
+)
 from planning_platform.lifecycle.models import (
     EventActor,
     EventSubject,
@@ -20,11 +26,18 @@ from planning_platform.lifecycle.models import (
 )
 from planning_platform.lifecycle.planner_client import PlannerThreadNotFound
 from planning_platform.lifecycle.recovery import RecoveryCipher, RecoveryPayloadRejected
-from planning_platform.lifecycle.service import LifecycleService
-from planning_platform.lifecycle.store import PlanRun
+from planning_platform.lifecycle.service import LifecycleEventRejected, LifecycleService
+from planning_platform.lifecycle.store import (
+    ImplementationPrAssociation,
+    LifecycleStoreMismatch,
+    PlanRun,
+)
 from planning_platform.loader import load_artifact
 from planning_platform.openproject import OpenProjectSnapshot, WorkPackageSnapshot
 from planning_platform.planner.models import (
+    ArtifactBundle,
+    ArtifactContent,
+    ArtifactManifestEntry,
     PlanResponse,
     RepositoryFile,
     RepositorySnapshot,
@@ -33,15 +46,67 @@ from planning_platform.planner.models import (
 )
 from planning_platform.publication_journal import InMemoryPublicationJournal
 
+_PLANNING_REPOSITORY = "RausserHQ/planning-platform"
+_IMPLEMENTATION_CHECKS = {"Acme/service": {"implementation-tests"}}
+
+
+def _review(
+    head_sha: str,
+    *,
+    state: str = "APPROVED",
+    review_id: int = 1,
+) -> ReviewEvidence:
+    return ReviewEvidence.model_validate(
+        {
+            "id": review_id,
+            "actor_id": 7,
+            "actor_login": "reviewer",
+            "state": state,
+            "submitted_at": "2026-07-30T19:00:00Z",
+            "commit_sha": head_sha,
+        }
+    )
+
+
+def _check(
+    name: str,
+    head_sha: str,
+    *,
+    conclusion: str = "success",
+    check_id: int = 1,
+    app_id: int = 15368,
+    app_slug: str = "github-actions",
+) -> CheckEvidence:
+    return CheckEvidence(
+        id=check_id,
+        name=name,
+        head_sha=head_sha,
+        app_id=app_id,
+        app_slug=app_slug,
+        status="completed",
+        conclusion=conclusion,
+    )
+
+
+def _service_policy() -> dict[str, object]:
+    return {
+        "planning_repository": _PLANNING_REPOSITORY,
+        "implementation_required_checks": _IMPLEMENTATION_CHECKS,
+    }
+
 
 class MemoryStore:
     def __init__(self, run: PlanRun | None = None, *, crash_on_publish: bool = False) -> None:
         self.run = run
         self.audit_rows: list[tuple[str, str]] = []
         self.crash_on_publish = crash_on_publish
+        self.implementation: dict[tuple[str, int], ImplementationPrAssociation] = {}
 
     def latest_for_idea(self, _idea_id: int) -> PlanRun | None:
         return self.run
+
+    def all(self) -> tuple[PlanRun, ...]:
+        return () if self.run is None else (self.run,)
 
     def begin(self, run: PlanRun) -> PlanRun:
         if self.run is None:
@@ -53,6 +118,21 @@ class MemoryStore:
             self.crash_on_publish = False
             raise RuntimeError("simulated crash after publication apply")
         self.run = replace(run, state=state)
+        return self.run
+
+    def approve_for_publication(
+        self,
+        run: PlanRun,
+        *,
+        merge_commit: str,
+        evidence_sha256: str,
+    ) -> PlanRun:
+        self.run = replace(
+            run,
+            state="publishing",
+            approved_commit=merge_commit,
+            approval_evidence_sha256=evidence_sha256,
+        )
         return self.run
 
     def by_pull_request(self, repository: str, number: int) -> PlanRun | None:
@@ -80,6 +160,115 @@ class MemoryStore:
         )
         return self.run
 
+    def bind_implementation_pull_request(
+        self,
+        *,
+        repository: str,
+        number: int,
+        plan_id: str,
+        node_key: str,
+        work_package_id: int,
+        url: str,
+        head_sha: str,
+        observed_at: datetime,
+        pull_request_state: str,
+        merged_commit: str | None,
+    ) -> ImplementationPrAssociation:
+        key = repository, number
+        current = self.implementation.get(key)
+        if current is None:
+            current = ImplementationPrAssociation(
+                repository=repository,
+                pull_request_number=number,
+                plan_id=plan_id,
+                node_key=node_key,
+                work_package_id=work_package_id,
+                pull_request_url=url,
+                head_sha=head_sha,
+                head_observed_at=observed_at,
+                pull_request_state=pull_request_state,  # type: ignore[arg-type]
+                merged_commit=merged_commit,
+            )
+        elif (
+            current.plan_id,
+            current.node_key,
+            current.work_package_id,
+            current.pull_request_url,
+        ) != (plan_id, node_key, work_package_id, url):
+            raise LifecycleStoreMismatch(
+                "implementation PR replay changed its work-package identity"
+            )
+        elif (
+            current.merged_commit is None
+            and observed_at > current.head_observed_at
+            and (
+                head_sha != current.head_sha
+                or pull_request_state != current.pull_request_state
+            )
+        ):
+            current = replace(
+                current,
+                head_sha=head_sha,
+                head_observed_at=observed_at,
+                pull_request_state=pull_request_state,  # type: ignore[arg-type]
+                successful_check_sha=(
+                    current.successful_check_sha
+                    if head_sha == current.head_sha
+                    else None
+                ),
+            )
+        if merged_commit is not None:
+            if (
+                current.merged_commit is not None
+                and current.merged_commit != merged_commit
+            ):
+                raise LifecycleStoreMismatch(
+                    "implementation PR replay changed its merge commit"
+                )
+            current = replace(
+                current,
+                pull_request_state="closed",
+                merged_commit=merged_commit,
+            )
+        self.implementation[key] = current
+        return current
+
+    def record_implementation_check_result(
+        self,
+        repository: str,
+        number: int,
+        *,
+        head_sha: str,
+        passed: bool,
+    ) -> ImplementationPrAssociation | None:
+        key = repository, number
+        current = self.implementation.get(key)
+        if current is None or current.head_sha != head_sha:
+            return None
+        current = replace(
+            current,
+            successful_check_sha=head_sha if passed else None,
+        )
+        self.implementation[key] = current
+        return current
+
+    def by_implementation_pull_request(
+        self,
+        repository: str,
+        number: int,
+    ) -> ImplementationPrAssociation | None:
+        return self.implementation.get((repository, number))
+
+    def implementation_associations(self) -> tuple[ImplementationPrAssociation, ...]:
+        return tuple(self.implementation.values())
+
+    def latest_published(self, plan_id: str) -> SimpleNamespace | None:
+        if self.run is not None and self.run.plan_id == plan_id and self.run.state == "published":
+            return SimpleNamespace(plan_version=self.run.plan_version)
+        if plan_id == "idea-42":
+            return SimpleNamespace(plan_version=1)
+        return None
+
     def clear_pending_resume(self, run: PlanRun, _request_ciphertext: str) -> PlanRun:
         assert self.run is not None
         self.run = replace(self.run, pending_resume_ciphertext=None)
@@ -93,6 +282,25 @@ class OpenProjectFake:
     def __init__(self) -> None:
         self.states: list[tuple[int, str | None, str | None]] = []
         self.comments: list[str] = []
+        self.config = SimpleNamespace(
+            status_ids={
+                "Draft": 1,
+                "Planning": 2,
+                "Needs Input": 3,
+                "Proposed": 4,
+                "Ready": 5,
+                "In Progress": 6,
+                "Blocked": 7,
+                "Review": 8,
+                "Done": 9,
+                "Superseded": 10,
+                "Rejected": 11,
+            }
+        )
+        self._status_id = 5
+        self._evidence_state: str | None = None
+        self.repository = "Acme/service"
+        self.plan_version = 1
 
     def read_work_package(self, work_package_id: int) -> dict[str, Any]:
         return {
@@ -123,6 +331,22 @@ class OpenProjectFake:
         evidence_state: str | None = None,
     ) -> None:
         self.states.append((work_package_id, status, evidence_state))
+        if status is not None:
+            self._status_id = self.config.status_ids[status]
+        if evidence_state is not None:
+            self._evidence_state = evidence_state
+
+    def resolve(self, identity: tuple[str, str]) -> WorkPackageSnapshot:
+        return WorkPackageSnapshot(
+            id=101,
+            lock_version=1,
+            plan_id=identity[0],
+            node_key=identity[1],
+            plan_version=self.plan_version,
+            repository=self.repository,
+            human_fields={"status_id": self._status_id},
+            evidence_state=self._evidence_state,
+        )
 
 
 class GitHubContextFake:
@@ -147,6 +371,9 @@ class GitHubContextFake:
                 files=(file,),
             ),
         )
+
+    async def repository_head(self, _repository: str) -> tuple[str, str]:
+        return "main", "f" * 40
 
 
 class CrashThenFailPlanner:
@@ -239,6 +466,7 @@ async def test_crash_after_run_insert_replays_the_exact_persisted_start_request(
         store=store,  # type: ignore[arg-type]
         publication_database_url="postgresql://unused",
         recovery_cipher=_cipher(),
+        **_service_policy(),
     )
     event = _work_package_event()
     with pytest.raises(RuntimeError, match="simulated"):
@@ -247,6 +475,8 @@ async def test_crash_after_run_insert_replays_the_exact_persisted_start_request(
     assert store.run.start_request_ciphertext.startswith("v1:")
     assert "Recover crash windows" not in store.run.start_request_ciphertext
     assert "# Planning Platform" not in store.run.start_request_ciphertext
+    assert store.run.repository == _PLANNING_REPOSITORY
+    assert store.run.base_branch == "main"
 
     outcome = await service.handle(event)
     assert outcome.outcome == "failed"
@@ -313,6 +543,7 @@ async def test_crash_after_resume_replays_the_persisted_idempotent_resume() -> N
         store=store,  # type: ignore[arg-type]
         publication_database_url="postgresql://unused",
         recovery_cipher=_cipher(),
+        **_service_policy(),
     )
     now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
     event = envelope_for_delivery(
@@ -341,6 +572,693 @@ async def test_crash_after_resume_replays_the_persisted_idempotent_resume() -> N
     assert store.run is not None
     assert store.run.state == "failed"
     assert store.run.pending_resume_ciphertext is None
+
+
+@pytest.mark.asyncio
+async def test_service_comment_cannot_replay_a_pending_human_resume() -> None:
+    request = ResumePlanRequest.model_validate(
+        {
+            "event": {
+                "idempotency_key": "event:openproject:resume:12345678",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": "interrupt-1",
+            "comment_id": 19,
+            "comment_created_at": "2026-07-30T19:00:00Z",
+            "answer": "Use the bounded migration.",
+        }
+    )
+    ciphertext = _cipher().seal(
+        purpose="planner-resume",
+        binding="openproject:42:planning:1",
+        plaintext=request.model_dump_json(),
+    )
+    run = PlanRun(
+        idea_id=42,
+        plan_id="idea-42",
+        plan_version=1,
+        thread_id="openproject:42:planning:1",
+        repository="RausserHQ/planning-platform",
+        base_branch="a" * 40,
+        artifact_prefix="planning/idea-42/v1",
+        backlog_path="planning/idea-42/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag='"snapshot-1"',
+        state="needs_input",
+        pending_resume_ciphertext=ciphertext,
+    )
+    store = MemoryStore(run)
+    planner = ResumeCrashPlanner()
+    service = LifecycleService(
+        planner=planner,  # type: ignore[arg-type]
+        openproject=OpenProjectFake(),  # type: ignore[arg-type]
+        github=object(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    event = envelope_for_delivery(
+        event_type="openproject.idea_comment",
+        source="windmill",
+        delivery_id="service-comment",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="service", id="7"),
+        subject=EventSubject(idea_id=42),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={
+            "work_package_comment": {
+                "id": 20,
+                "createdAt": "2026-07-30T19:01:00Z",
+                "comment": {
+                    "raw": (
+                        "Planning input required.\n\n"
+                        "<!-- planning-platform:comment:"
+                        "interrupt:openproject:42:planning:1:interrupt-1 -->"
+                    )
+                },
+                "_links": {"workPackage": {"href": "/api/v3/work_packages/42"}},
+            }
+        },
+    )
+
+    outcome = await service.handle(event)
+
+    assert outcome.outcome == "ignored_service_comment"
+    assert planner.requests == []
+    assert store.run is not None
+    assert store.run.state == "needs_input"
+    assert store.run.pending_resume_ciphertext == ciphertext
+
+
+def _implementation_pr_event(
+    *,
+    delivery: str,
+    occurred_at: datetime,
+    node_key: str = "implement-core",
+    merged: bool = False,
+    head_sha: str = "d" * 40,
+    state: str | None = None,
+    number: int = 23,
+    repository: str = "Acme/service",
+):
+    return envelope_for_delivery(
+        event_type="github.pull_request",
+        source="github",
+        delivery_id=delivery,
+        occurred_at=occurred_at,
+        received_at=occurred_at,
+        actor=EventActor(kind="service", id="github-app"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={
+            "pull_request": {
+                "number": number,
+                "body": (
+                    "<!-- planning-platform:work-package "
+                    f"plan_id=idea-42 node_key={node_key} -->"
+                ),
+                "html_url": f"https://github.com/{repository}/pull/{number}",
+                "head": {"sha": head_sha},
+                "state": state or ("closed" if merged else "open"),
+                "merged": merged,
+                "merge_commit_sha": "e" * 40 if merged else None,
+            },
+            "repository": {"full_name": repository},
+        },
+    )
+
+
+def _implementation_check_event(
+    *,
+    delivery: str,
+    occurred_at: datetime,
+    conclusion: str = "success",
+    head_sha: str = "d" * 40,
+    number: int = 23,
+    repository: str = "Acme/service",
+):
+    return envelope_for_delivery(
+        event_type="github.check_run",
+        source="github",
+        delivery_id=delivery,
+        occurred_at=occurred_at,
+        received_at=occurred_at,
+        actor=EventActor(kind="service", id="github-app"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={
+            "check_run": {
+                "id": 501,
+                "name": "implementation-tests",
+                "app": {"id": 15368, "slug": "github-actions"},
+                "status": "completed",
+                "conclusion": conclusion,
+                "head_sha": head_sha,
+                "pull_requests": [{"number": number}],
+            },
+            "repository": {"full_name": repository},
+        },
+    )
+
+
+class ImplementationGitHubFake:
+    def __init__(self) -> None:
+        self.conclusion = "success"
+        self.check_name = "implementation-tests"
+        self.app_slug = "github-actions"
+        self.state = "open"
+
+    async def pull_request_evidence(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str | None = None,
+    ) -> PullRequestEvidence:
+        head_sha = expected_head_sha or "d" * 40
+        return PullRequestEvidence(
+            repository=repository,
+            number=number,
+            head_sha=head_sha,
+            state=self.state,  # type: ignore[arg-type]
+            merged=False,
+            merge_commit_sha=None,
+            reviews=(),
+            checks=(
+                _check(
+                    self.check_name,
+                    head_sha,
+                    conclusion=self.conclusion,
+                    app_slug=self.app_slug,
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_implementation_pr_and_check_events_converge_through_durable_mapping() -> None:
+    store = MemoryStore()
+    openproject = OpenProjectFake()
+    github = ImplementationGitHubFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    opened_at = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+
+    opened = await service.handle(
+        _implementation_pr_event(delivery="implementation-open", occurred_at=opened_at)
+    )
+    association = store.by_implementation_pull_request("Acme/service", 23)
+    assert opened.outcome == "open"
+    assert association is not None
+    assert (association.plan_id, association.node_key, association.work_package_id) == (
+        "idea-42",
+        "implement-core",
+        101,
+    )
+    assert openproject.states[-1] == (101, "In Progress", "pr_open")
+    assert openproject.comments[-1].endswith(
+        "https://github.com/Acme/service/pull/23"
+    )
+
+    checked = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-check",
+            occurred_at=opened_at.replace(minute=2),
+        )
+    )
+    assert checked.outcome == "successful:1"
+    assert openproject.states[-1] == (101, "Review", "check_passed")
+
+    state_count = len(openproject.states)
+    second = await service.handle(
+        _implementation_pr_event(
+            delivery="implementation-second-open",
+            occurred_at=opened_at.replace(minute=3),
+            number=24,
+        )
+    )
+    assert second.outcome == "open"
+    assert len(openproject.states) == state_count
+    assert openproject._status_id == openproject.config.status_ids["Review"]
+
+    openproject._status_id = openproject.config.status_ids["Done"]
+    merged = await service.handle(
+        _implementation_pr_event(
+            delivery="implementation-merge",
+            occurred_at=opened_at.replace(minute=4),
+            merged=True,
+        )
+    )
+    assert merged.outcome == "merged"
+    assert openproject.states[-1] == (101, None, "pr_merged")
+    assert openproject._status_id == openproject.config.status_ids["Done"]
+
+    reordered = await service.handle(
+        _implementation_pr_event(
+            delivery="implementation-late-open",
+            occurred_at=opened_at.replace(minute=2),
+        )
+    )
+    assert reordered.outcome == "merged"
+    assert openproject.states[-1] == (101, None, "pr_merged")
+    assert openproject._status_id == openproject.config.status_ids["Done"]
+
+
+@pytest.mark.asyncio
+async def test_implementation_mapping_rejects_retarget_and_stale_or_failed_checks() -> None:
+    store = MemoryStore()
+    openproject = OpenProjectFake()
+    github = ImplementationGitHubFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    await service.handle(
+        _implementation_pr_event(delivery="implementation-bind", occurred_at=now)
+    )
+    states_before = len(openproject.states)
+
+    stale = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-stale-check",
+            occurred_at=now.replace(minute=2),
+            head_sha="f" * 40,
+        )
+    )
+    github.conclusion = "failure"
+    failed = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-failed-check",
+            occurred_at=now.replace(minute=3),
+            conclusion="failure",
+        )
+    )
+    assert stale.outcome == "successful:0"
+    assert failed.outcome == "successful:0"
+    assert len(openproject.states) == states_before
+
+    with pytest.raises(LifecycleStoreMismatch, match="identity"):
+        await service.handle(
+            _implementation_pr_event(
+                delivery="implementation-retarget",
+                occurred_at=now.replace(minute=4),
+                node_key="different-node",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_implementation_mapping_rejects_inactive_or_wrong_repository_nodes() -> None:
+    store = MemoryStore()
+    openproject = OpenProjectFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=ImplementationGitHubFake(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+
+    closed = await service.handle(
+        _implementation_pr_event(
+            delivery="implementation-closed",
+            occurred_at=now,
+            state="closed",
+        )
+    )
+    association = store.by_implementation_pull_request("Acme/service", 23)
+    assert closed.outcome == "closed"
+    assert association is not None and association.pull_request_state == "closed"
+    assert openproject.states[-1] == (101, None, "pr_closed")
+    assert openproject._status_id == openproject.config.status_ids["Ready"]
+
+    openproject.repository = "Other/service"
+    with pytest.raises(LifecycleEventRejected, match="active approved repository"):
+        await service.handle(
+            _implementation_pr_event(
+                delivery="implementation-wrong-repository",
+                occurred_at=now.replace(minute=2),
+                number=24,
+            )
+        )
+
+    openproject.repository = "Acme/service"
+    openproject._status_id = openproject.config.status_ids["Superseded"]
+    with pytest.raises(LifecycleEventRejected, match="active approved repository"):
+        await service.handle(
+            _implementation_pr_event(
+                delivery="implementation-superseded",
+                occurred_at=now.replace(minute=3),
+                number=25,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_only_configured_trusted_current_checks_advance_implementation() -> None:
+    store = MemoryStore()
+    openproject = OpenProjectFake()
+    github = ImplementationGitHubFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    await service.handle(
+        _implementation_pr_event(delivery="implementation-bind", occurred_at=now)
+    )
+
+    github.check_name = "unconfigured-check"
+    wrong_name = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-wrong-check",
+            occurred_at=now.replace(minute=2),
+        )
+    )
+    github.check_name = "implementation-tests"
+    github.app_slug = "untrusted-app"
+    wrong_app = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-wrong-app",
+            occurred_at=now.replace(minute=3),
+        )
+    )
+    github.app_slug = "github-actions"
+    passing = await service.handle(
+        _implementation_check_event(
+            delivery="implementation-trusted-check",
+            occurred_at=now.replace(minute=4),
+        )
+    )
+
+    assert wrong_name.outcome == "successful:0"
+    assert wrong_app.outcome == "successful:0"
+    assert passing.outcome == "successful:1"
+    association = store.by_implementation_pull_request("Acme/service", 23)
+    assert association is not None
+    assert association.successful_check_sha == association.head_sha
+    assert openproject._status_id == openproject.config.status_ids["Review"]
+
+
+class SnapshotOpenProjectFake(OpenProjectFake):
+    def snapshot(self) -> OpenProjectSnapshot:
+        return OpenProjectSnapshot(
+            captured_at="2026-07-30T19:00:00Z",
+            etag='"snapshot-1"',
+            sha256="b" * 64,
+            work_packages=(self.resolve(("idea-42", "implement-core")),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_closed_implementation_pr_becomes_a_stale_evidence_finding() -> None:
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    store = MemoryStore()
+    store.bind_implementation_pull_request(
+        repository="Acme/service",
+        number=23,
+        plan_id="idea-42",
+        node_key="implement-core",
+        work_package_id=101,
+        url="https://github.com/Acme/service/pull/23",
+        head_sha="d" * 40,
+        observed_at=now - timedelta(days=2),
+        pull_request_state="closed",
+        merged_commit=None,
+    )
+    openproject = SnapshotOpenProjectFake()
+    openproject._status_id = openproject.config.status_ids["In Progress"]
+    openproject._evidence_state = "pr_closed"
+    github = ImplementationGitHubFake()
+    github.state = "closed"
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        planning_repository=_PLANNING_REPOSITORY,
+        implementation_required_checks=_IMPLEMENTATION_CHECKS,
+        implementation_stale_after=timedelta(hours=24),
+    )
+    event = envelope_for_delivery(
+        event_type="reconciliation.scheduled",
+        source="scheduler",
+        delivery_id="closed-implementation-stale",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"schedule": "nightly"},
+    )
+
+    outcome = await service.handle(event)
+
+    assert ":findings:1:" in outcome.outcome
+    association = store.by_implementation_pull_request("Acme/service", 23)
+    assert association is not None and association.pull_request_state == "closed"
+    assert openproject._status_id == openproject.config.status_ids["In Progress"]
+
+
+class ImplementationReconciliationOpenProjectFake(OpenProjectFake):
+    pass
+
+
+class ImplementationReconciliationGitHubFake:
+    async def pull_request_evidence(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str | None = None,
+    ) -> PullRequestEvidence:
+        head_sha = expected_head_sha or "d" * 40
+        return PullRequestEvidence(
+            repository=repository,
+            number=number,
+            head_sha=head_sha,
+            state="closed",
+            merged=True,
+            merge_commit_sha="e" * 40,
+            reviews=(_review(head_sha),),
+            checks=(
+                _check("implementation-tests", head_sha),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_suppressed_implementation_merge_and_check() -> None:
+    store = MemoryStore()
+    opened_at = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    store.bind_implementation_pull_request(
+        repository="Acme/service",
+        number=23,
+        plan_id="idea-42",
+        node_key="implement-core",
+        work_package_id=101,
+        url="https://github.com/Acme/service/pull/23",
+        head_sha="d" * 40,
+        observed_at=opened_at,
+        pull_request_state="open",
+        merged_commit=None,
+    )
+    openproject = ImplementationReconciliationOpenProjectFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=ImplementationReconciliationGitHubFake(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    event = envelope_for_delivery(
+        event_type="reconciliation.scheduled",
+        source="scheduler",
+        delivery_id="repair-suppressed-implementation",
+        occurred_at=opened_at.replace(minute=5),
+        received_at=opened_at.replace(minute=5),
+        actor=EventActor(kind="system", id="windmill"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"schedule": "nightly"},
+    )
+
+    outcome = await service.handle(event)
+
+    association = store.by_implementation_pull_request("Acme/service", 23)
+    assert association is not None
+    assert association.merged_commit == "e" * 40
+    assert association.successful_check_sha == "d" * 40
+    assert openproject.states[-1] == (101, "Review", "pr_merged")
+    assert "implementation_repairs:1" in outcome.outcome
+
+
+class PartialImplementationReconciliationGitHubFake:
+    async def pull_request_evidence(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str | None = None,
+    ) -> PullRequestEvidence:
+        del expected_head_sha
+        if number == 23:
+            raise GitHubAdapterError("repository is temporarily inaccessible")
+        head_sha = "f" * 40
+        return PullRequestEvidence(
+            repository=repository,
+            number=number,
+            head_sha=head_sha,
+            state="open",
+            merged=False,
+            merge_commit_sha=None,
+            reviews=(),
+            checks=(_check("implementation-tests", head_sha),),
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_repairs_projection_and_missed_head_without_global_abort() -> None:
+    store = MemoryStore()
+    observed_at = datetime(2026, 7, 28, 19, 1, tzinfo=UTC)
+    for number, head_sha in ((23, "d" * 40), (24, "e" * 40)):
+        store.bind_implementation_pull_request(
+            repository="Acme/service",
+            number=number,
+            plan_id="idea-42",
+            node_key="implement-core",
+            work_package_id=101,
+            url=f"https://github.com/Acme/service/pull/{number}",
+            head_sha=head_sha,
+            observed_at=observed_at,
+            pull_request_state="open",
+            merged_commit=None,
+        )
+    store.record_implementation_check_result(
+        "Acme/service",
+        24,
+        head_sha="e" * 40,
+        passed=True,
+    )
+    openproject = ImplementationReconciliationOpenProjectFake()
+    openproject._status_id = openproject.config.status_ids["In Progress"]
+    openproject._evidence_state = "pr_open"
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=PartialImplementationReconciliationGitHubFake(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    event = envelope_for_delivery(
+        event_type="reconciliation.scheduled",
+        source="scheduler",
+        delivery_id="partial-implementation-repair",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"schedule": "nightly"},
+    )
+
+    outcome = await service.handle(event)
+
+    repaired = store.by_implementation_pull_request("Acme/service", 24)
+    assert repaired is not None
+    assert repaired.head_sha == "f" * 40
+    assert repaired.successful_check_sha == "f" * 40
+    assert openproject.states[-1] == (101, "Review", "check_passed")
+    assert "implementation_repairs:1" in outcome.outcome
+    assert "implementation_failures:1" in outcome.outcome
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_isolates_invalid_projection_before_valid_work_package() -> None:
+    store = MemoryStore()
+    observed_at = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
+    store.bind_implementation_pull_request(
+        repository="Acme/service",
+        number=22,
+        plan_id="idea-42",
+        node_key="stale-node",
+        work_package_id=100,
+        url="https://github.com/Acme/service/pull/22",
+        head_sha="c" * 40,
+        observed_at=observed_at,
+        pull_request_state="open",
+        merged_commit=None,
+    )
+    store.bind_implementation_pull_request(
+        repository="Acme/service",
+        number=24,
+        plan_id="idea-42",
+        node_key="implement-core",
+        work_package_id=101,
+        url="https://github.com/Acme/service/pull/24",
+        head_sha="d" * 40,
+        observed_at=observed_at,
+        pull_request_state="open",
+        merged_commit=None,
+    )
+    openproject = ImplementationReconciliationOpenProjectFake()
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=ImplementationReconciliationGitHubFake(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    event = envelope_for_delivery(
+        event_type="reconciliation.scheduled",
+        source="scheduler",
+        delivery_id="isolate-invalid-projection",
+        occurred_at=observed_at.replace(minute=5),
+        received_at=observed_at.replace(minute=5),
+        actor=EventActor(kind="system", id="windmill"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"schedule": "nightly"},
+    )
+
+    outcome = await service.handle(event)
+
+    assert openproject.states[-1] == (101, "Review", "pr_merged")
+    assert "implementation_repairs:1" in outcome.outcome
+    assert "implementation_failures:1" in outcome.outcome
 
 
 class PublicationOpenProjectFake(OpenProjectFake):
@@ -374,9 +1292,44 @@ class PublicationOpenProjectFake(OpenProjectFake):
 
 
 class PublicationGitHubFake:
-    def __init__(self, raw: bytes, binding: ImmutableArtifactBinding) -> None:
+    def __init__(
+        self,
+        raw: bytes,
+        binding: ImmutableArtifactBinding,
+        *,
+        evidence: PullRequestEvidence | None = None,
+    ) -> None:
         self.raw = raw
         self.binding = binding
+        self.evidence = evidence or PullRequestEvidence(
+            repository=binding.repository,
+            number=17,
+            head_sha="c" * 40,
+            state="closed",
+            merged=True,
+            merge_commit_sha=binding.commit_sha,
+            reviews=(_review("c" * 40),),
+            checks=(
+                _check("planning-backlog-validation", "c" * 40),
+            ),
+        )
+        self.binding_reads = 0
+        self.evidence_reads = 0
+
+    async def pull_request_evidence(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str,
+    ) -> PullRequestEvidence:
+        self.evidence_reads += 1
+        assert (repository, number, expected_head_sha) == (
+            self.evidence.repository,
+            self.evidence.number,
+            self.evidence.head_sha,
+        )
+        return self.evidence
 
     async def artifact_binding(
         self,
@@ -385,6 +1338,7 @@ class PublicationGitHubFake:
         commit_sha: str,
         path: str,
     ) -> ImmutableArtifactBinding:
+        self.binding_reads += 1
         assert (repository, commit_sha, path) == (
             self.binding.repository,
             self.binding.commit_sha,
@@ -435,13 +1389,15 @@ async def test_crash_after_publication_apply_replays_journal_before_stale_base_c
         content_sha256=artifact.sha256,
     )
     journal = InMemoryPublicationJournal()
+    github = PublicationGitHubFake(raw, binding)
     service = LifecycleService(
         planner=object(),  # type: ignore[arg-type]
         openproject=openproject,  # type: ignore[arg-type]
-        github=PublicationGitHubFake(raw, binding),  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
         store=store,  # type: ignore[arg-type]
         publication_database_url="postgresql://unused",
         recovery_cipher=_cipher(),
+        **_service_policy(),
         publication_journal_factory=lambda: journal,
     )
     now = datetime(2026, 7, 30, 20, 0, tzinfo=UTC)
@@ -468,12 +1424,236 @@ async def test_crash_after_publication_apply_replays_journal_before_stale_base_c
         await service.handle(event)
     assert store.run is not None and store.run.state == "publishing"
     assert openproject.effects == ["create_work_package", "record_audit"]
+    assert github.evidence_reads == 1
 
+    store.run = replace(store.run, approval_evidence_sha256=None)
     openproject.reject_snapshot_reads = True
     outcome = await service.handle(event)
     assert outcome.outcome == "published"
     assert store.run is not None and store.run.state == "published"
     assert openproject.effects == ["create_work_package", "record_audit"]
+    assert github.evidence_reads == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence",
+    (
+        PullRequestEvidence(
+            repository="Acme/service",
+            number=17,
+            head_sha="c" * 40,
+            state="closed",
+            merged=True,
+            merge_commit_sha="a" * 40,
+            reviews=(),
+            checks=(
+                _check("planning-backlog-validation", "c" * 40),
+            ),
+        ),
+        PullRequestEvidence(
+            repository="Acme/service",
+            number=17,
+            head_sha="c" * 40,
+            state="closed",
+            merged=True,
+            merge_commit_sha="a" * 40,
+            reviews=(_review("c" * 40),),
+            checks=(),
+        ),
+        PullRequestEvidence(
+            repository="Acme/service",
+            number=17,
+            head_sha="c" * 40,
+            state="closed",
+            merged=True,
+            merge_commit_sha="a" * 40,
+            reviews=(_review("c" * 40),),
+            checks=(
+                _check(
+                    "planning-backlog-validation",
+                    "c" * 40,
+                    conclusion="failure",
+                ),
+            ),
+        ),
+        PullRequestEvidence(
+            repository="Acme/service",
+            number=17,
+            head_sha="c" * 40,
+            state="closed",
+            merged=True,
+            merge_commit_sha="d" * 40,
+            reviews=(_review("c" * 40),),
+            checks=(
+                _check("planning-backlog-validation", "c" * 40),
+            ),
+        ),
+    ),
+)
+async def test_planning_publication_fails_closed_without_exact_approval_evidence(
+    evidence: PullRequestEvidence,
+) -> None:
+    fixture = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+    raw = fixture.read_bytes()
+    artifact = load_artifact(fixture)
+    merge_sha = "a" * 40
+    run = PlanRun(
+        idea_id=1,
+        plan_id="single-repository",
+        plan_version=1,
+        thread_id="openproject:1:planning:1",
+        repository="Acme/service",
+        base_branch=merge_sha,
+        artifact_prefix="planning/single-repository/v1",
+        backlog_path="planning/single-repository/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag="fixture",
+        state="pr_open",
+        planning_commit="c" * 40,
+        pull_request_number=17,
+        pull_request_url="https://github.com/Acme/service/pull/17",
+    )
+    store = MemoryStore(run)
+    snapshot = OpenProjectSnapshot(
+        captured_at="2026-07-30T00:00:00Z",
+        etag="fixture",
+        sha256="b" * 64,
+        work_packages=(),
+    )
+    openproject = PublicationOpenProjectFake(snapshot)
+    binding = ImmutableArtifactBinding(
+        repository=run.repository,
+        commit_sha=merge_sha,
+        path=run.backlog_path,
+        blob_sha=artifact.blob_sha1,
+        content_sha256=artifact.sha256,
+    )
+    github = PublicationGitHubFake(raw, binding, evidence=evidence)
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 20, 0, tzinfo=UTC)
+    event = envelope_for_delivery(
+        event_type="github.pull_request",
+        source="github",
+        delivery_id=f"invalid-approval-{hash(evidence)}",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="service", id="github-app"),
+        subject=EventSubject(idea_id=1, plan_id=run.plan_id, plan_version=1),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={
+            "pull_request": {
+                "number": 17,
+                "merged": True,
+                "merge_commit_sha": merge_sha,
+            },
+            "repository": {"full_name": run.repository},
+        },
+    )
+
+    with pytest.raises(LifecycleEventRejected):
+        await service.handle(event)
+
+    assert store.run is not None and store.run.state == "pr_open"
+    assert github.binding_reads == 0
+    assert openproject.effects == []
+
+
+class InvalidArtifactPlanner:
+    def __init__(self, bundle: ArtifactBundle) -> None:
+        self.bundle = bundle
+
+    async def artifacts(self, thread_id: str) -> ArtifactBundle:
+        assert thread_id == self.bundle.thread_id
+        return self.bundle
+
+
+class NoPlanningCommitGitHubFake:
+    async def ensure_planning_commit(self, **_values: object) -> None:
+        raise AssertionError("invalid planner artifacts reached a GitHub side effect")
+
+
+@pytest.mark.asyncio
+async def test_semantically_invalid_generated_backlog_never_reaches_github() -> None:
+    fixture = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+    loaded = load_artifact(fixture)
+    invalid_item = loaded.plan.items[0].model_copy(
+        update={
+            "acceptance_criteria": (
+                loaded.plan.items[0].acceptance_criteria[0].model_copy(
+                    update={"observation": "As desired"}
+                ),
+            )
+        }
+    )
+    invalid_plan = loaded.plan.model_copy(
+        update={"items": (invalid_item, *loaded.plan.items[1:])}
+    )
+    content = yaml.safe_dump(
+        invalid_plan.model_dump(mode="json"),
+        sort_keys=False,
+    )
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    run = PlanRun(
+        idea_id=1,
+        plan_id="single-repository",
+        plan_version=1,
+        thread_id="openproject:1:planning:1",
+        repository="Acme/service",
+        base_branch="a" * 40,
+        artifact_prefix="planning/single-repository/v1",
+        backlog_path="planning/single-repository/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag="fixture",
+        state="planning",
+    )
+    bundle = ArtifactBundle(
+        thread_id=run.thread_id,
+        artifacts=(
+            ArtifactContent(path="backlog.yaml", sha256=digest, content=content),
+        ),
+    )
+    response = PlanResponse(
+        thread_id=run.thread_id,
+        status="artifacts_ready",
+        trace_id=str(uuid4()),
+        interrupt=None,
+        artifact_manifest=(
+            ArtifactManifestEntry(path="backlog.yaml", sha256=digest),
+        ),
+    )
+    service = LifecycleService(
+        planner=InvalidArtifactPlanner(bundle),  # type: ignore[arg-type]
+        openproject=OpenProjectFake(),  # type: ignore[arg-type]
+        github=NoPlanningCommitGitHubFake(),  # type: ignore[arg-type]
+        store=MemoryStore(run),  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    now = datetime(2026, 7, 30, 20, 0, tzinfo=UTC)
+    event = envelope_for_delivery(
+        event_type="openproject.work_package_changed",
+        source="windmill",
+        delivery_id="invalid-generated-backlog",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="service", id="openproject"),
+        subject=EventSubject(idea_id=1),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"work_package": {"id": 1}},
+    )
+
+    with pytest.raises(LifecycleEventRejected, match="semantic validation"):
+        await service._handle_planner_response(event, run, response)
 
 
 class ReconciliationStore:
@@ -483,6 +1663,9 @@ class ReconciliationStore:
 
     def all(self) -> tuple[PlanRun, ...]:
         return self.runs
+
+    def implementation_associations(self) -> tuple[ImplementationPrAssociation, ...]:
+        return ()
 
     def audit(self, **values: Any) -> None:
         self.audit_rows.append((str(values["action"]), str(values["outcome"])))
@@ -532,7 +1715,7 @@ class ReconciliationGitHubFake:
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_uses_only_latest_plan_and_superseded_blocker_stays_open() -> None:
+async def test_reconciliation_uses_latest_published_graph_during_unapproved_replan() -> None:
     fixture = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
     loaded = load_artifact(fixture)
     base = loaded.plan.items[0]
@@ -600,9 +1783,21 @@ async def test_reconciliation_uses_only_latest_plan_and_superseded_blocker_stays
             backlog_sha256=hashlib.sha256(raw).hexdigest(),
         )
 
+    pending_version_three = replace(
+        published_run(2, commit_two, raw_two),
+        plan_version=3,
+        thread_id="openproject:1:planning:3",
+        artifact_prefix="planning/single-repository/v3",
+        backlog_path="planning/single-repository/v3/backlog.yaml",
+        state="pr_open",
+        approved_commit=None,
+        backlog_blob_sha1=None,
+        backlog_sha256=None,
+    )
     runs = (
         published_run(1, commit_one, raw_one),
         published_run(2, commit_two, raw_two),
+        pending_version_three,
     )
     snapshot = OpenProjectSnapshot(
         captured_at="2026-07-30T00:00:00Z",
@@ -653,6 +1848,7 @@ async def test_reconciliation_uses_only_latest_plan_and_superseded_blocker_stays
         store=ReconciliationStore(runs),  # type: ignore[arg-type]
         publication_database_url="postgresql://unused",
         recovery_cipher=_cipher(),
+        **_service_policy(),
     )
     now = datetime(2026, 7, 30, 21, 0, tzinfo=UTC)
     event = envelope_for_delivery(

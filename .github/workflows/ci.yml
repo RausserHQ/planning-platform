@@ -14,6 +14,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  planning-backlog-validation:
+    if: github.event_name == 'pull_request'
+    name: planning-backlog-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: 0.11.27
+          enable-cache: true
+
+      - name: Validate changed planning backlogs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t backlogs < <(
+            git diff --name-only --diff-filter=ACMR \
+              "${BASE_SHA}" "${HEAD_SHA}" -- 'planning/**/backlog.yaml'
+          )
+          for backlog in "${backlogs[@]}"; do
+            uv run --frozen planning validate "${GITHUB_WORKSPACE}/${backlog}"
+          done
+
   validate:
     runs-on: ubuntu-latest
     services:

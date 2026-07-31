@@ -146,5 +146,16 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "ARG NPM_VERSION=11.19.0" in dockerfile
     assert 'npm install --global "npm@${NPM_VERSION}"' in dockerfile
     assert 'tar/package.json").version' in dockerfile
+    assert "rm -f /usr/bin/wmill" in dockerfile
+    assert 'npm install --global "windmill-cli@1.775.2"' in dockerfile
+    assert 'wmill_version="$(wmill --version)"' in dockerfile
+    assert 'grep -Fqx "CLI version: 1.775.2"' in dockerfile
+    assert "bun install -g windmill-cli" not in dockerfile
+    assert "/root/.bun/install/cache" not in dockerfile
     assert "ENV PYTHONPATH=/opt/planning-platform" in dockerfile
     assert "ADDITIONAL_PYTHON_PATHS=/opt/planning-platform" in dockerfile
+
+    workflow = (REPO_ROOT / ".github/workflows/release-images.yml").read_text()
+    assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
+    assert "--entrypoint wmill" in workflow
+    assert "grep -Fqx 'CLI version: 1.775.2'" in workflow

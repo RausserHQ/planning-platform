@@ -8,7 +8,7 @@ import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 import jwt
@@ -19,6 +19,7 @@ from .github_models import (
     PlanningBranch,
     PlanningPullRequest,
     PullRequestEvidence,
+    ReviewEvidence,
 )
 from .planner.models import RepositoryFile, RepositorySnapshot, repository_snapshot_digest
 
@@ -587,48 +588,166 @@ class GitHubAdapter:
         return model
 
     async def pull_request_evidence(
-        self, repository: str, number: int, *, expected_head_sha: str
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_head_sha: str | None = None,
     ) -> PullRequestEvidence:
         pull_value = await self._request("GET", f"/repos/{repository}/pulls/{number}")
         pull = self._pull_request(repository, pull_value)
-        if pull.head_sha != expected_head_sha:
+        if expected_head_sha is not None and pull.head_sha != expected_head_sha:
             raise GitHubAdapterError(
-                "pull request evidence is stale for the expected planning commit"
+                "pull request evidence is stale for the expected commit"
             )
-        reviews = await self._request("GET", f"/repos/{repository}/pulls/{number}/reviews")
-        checks = await self._request(
-            "GET", f"/repos/{repository}/commits/{expected_head_sha}/check-runs"
-        )
-        if not isinstance(reviews, list) or not isinstance(checks.get("check_runs"), list):
-            raise GitHubAdapterError("GitHub review or check evidence is malformed")
-        approved_people = {
-            review.get("user", {}).get("id")
-            for review in reviews
-            if isinstance(review, dict)
-            and review.get("state") == "APPROVED"
-            and isinstance(review.get("user"), dict)
-            and isinstance(review["user"].get("id"), int)
-        }
-        evidence_checks = tuple(
-            CheckEvidence(
-                name=entry["name"],
-                status=entry["status"],
-                conclusion=entry.get("conclusion"),
-                details_url=entry.get("details_url"),
+        reviews: list[Any] = []
+        for page in range(1, 11):
+            review_page = await self._request(
+                "GET",
+                f"/repos/{repository}/pulls/{number}/reviews"
+                f"?per_page=100&page={page}",
             )
-            for entry in checks["check_runs"]
-            if isinstance(entry, dict)
-            and isinstance(entry.get("name"), str)
-            and entry.get("status") in {"queued", "in_progress", "completed"}
-        )
+            if not isinstance(review_page, list):
+                raise GitHubAdapterError("GitHub review evidence is malformed")
+            reviews.extend(review_page)
+            if len(review_page) < 100:
+                break
+        else:
+            raise GitHubAdapterError(
+                "GitHub review evidence exceeds the bounded pagination limit"
+            )
+        check_values: list[Any] = []
+        check_total: int | None = None
+        for page in range(1, 11):
+            checks = await self._request(
+                "GET",
+                f"/repos/{repository}/commits/{pull.head_sha}/check-runs"
+                f"?filter=latest&per_page=100&page={page}",
+            )
+            values = checks.get("check_runs") if isinstance(checks, dict) else None
+            total = checks.get("total_count") if isinstance(checks, dict) else None
+            if not isinstance(values, list) or type(total) is not int or total < 0:
+                raise GitHubAdapterError("GitHub check evidence is malformed")
+            if check_total is None:
+                check_total = total
+            elif check_total != total:
+                raise GitHubAdapterError("GitHub check evidence changed during pagination")
+            check_values.extend(values)
+            if len(values) < 100:
+                break
+        else:
+            raise GitHubAdapterError(
+                "GitHub check evidence exceeds the bounded pagination limit"
+            )
+        if check_total != len(check_values):
+            raise GitHubAdapterError("GitHub check evidence is incomplete")
+
+        latest_reviews: dict[
+            int,
+            tuple[tuple[datetime, int, int], ReviewEvidence],
+        ] = {}
+        for index, review in enumerate(reviews):
+            if not isinstance(review, dict) or not isinstance(review.get("user"), dict):
+                raise GitHubAdapterError("GitHub review evidence is malformed")
+            user = review["user"]
+            user_id = user.get("id")
+            if user.get("type") != "User":
+                continue
+            if review.get("state") in {"PENDING", "COMMENTED"}:
+                continue
+            submitted_at_value = review.get("submitted_at")
+            review_id = review.get("id")
+            actor_login = user.get("login")
+            review_state = review.get("state")
+            commit_sha = review.get("commit_id")
+            if (
+                type(user_id) is not int
+                or type(review_id) is not int
+                or not isinstance(actor_login, str)
+                or not isinstance(submitted_at_value, str)
+                or review_state
+                not in {
+                    "APPROVED",
+                    "CHANGES_REQUESTED",
+                    "DISMISSED",
+                }
+                or not isinstance(commit_sha, str)
+            ):
+                raise GitHubAdapterError("GitHub review evidence is malformed")
+            try:
+                submitted_at = datetime.fromisoformat(
+                    submitted_at_value.replace("Z", "+00:00")
+                )
+                evidence_review = ReviewEvidence(
+                    id=review_id,
+                    actor_id=user_id,
+                    actor_login=actor_login,
+                    state=cast(
+                        Literal[
+                            "APPROVED",
+                            "CHANGES_REQUESTED",
+                            "DISMISSED",
+                        ],
+                        review_state,
+                    ),
+                    submitted_at=submitted_at,
+                    commit_sha=commit_sha,
+                )
+            except (TypeError, ValueError) as error:
+                raise GitHubAdapterError("GitHub review evidence is malformed") from error
+            if submitted_at.tzinfo is None:
+                raise GitHubAdapterError("GitHub review evidence timestamp has no timezone")
+            order = (submitted_at, evidence_review.id, index)
+            current = latest_reviews.get(user_id)
+            if current is None or order > current[0]:
+                latest_reviews[user_id] = (order, evidence_review)
+        evidence_checks: list[CheckEvidence] = []
+        for entry in check_values:
+            if not isinstance(entry, dict) or not isinstance(entry.get("app"), dict):
+                raise GitHubAdapterError("GitHub check evidence is malformed")
+            app = entry["app"]
+            check_id = entry.get("id")
+            check_name = entry.get("name")
+            check_head = entry.get("head_sha")
+            app_id = app.get("id")
+            app_slug = app.get("slug")
+            check_status = entry.get("status")
+            if (
+                type(check_id) is not int
+                or not isinstance(check_name, str)
+                or not isinstance(check_head, str)
+                or type(app_id) is not int
+                or not isinstance(app_slug, str)
+                or check_status not in {"queued", "in_progress", "completed"}
+            ):
+                raise GitHubAdapterError("GitHub check evidence is malformed")
+            try:
+                evidence_checks.append(
+                    CheckEvidence(
+                        id=check_id,
+                        name=check_name,
+                        head_sha=check_head,
+                        app_id=app_id,
+                        app_slug=app_slug,
+                        status=cast(
+                            Literal["queued", "in_progress", "completed"],
+                            check_status,
+                        ),
+                        conclusion=entry.get("conclusion"),
+                        details_url=entry.get("details_url"),
+                    )
+                )
+            except ValueError as error:
+                raise GitHubAdapterError("GitHub check evidence is malformed") from error
         return PullRequestEvidence(
             repository=repository,
             number=number,
             head_sha=pull.head_sha,
+            state=pull.state,
             merged=pull.merged,
             merge_commit_sha=pull.merge_commit_sha,
-            approvals=len(approved_people),
-            checks=evidence_checks,
+            reviews=tuple(value[1] for value in latest_reviews.values()),
+            checks=tuple(evidence_checks),
         )
 
     async def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
