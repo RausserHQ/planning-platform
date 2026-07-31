@@ -7,5 +7,8 @@ The planning methodology and artifact sequence documented under
 License. See that directory's `LICENSE.BMAD`, `BMAD_ATTRIBUTION.md`, and
 `manifest.json`.
 
-This repository contains integration code for, but does not redistribute,
-OpenProject (GPL-3.0), Windmill (AGPL-3.0 source build), or LangGraph (MIT).
+This repository contains integration code for OpenProject (GPL-3.0), Windmill,
+and LangGraph (MIT). Its released Windmill runtime image redistributes the
+official Community Edition base with an added Planning Platform layer. The
+upstream mixed-license and Community Edition binary terms described in
+`docs/licenses.md` apply to that base and its redistribution.

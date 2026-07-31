@@ -157,6 +157,13 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "ADDITIONAL_PYTHON_PATHS=/opt/planning-platform" in dockerfile
 
     workflow = (REPO_ROOT / ".github/workflows/release-images.yml").read_text()
+    assert (
+        "WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@sha256:"
+        in workflow
+    )
+    assert "Verify official Windmill CE base identity" in workflow
+    assert "WINDMILL_BASE=${{ env.WINDMILL_BASE }}" in workflow
+    assert "context: upstream" not in workflow
     assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
     assert "--entrypoint wmill" in workflow
     assert "grep -Fx 'CLI version: 1.775.2' >/dev/null" in workflow

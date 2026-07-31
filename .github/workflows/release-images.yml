@@ -3,7 +3,7 @@ name: Build planning platform images
 on:
   push:
     tags:
-      - v0.1.7
+      - v0.1.8
 
 permissions:
   contents: read
@@ -18,11 +18,10 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   PLANNER_IMAGE: ghcr.io/rausserhq/planning-platform/planner
-  PLANNER_TAG: v0.1.7
+  PLANNER_TAG: v0.1.8
   WINDMILL_IMAGE: ghcr.io/rausserhq/planning-platform/windmill
-  WINDMILL_SOURCE_IMAGE: ghcr.io/rausserhq/planning-platform/windmill-source
-  WINDMILL_TAG: v1.775.2-planning.8
-  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.8
+  WINDMILL_TAG: v1.775.2-planning.9
+  WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@sha256:ef39329523f4806e5cd5169ffa7af2618f39439bcf659115e8bb804c592d7132
   WINDMILL_SHA: 64ec1aa490ab5537a73bcb6f6b7e926c6339af39
 
 jobs:
@@ -52,7 +51,7 @@ jobs:
           push: true
           tags: ${{ env.PLANNER_IMAGE }}:${{ env.PLANNER_TAG }}
           build-args: |
-            PLANNING_PLATFORM_VERSION=0.1.7
+            PLANNING_PLATFORM_VERSION=0.1.8
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=planning-platform-planner
@@ -85,22 +84,6 @@ jobs:
       - name: Check out planning source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Check out exact Windmill source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: windmill-labs/windmill
-          ref: ${{ env.WINDMILL_SHA }}
-          path: upstream
-          fetch-depth: 1
-
-      - name: Verify exact AGPL source and CE feature set
-        run: |
-          set -euo pipefail
-          test "$(git -C upstream rev-parse HEAD)" = "${WINDMILL_SHA}"
-          test -z "$(git -C upstream status --porcelain)"
-          grep -En '^version = "1\.775\.2"$' upstream/backend/Cargo.toml
-          ! grep -En 'features=.enterprise.|features = .enterprise.' upstream/Dockerfile
-
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
@@ -118,29 +101,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      - name: Verify official Windmill CE base identity
+        run: |
+          set -euo pipefail
+          test "$(docker buildx imagetools inspect \
+            --format '{{.Image.OS}}/{{.Image.Architecture}}' "${WINDMILL_BASE}")" = \
+            "linux/amd64"
+          labels="$(docker buildx imagetools inspect \
+            --format '{{json .Image.Config.Labels}}' "${WINDMILL_BASE}")"
+          test "$(jq -r '."org.opencontainers.image.version"' <<<"${labels}")" = "1.775.2"
+          test "$(jq -r '."org.opencontainers.image.revision"' <<<"${labels}")" = "${WINDMILL_SHA}"
+          test "$(jq -r '."org.opencontainers.image.source"' <<<"${labels}")" = \
+            "https://github.com/windmill-labs/windmill"
+          build_history="$(docker buildx imagetools inspect \
+            --format '{{range .Image.History}}{{println .CreatedBy}}{{end}}' "${WINDMILL_BASE}")"
+          grep -F 'features=ce' <<<"${build_history}" >/dev/null
+          ! grep -F 'features=ee' <<<"${build_history}" >/dev/null
+
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Windmill CE from exact source
-        id: source
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: upstream
-          file: upstream/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: ${{ env.WINDMILL_SOURCE_IMAGE }}:${{ env.WINDMILL_SOURCE_TAG }}
-          build-args: |
-            features=
-            WM_BUILD_VERSION=v1.775.2
-          provenance: mode=max
-          sbom: true
-          cache-from: type=gha,scope=planning-platform-windmill-source
-          cache-to: type=gha,mode=max,scope=planning-platform-windmill-source
 
       - name: Add the deterministic lifecycle package
         id: windmill
@@ -152,8 +135,8 @@ jobs:
           push: true
           tags: ${{ env.WINDMILL_IMAGE }}:${{ env.WINDMILL_TAG }}
           build-args: |
-            WINDMILL_BASE=${{ env.WINDMILL_SOURCE_IMAGE }}:${{ env.WINDMILL_SOURCE_TAG }}@${{ steps.source.outputs.digest }}
-            PLANNING_PLATFORM_VERSION=0.1.7
+            WINDMILL_BASE=${{ env.WINDMILL_BASE }}
+            PLANNING_PLATFORM_VERSION=0.1.8
             NPM_VERSION=11.19.0
           provenance: mode=max
           sbom: true
@@ -179,7 +162,7 @@ jobs:
           docker pull --platform linux/amd64 "${image}"
           test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "1000:1000"
           docker run --rm --platform linux/amd64 --entrypoint python3 "${image}" -c \
-            'from importlib.metadata import version; from pathlib import Path; root = Path("/opt/planning-platform-workspace"); files = [path for path in root.rglob("*") if path.is_file()]; assert version("planning-platform") == "0.1.7"; assert len(files) == 37; assert (root / "wmill.yaml").is_file(); assert (root / "f/planning/github_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/openproject_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/alertmanager_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/nightly_reconciliation.schedule.yaml").is_file()'
+            'from importlib.metadata import version; from pathlib import Path; root = Path("/opt/planning-platform-workspace"); files = [path for path in root.rglob("*") if path.is_file()]; assert version("planning-platform") == "0.1.8"; assert len(files) == 37; assert (root / "wmill.yaml").is_file(); assert (root / "f/planning/github_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/openproject_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/alertmanager_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/nightly_reconciliation.schedule.yaml").is_file()'
           docker run --rm --platform linux/amd64 --user 1000:1000 \
             --entrypoint wmill "${image}" --version \
             | grep -Fx 'CLI version: 1.775.2' >/dev/null
@@ -187,7 +170,7 @@ jobs:
           test "$(docker run --rm --platform linux/amd64 --entrypoint node "${image}" -p \
             'require("/usr/lib/node_modules/npm/node_modules/tar/package.json").version')" = "7.5.19"
           {
-            echo "Windmill source: \`${WINDMILL_SHA}\` (AGPL v3)"
-            echo "Windmill source image: \`${WINDMILL_SOURCE_IMAGE}:${WINDMILL_SOURCE_TAG}@${{ steps.source.outputs.digest }}\`"
+            echo "Windmill official CE base: \`${WINDMILL_BASE}\`"
+            echo "Windmill source revision: \`${WINDMILL_SHA}\`"
             echo "Windmill runtime: \`${image}\`"
           } >>"${GITHUB_STEP_SUMMARY}"
