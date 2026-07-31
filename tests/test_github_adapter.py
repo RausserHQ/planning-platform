@@ -196,6 +196,267 @@ async def test_existing_planning_branch_is_accepted_only_after_byte_verification
 
 
 @pytest.mark.asyncio
+async def test_pull_request_evidence_uses_latest_opinionated_review_and_latest_checks() -> None:
+    head_sha = "a" * 40
+    merge_sha = "b" * 40
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/12"):
+            return httpx.Response(
+                200,
+                json={
+                    "number": 12,
+                    "html_url": "https://github.com/owner/repo/pull/12",
+                    "head": {"sha": head_sha},
+                    "state": "closed",
+                    "merged": True,
+                    "merge_commit_sha": merge_sha,
+                },
+            )
+        if path.endswith("/pulls/12/reviews"):
+            assert request.url.params["per_page"] == "100"
+            assert request.url.params["page"] == "1"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "state": "APPROVED",
+                        "submitted_at": "2026-07-30T18:00:00Z",
+                        "commit_id": head_sha,
+                        "user": {"id": 7, "login": "reviewer-7", "type": "User"},
+                    },
+                    {
+                        "id": 2,
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-07-30T18:01:00Z",
+                        "commit_id": head_sha,
+                        "user": {"id": 7, "login": "reviewer-7", "type": "User"},
+                    },
+                    {
+                        "id": 3,
+                        "state": "APPROVED",
+                        "submitted_at": "2026-07-30T18:02:00Z",
+                        "commit_id": head_sha,
+                        "user": {"id": 8, "login": "reviewer-8", "type": "User"},
+                    },
+                    {
+                        "id": 4,
+                        "state": "COMMENTED",
+                        "submitted_at": "2026-07-30T18:03:00Z",
+                        "commit_id": head_sha,
+                        "user": {"id": 8, "login": "reviewer-8", "type": "User"},
+                    },
+                    {
+                        "id": 5,
+                        "state": "APPROVED",
+                        "submitted_at": "2026-07-30T18:04:00Z",
+                        "user": {"id": 9, "type": "Bot"},
+                    },
+                ],
+            )
+        if path.endswith(f"/commits/{head_sha}/check-runs"):
+            assert request.url.params["filter"] == "latest"
+            assert request.url.params["per_page"] == "100"
+            assert request.url.params["page"] == "1"
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "check_runs": [
+                        {
+                            "id": 1001,
+                            "name": "planning-backlog-validation",
+                            "head_sha": head_sha,
+                            "app": {"id": 15368, "slug": "github-actions"},
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details_url": "https://github.com/owner/repo/actions/runs/1",
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(request.url)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        evidence = await GitHubAdapter(
+            client,
+            StaticInstallationToken("token"),
+            api_url="https://github.test",
+        ).pull_request_evidence("owner/repo", 12, expected_head_sha=head_sha)
+
+    assert evidence.merged
+    assert evidence.merge_commit_sha == merge_sha
+    assert evidence.approvals == 1
+    assert any(
+        review.actor_id == 8 and review.state == "APPROVED"
+        for review in evidence.reviews
+    )
+    assert evidence.required_checks_pass({"planning-backlog-validation"})
+
+
+@pytest.mark.asyncio
+async def test_pull_request_evidence_paginates_before_selecting_latest_review() -> None:
+    head_sha = "a" * 40
+    review_pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/12"):
+            return httpx.Response(
+                200,
+                json={
+                    "number": 12,
+                    "html_url": "https://github.com/owner/repo/pull/12",
+                    "head": {"sha": head_sha},
+                    "state": "open",
+                    "merged": False,
+                    "merge_commit_sha": None,
+                },
+            )
+        if path.endswith("/pulls/12/reviews"):
+            page = int(request.url.params["page"])
+            review_pages.append(page)
+            if page == 1:
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": review_id,
+                            "state": "APPROVED",
+                            "submitted_at": "2026-07-30T18:00:00Z",
+                            "commit_id": head_sha,
+                            "user": {
+                                "id": 7,
+                                "login": "reviewer-7",
+                                "type": "User",
+                            },
+                        }
+                        for review_id in range(1, 101)
+                    ],
+                )
+            assert page == 2
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 101,
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-07-30T18:01:00Z",
+                        "commit_id": head_sha,
+                        "user": {"id": 7, "login": "reviewer-7", "type": "User"},
+                    }
+                ],
+            )
+        if path.endswith(f"/commits/{head_sha}/check-runs"):
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "check_runs": [
+                        {
+                            "id": 1001,
+                            "name": "planning-backlog-validation",
+                            "head_sha": head_sha,
+                            "app": {"id": 15368, "slug": "github-actions"},
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ]
+                },
+            )
+        raise AssertionError(request.url)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        evidence = await GitHubAdapter(
+            client,
+            StaticInstallationToken("token"),
+            api_url="https://github.test",
+        ).pull_request_evidence("owner/repo", 12, expected_head_sha=head_sha)
+
+    assert review_pages == [1, 2]
+    assert evidence.approvals == 0
+    assert evidence.required_checks_pass({"planning-backlog-validation"})
+
+
+@pytest.mark.asyncio
+async def test_pull_request_evidence_paginates_checks_before_policy_evaluation() -> None:
+    head_sha = "a" * 40
+    check_pages: list[int] = []
+
+    def check_value(
+        check_id: int,
+        name: str,
+        conclusion: str,
+    ) -> dict[str, object]:
+        return {
+            "id": check_id,
+            "name": name,
+            "head_sha": head_sha,
+            "app": {"id": 15368, "slug": "github-actions"},
+            "status": "completed",
+            "conclusion": conclusion,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/12"):
+            return httpx.Response(
+                200,
+                json={
+                    "number": 12,
+                    "html_url": "https://github.com/owner/repo/pull/12",
+                    "head": {"sha": head_sha},
+                    "state": "open",
+                    "merged": False,
+                    "merge_commit_sha": None,
+                },
+            )
+        if path.endswith("/pulls/12/reviews"):
+            return httpx.Response(200, json=[])
+        if path.endswith(f"/commits/{head_sha}/check-runs"):
+            page = int(request.url.params["page"])
+            check_pages.append(page)
+            if page == 1:
+                values = [
+                    check_value(
+                        1000,
+                        "planning-backlog-validation",
+                        "success",
+                    ),
+                    *[
+                        check_value(1000 + index, f"optional-{index}", "success")
+                        for index in range(1, 100)
+                    ],
+                ]
+            else:
+                assert page == 2
+                values = [
+                    check_value(
+                        2000,
+                        "planning-backlog-validation",
+                        "failure",
+                    )
+                ]
+            return httpx.Response(
+                200,
+                json={"total_count": 101, "check_runs": values},
+            )
+        raise AssertionError(request.url)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        evidence = await GitHubAdapter(
+            client,
+            StaticInstallationToken("token"),
+            api_url="https://github.test",
+        ).pull_request_evidence("owner/repo", 12, expected_head_sha=head_sha)
+
+    assert check_pages == [1, 2]
+    assert not evidence.required_checks_pass({"planning-backlog-validation"})
+
+
+@pytest.mark.asyncio
 async def test_typed_planner_client_authenticates_and_parses_artifact_bundle() -> None:
     from planning_platform.lifecycle.planner_client import PlannerClient
 

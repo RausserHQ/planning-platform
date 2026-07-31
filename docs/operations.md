@@ -20,6 +20,18 @@ pod.
    image.
 5. Install Windmill CE 1.775.2 and sync `windmill/` with CLI 1.775.2.
 6. Start planner and Windmill workers, then enable the signed webhook routes.
+   The worker environment must set:
+   - `PLANNING_ARTIFACT_REPOSITORY` to the one repository that contains the
+     `planning-backlog-validation` workflow;
+   - `PLANNING_IMPLEMENTATION_REQUIRED_CHECKS_JSON` to a non-empty JSON object
+     mapping every implementation repository that may advance on checks to its
+     non-empty array of trusted required-check names, for example
+     `{"Acme/service":["implementation-tests"]}`;
+   - `PLANNING_IMPLEMENTATION_STALE_HOURS` to the positive interval after
+     which an In Progress item with only closed-unmerged PRs is reported.
+   OpenProject ingress resolves the service actor ID through
+   `/api/v3/users/me` with the scoped publisher token; comment markers are
+   never used as identity.
 7. Apply the scoped Alertmanager route only after the authenticated
    `planning/alerts` trigger is synced. A firing alert must create a Blocked
    operational Task; a resolved delivery must converge the same fingerprint to
@@ -56,7 +68,9 @@ The workspace is `planning`; Git owns scripts, flows, schedules, and triggers.
 Secrets, users, groups, and settings are deliberately excluded from sync.
 The custom worker image supplies this package through `PYTHONPATH` for ordinary
 Python discovery and Windmill's `ADDITIONAL_PYTHON_PATHS`; it filters only the
-local `planning-platform` dependency.
+local `planning-platform` dependency. The image replaces Windmill's inherited
+root-home Bun link with the pinned npm-installed `wmill` executable under
+`/usr/bin`, and the release gate executes it explicitly as UID/GID 1000.
 
 ## Recovery
 
@@ -70,9 +84,16 @@ local `planning-platform` dependency.
   `dead_letter`, so a later authorized attempt remains possible.
 - Publication conflicts move the Idea to `Blocked`, post the exact safe
   conflict, and perform no overwrite. Regenerate against a fresh snapshot.
-- Nightly reconciliation repairs missed merged-planning-PR events, restores a
-  missing `Needs Input` status, and unblocks or blocks work only when the
-  approved graph makes the transition unambiguous. Other drift is reported.
+- Nightly reconciliation selects workflow recovery from the newest run and
+  graph authority independently from the newest successfully published run.
+  It repairs missed merged-planning-PR events and durable
+  implementation-PR/check associations, discovers missed PR head changes, and
+  isolates an inaccessible implementation repository instead of aborting the
+  remaining scan. It reprojects each work package even when database evidence
+  was already committed, restores a missing `Needs Input` status, and unblocks
+  or blocks work only when the approved graph makes the transition
+  unambiguous. Closed-unmerged implementation evidence becomes a stale finding
+  after the configured interval. Other drift is reported.
 
 Never edit a delivery row, publication journal, LangGraph checkpoint, or
 OpenProject managed hash by hand.
@@ -127,7 +148,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.5` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.6` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 builds Windmill CE from the pinned upstream commit, emits SBOM/provenance, and
 blocks on fixable critical Trivy findings. The Windmill image also contains the

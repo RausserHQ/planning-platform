@@ -27,6 +27,7 @@ class WorkPackageSnapshot:
     plan_id: str | None
     node_key: str | None
     plan_version: int | None = None
+    repository: str | None = None
     title: str = ""
     managed_hash: str | None = None
     parent_id: int | None = None
@@ -66,6 +67,7 @@ class WorkPackageSnapshot:
             plan_id=value.get("plan_id"),
             node_key=value.get("node_key"),
             plan_version=value.get("plan_version"),
+            repository=value.get("repository"),
             title=value.get("title", ""),
             managed_hash=value.get("managed_hash"),
             parent_id=value.get("parent_id"),

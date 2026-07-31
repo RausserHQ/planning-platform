@@ -87,11 +87,154 @@ def test_lifecycle_store_replays_immutable_binding_and_tracks_pr_state() -> None
     )
     assert recorded.state == "pr_open"
     assert store.by_pull_request(run.repository, pull_number) == recorded
-    publishing = store.set_state(recorded, "publishing")
-    published = store.set_state(publishing, "published")
+    publishing = store.approve_for_publication(
+        recorded,
+        merge_commit="e" * 40,
+        evidence_sha256="f" * 64,
+    )
+    assert publishing.approved_commit == "e" * 40
+    assert publishing.approval_evidence_sha256 == "f" * 64
+    assert (
+        store.approve_for_publication(
+            publishing,
+            merge_commit="e" * 40,
+            evidence_sha256="f" * 64,
+        )
+        == publishing
+    )
+    with pytest.raises(LifecycleStoreMismatch, match="approval evidence"):
+        store.approve_for_publication(
+            publishing,
+            merge_commit="e" * 40,
+            evidence_sha256="0" * 64,
+        )
+    bound = store.record_publication_binding(
+        publishing,
+        approved_commit="e" * 40,
+        backlog_blob_sha1="1" * 40,
+        backlog_sha256="2" * 64,
+    )
+    assert bound.backlog_blob_sha1 == "1" * 40
+    assert bound.backlog_sha256 == "2" * 64
+    assert (
+        store.record_publication_binding(
+            bound,
+            approved_commit="e" * 40,
+            backlog_blob_sha1="1" * 40,
+            backlog_sha256="2" * 64,
+        )
+        == bound
+    )
+    published = store.set_state(bound, "published")
     assert store.latest_for_idea(run.idea_id) == published
+    assert store.latest_published(run.plan_id) == published
     with pytest.raises(LifecycleStoreMismatch, match="transition"):
         store.set_state(published, "publishing")
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_implementation_pr_mapping_is_immutable_monotonic_and_head_bound() -> None:
+    assert DATABASE_URL is not None
+    store = PostgresLifecycleStore(DATABASE_URL)
+    store.setup()
+    number = int(uuid4().hex[:7], 16) + 1
+    repository = "RausserHQ/planning-platform"
+    opened_at = datetime.now(UTC)
+    values = {
+        "repository": repository,
+        "number": number,
+        "plan_id": f"idea-{number}",
+        "node_key": "implementation-core",
+        "work_package_id": number,
+        "url": f"https://github.com/{repository}/pull/{number}",
+        "head_sha": "1" * 40,
+        "observed_at": opened_at,
+        "pull_request_state": "open",
+        "merged_commit": None,
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        bindings = tuple(
+            executor.map(
+                lambda _index: store.bind_implementation_pull_request(**values),
+                range(8),
+            )
+        )
+    assert bindings == (bindings[0],) * 8
+    assert store.by_implementation_pull_request(repository, number) == bindings[0]
+
+    with pytest.raises(LifecycleStoreMismatch, match="identity"):
+        store.bind_implementation_pull_request(
+            **{**values, "node_key": "retargeted-node"}
+        )
+    assert (
+        store.record_implementation_check_result(
+            repository,
+            number,
+            head_sha="2" * 40,
+            passed=True,
+        )
+        is None
+    )
+    checked = store.record_implementation_check_result(
+        repository,
+        number,
+        head_sha="1" * 40,
+        passed=True,
+    )
+    assert checked is not None and checked.successful_check_sha == "1" * 40
+    cleared = store.record_implementation_check_result(
+        repository,
+        number,
+        head_sha="1" * 40,
+        passed=False,
+    )
+    assert cleared is not None and cleared.successful_check_sha is None
+    checked = store.record_implementation_check_result(
+        repository,
+        number,
+        head_sha="1" * 40,
+        passed=True,
+    )
+    assert checked is not None and checked.successful_check_sha == "1" * 40
+
+    pushed = store.bind_implementation_pull_request(
+        **{
+            **values,
+            "head_sha": "2" * 40,
+            "observed_at": opened_at + timedelta(seconds=2),
+        }
+    )
+    assert pushed.head_sha == "2" * 40
+    assert pushed.successful_check_sha is None
+    late = store.bind_implementation_pull_request(
+        **{
+            **values,
+            "observed_at": opened_at + timedelta(seconds=1),
+        }
+    )
+    assert late.head_sha == "2" * 40
+
+    merged = store.bind_implementation_pull_request(
+        **{
+            **values,
+            "head_sha": "2" * 40,
+            "observed_at": opened_at + timedelta(seconds=3),
+            "pull_request_state": "closed",
+            "merged_commit": "3" * 40,
+        }
+    )
+    assert merged.merged_commit == "3" * 40
+    replayed_open = store.bind_implementation_pull_request(
+        **{
+            **values,
+            "head_sha": "2" * 40,
+            "observed_at": opened_at + timedelta(seconds=4),
+        }
+    )
+    assert replayed_open.merged_commit == "3" * 40
+    assert replayed_open.pull_request_state == "closed"
+    assert replayed_open in store.implementation_associations()
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
@@ -236,6 +379,53 @@ def test_runtime_readiness_rejects_legacy_columns_constraints_and_indexes() -> N
                 """
                 ALTER TABLE planning_lifecycle.plan_runs
                 DROP COLUMN start_request_ciphertext
+                """
+            )
+        assert not store.ready()
+        store.setup()
+        assert store.ready()
+
+        with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_lifecycle.implementation_pr_associations
+                DROP CONSTRAINT implementation_pr_state_valid
+                """
+            )
+            connection.execute(
+                """
+                ALTER TABLE planning_lifecycle.implementation_pr_associations
+                ADD CONSTRAINT implementation_pr_state_valid
+                CHECK (pull_request_state IN ('open','closed','invalid'))
+                """
+            )
+        assert not store.ready()
+        with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_lifecycle.implementation_pr_associations
+                DROP CONSTRAINT implementation_pr_state_valid
+                """
+            )
+        store.setup()
+        assert store.ready()
+
+        with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_lifecycle.plan_runs
+                DROP CONSTRAINT plan_runs_approval_evidence_sha256_format
+                """
+            )
+        assert not store.ready()
+        store.setup()
+        assert store.ready()
+
+        with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+            connection.execute(
+                """
+                ALTER TABLE planning_lifecycle.implementation_pr_associations
+                DROP CONSTRAINT implementation_pr_state_valid
                 """
             )
         assert not store.ready()

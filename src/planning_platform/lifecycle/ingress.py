@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,8 +100,12 @@ def openproject_envelope(
     event: dict[str, Any],
     *,
     secret: bytes,
+    trusted_service_actor_ids: Collection[str],
     received_at: datetime | None = None,
 ) -> EventEnvelope:
+    trusted_actors = frozenset(trusted_service_actor_ids)
+    if not trusted_actors or any(not value for value in trusted_actors):
+        raise ValueError("trusted OpenProject service actor IDs are required")
     raw, headers, payload = _raw_event(event)
     now = received_at or datetime.now(UTC)
     action = payload.get("action")
@@ -117,9 +122,10 @@ def openproject_envelope(
     )
     delivery = headers.get("x-openproject-delivery") or hashlib.sha256(raw).hexdigest()
     actor = payload.get("actor")
-    actor_id = (
-        str(actor.get("id") or actor.get("name")) if isinstance(actor, dict) else "openproject"
-    )
+    actor_value = actor.get("id") if isinstance(actor, dict) else None
+    if not isinstance(actor_value, (int, str)) or not str(actor_value):
+        raise WebhookRejected("OpenProject webhook actor identity is absent")
+    actor_id = str(actor_value)
     idea_id: int | None = None
     if not is_comment and type(resource.get("id")) is int:
         idea_id = resource["id"]
@@ -140,7 +146,10 @@ def openproject_envelope(
         secret=secret,
         occurred_at=occurred,
         received_at=now,
-        actor=EventActor(kind="human" if is_comment else "service", id=actor_id),
+        actor=EventActor(
+            kind=("service" if actor_id in trusted_actors else "human"),
+            id=actor_id,
+        ),
         subject=EventSubject(idea_id=idea_id),
         key_id="openproject-webhook",
     )

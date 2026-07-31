@@ -404,6 +404,7 @@ class OpenProjectPublicationAdapter:
         parent_id = self._id_from_link(links.get("parent"))
         status_id = self._id_from_link(links.get("status"))
         plan_version = self._field_value(raw, self._field_name("plan_version"))
+        repository = self._field_value(raw, self._field_name("repository"))
         identity = self._identity_from_raw(raw)
         stored_hash = self._field_value(raw, self._field_name("managed_hash"))
         evidence_state = self._field_value(raw, self._field_name("evidence_state"))
@@ -412,6 +413,8 @@ class OpenProjectPublicationAdapter:
                 raise OpenProjectPublicationError("managed work package has no valid Managed hash")
             if evidence_state is not None and not isinstance(evidence_state, str):
                 raise OpenProjectPublicationError("Evidence state custom field is not a string")
+            if not isinstance(repository, str) or not repository:
+                raise OpenProjectPublicationError("Repository custom field is not a string")
             observed_hash = canonical_hash(self._observed_projection(raw))
             if stored_hash != observed_hash:
                 raise OpenProjectPublicationError(
@@ -429,6 +432,7 @@ class OpenProjectPublicationAdapter:
             plan_id=None if identity is None else identity[0],
             node_key=None if identity is None else identity[1],
             plan_version=parsed_plan_version,
+            repository=None if identity is None else repository,
             title=str(raw.get("subject", raw.get("title", ""))),
             managed_hash=(
                 None

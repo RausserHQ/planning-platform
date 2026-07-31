@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from planning_platform.diff import plan_diff
-from planning_platform.github_adapter import GitHubAdapter
-from planning_platform.github_models import ImmutableArtifactBinding
+from planning_platform.github_adapter import GitHubAdapter, GitHubAdapterError
+from planning_platform.github_models import ImmutableArtifactBinding, PullRequestEvidence
 from planning_platform.lifecycle.models import (
     EventActor,
     EventEnvelope,
@@ -23,6 +25,7 @@ from planning_platform.models import with_approved_commit
 from planning_platform.openproject_adapter import (
     OpenProjectConflict,
     OpenProjectPublicationAdapter,
+    OpenProjectPublicationError,
 )
 from planning_platform.planner.models import (
     IdeaSnapshot,
@@ -39,16 +42,23 @@ from planning_platform.publication_journal import (
     PublicationJournalMismatch,
 )
 from planning_platform.publisher import PublicationEnvelope, PublicationRejected, publish
+from planning_platform.validation import validate_plan
 
 from .concurrency import run_sync_to_completion
 from .planner_client import PlannerClient, PlannerThreadNotFound
 from .recovery import RecoveryCipher, RecoveryPayloadRejected
-from .store import PlanRun, PostgresLifecycleStore
+from .store import (
+    ImplementationPrAssociation,
+    LifecycleStoreMismatch,
+    PlanRun,
+    PostgresLifecycleStore,
+)
 
 _REPOSITORY = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:https://github\.com/)?"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?(?![A-Za-z0-9_.-])"
 )
+_REQUIRED_PLANNING_CHECKS = frozenset({"planning-backlog-validation"})
 
 
 @dataclass(frozen=True)
@@ -77,14 +87,36 @@ class LifecycleService:
         store: PostgresLifecycleStore,
         publication_database_url: str,
         recovery_cipher: RecoveryCipher,
+        planning_repository: str,
+        implementation_required_checks: Mapping[str, Collection[str]],
+        implementation_stale_after: timedelta = timedelta(hours=48),
         publication_journal_factory: Callable[[], PublicationJournal] | None = None,
     ) -> None:
+        if not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", planning_repository
+        ):
+            raise ValueError("planning artifact repository is invalid")
+        if implementation_stale_after <= timedelta(0):
+            raise ValueError("implementation stale interval must be positive")
+        normalized_checks: dict[str, frozenset[str]] = {}
+        for repository, checks in implementation_required_checks.items():
+            values = frozenset(checks)
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)
+                or not values
+                or any(not value.strip() for value in values)
+            ):
+                raise ValueError("implementation required-check policy is invalid")
+            normalized_checks[repository] = values
         self._planner = planner
         self._openproject = openproject
         self._github = github
         self._store = store
         self._publication_database_url = publication_database_url
         self._recovery_cipher = recovery_cipher
+        self._planning_repository = planning_repository
+        self._implementation_required_checks = normalized_checks
+        self._implementation_stale_after = implementation_stale_after
         self._publication_journal_factory = publication_journal_factory or (
             lambda: PostgresPublicationJournal(self._publication_database_url)
         )
@@ -160,12 +192,12 @@ class LifecycleService:
             )
 
         context = []
-        base_branch = ""
         for repository in repositories:
-            branch, snapshot = await self._github.context_snapshot(repository)
-            if not base_branch:
-                base_branch = branch
+            _branch, snapshot = await self._github.context_snapshot(repository)
             context.append(snapshot)
+        base_branch, _planning_head = await self._github.repository_head(
+            self._planning_repository
+        )
         op_snapshot = await run_sync_to_completion(self._openproject.snapshot)
         plan_version = 1 if latest is None else latest.plan_version + 1
         plan_id = f"idea-{idea_id}"
@@ -176,7 +208,7 @@ class LifecycleService:
             plan_id=plan_id,
             plan_version=plan_version,
             thread_id=thread_id,
-            repository=repositories[0],
+            repository=self._planning_repository,
             base_branch=base_branch,
             artifact_prefix=artifact_prefix,
             backlog_path=f"{artifact_prefix}/backlog.yaml",
@@ -236,6 +268,17 @@ class LifecycleService:
                 "no_pending_interrupt",
                 work_package_id=idea_id,
             )
+        comment = activity.get("comment")
+        answer = comment.get("raw") if isinstance(comment, dict) else None
+        if event.actor.kind != "human":
+            return await self._outcome(
+                event,
+                "resume_planning",
+                "ignored_service_comment",
+                plan_id=run.plan_id,
+                plan_version=run.plan_version,
+                work_package_id=idea_id,
+            )
         if run.pending_resume_ciphertext is not None:
             try:
                 plaintext = self._recovery_cipher.open(
@@ -260,19 +303,8 @@ class LifecycleService:
         state = await self._planner.get(run.thread_id)
         if state.interrupt is None:
             return await self._handle_planner_response(event, run, state)
-        comment = activity.get("comment")
-        answer = comment.get("raw") if isinstance(comment, dict) else None
         if not isinstance(answer, str) or not answer.strip():
             raise LifecycleEventRejected("OpenProject planning comment is empty")
-        if "<!-- planning-platform:comment:" in answer:
-            return await self._outcome(
-                event,
-                "resume_planning",
-                "ignored_service_comment",
-                plan_id=run.plan_id,
-                plan_version=run.plan_version,
-                work_package_id=idea_id,
-            )
         comment_id = self._positive_int(activity.get("id"), "comment ID")
         created_at = self._timestamp(activity.get("createdAt"), "comment createdAt")
         resume_request = ResumePlanRequest(
@@ -395,6 +427,12 @@ class LifecycleService:
             or backlog.plan.plan.approved_planning_commit is not None
         ):
             raise LifecycleEventRejected("planner backlog does not match its lifecycle run")
+        issues = validate_plan(backlog.plan)
+        if issues:
+            codes = ",".join(sorted({issue.code for issue in issues}))
+            raise LifecycleEventRejected(
+                f"planner backlog failed semantic validation ({codes})"
+            )
         branch = await self._github.ensure_planning_commit(
             repository=run.repository,
             branch_name=f"planning/{run.plan_id}-v{run.plan_version}",
@@ -476,7 +514,53 @@ class LifecycleService:
         merge_sha = pull.get("merge_commit_sha")
         if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
             raise LifecycleEventRejected("merged planning PR has no immutable merge commit")
-        run = await run_sync_to_completion(self._store.set_state, run, "publishing")
+        if run.state == "pr_open" or (
+            run.state == "publishing" and run.approval_evidence_sha256 is None
+        ):
+            if run.planning_commit is None or run.pull_request_number is None:
+                raise LifecycleEventRejected(
+                    "planning PR has no durable head and pull-request binding"
+                )
+            if run.approved_commit is not None and run.approved_commit != merge_sha:
+                raise LifecycleEventRejected(
+                    "legacy publication merge does not match its durable binding"
+                )
+            evidence = await self._github.pull_request_evidence(
+                repository,
+                run.pull_request_number,
+                expected_head_sha=run.planning_commit,
+            )
+            if not evidence.merged or evidence.merge_commit_sha != merge_sha:
+                raise LifecycleEventRejected(
+                    "GitHub merge evidence does not match the planning webhook"
+                )
+            if evidence.approvals < 1:
+                raise LifecycleEventRejected(
+                    "planning PR has no current human approval"
+                )
+            if not evidence.required_checks_pass(set(_REQUIRED_PLANNING_CHECKS)):
+                raise LifecycleEventRejected(
+                    "planning PR required validator check is not successful"
+                )
+            evidence_bytes = json.dumps(
+                evidence.model_dump(mode="json"),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            run = await run_sync_to_completion(
+                self._store.approve_for_publication,
+                run,
+                merge_commit=merge_sha,
+                evidence_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+            )
+        elif (
+            run.state != "publishing"
+            or run.approved_commit != merge_sha
+            or run.approval_evidence_sha256 is None
+        ):
+            raise LifecycleEventRejected(
+                "planning publication has no durable verified approval evidence"
+            )
         binding = await self._github.artifact_binding(
             repository=repository,
             commit_sha=merge_sha,
@@ -604,23 +688,100 @@ class LifecycleService:
         if marker is None:
             return await self._outcome(event, "implementation_pr", "unmanaged")
         identity = marker.group(1), marker.group(2)
+        number = self._positive_int(pull.get("number"), "pull request")
+        head = pull.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise LifecycleEventRejected("implementation PR has no immutable head commit")
+        url = pull.get("html_url")
+        if url != f"https://github.com/{repository}/pull/{number}":
+            raise LifecycleEventRejected("implementation PR has no canonical GitHub URL")
+        pull_request_state = pull.get("state")
+        if pull_request_state not in {"open", "closed"}:
+            raise LifecycleEventRejected("implementation PR has no open or closed state")
+        merged = pull.get("merged") is True
+        merge_commit = pull.get("merge_commit_sha") if merged else None
+        if (
+            merged
+            and (
+                not isinstance(merge_commit, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", merge_commit)
+            )
+        ):
+            raise LifecycleEventRejected("merged implementation PR has no merge commit")
+        if merged and pull_request_state != "closed":
+            raise LifecycleEventRejected("merged implementation PR is not closed")
+        existing = await run_sync_to_completion(
+            self._store.by_implementation_pull_request,
+            repository,
+            number,
+        )
+        if existing is not None and (
+            existing.plan_id,
+            existing.node_key,
+        ) != identity:
+            raise LifecycleStoreMismatch(
+                "implementation PR replay changed its work-package identity"
+            )
         package = await run_sync_to_completion(self._openproject.resolve, identity)
         if package is None:
             raise LifecycleEventRejected("implementation PR names an unknown work package")
-        merged = pull.get("merged") is True
-        await run_sync_to_completion(
-            self._openproject.set_lifecycle_state,
-            package.id,
-            status="Review" if merged else "In Progress",
-            evidence_state="pr_merged" if merged else "pr_open",
+        if existing is None:
+            active = await run_sync_to_completion(
+                self._store.latest_published,
+                identity[0],
+            )
+            terminal_ids = {
+                self._openproject.config.status_ids[name]
+                for name in ("Done", "Superseded", "Rejected")
+            }
+            if (
+                active is None
+                or package.plan_version != active.plan_version
+                or package.repository != repository
+                or package.human_fields.get("status_id") in terminal_ids
+            ):
+                raise LifecycleEventRejected(
+                    "implementation PR does not match an active approved repository node"
+                )
+        elif package.id != existing.work_package_id:
+            raise LifecycleStoreMismatch(
+                "implementation PR work-package binding no longer resolves"
+            )
+        association = await run_sync_to_completion(
+            self._store.bind_implementation_pull_request,
+            repository=repository,
+            number=number,
+            plan_id=identity[0],
+            node_key=identity[1],
+            work_package_id=package.id,
+            url=url,
+            head_sha=head_sha,
+            observed_at=event.occurred_at,
+            pull_request_state=pull_request_state,
+            merged_commit=merge_commit,
         )
+        await run_sync_to_completion(
+            self._openproject.ensure_comment,
+            package.id,
+            f"Implementation pull request: {url}",
+            idempotency_key=(
+                "implementation-pr:"
+                + hashlib.sha256(f"{repository}#{number}".encode()).hexdigest()[:32]
+            ),
+        )
+        await self._project_implementation_work_package(association.work_package_id)
         return await self._outcome(
             event,
             "implementation_pr",
-            "merged" if merged else "open",
+            (
+                "merged"
+                if association.merged_commit is not None
+                else association.pull_request_state
+            ),
             plan_id=identity[0],
             work_package_id=package.id,
-            pull_request_number=self._positive_int(pull.get("number"), "pull request"),
+            pull_request_number=number,
         )
 
     async def _check_run(self, event: EventEnvelope) -> LifecycleOutcome:
@@ -631,22 +792,75 @@ class LifecycleService:
         repository = self._payload_object(event.payload, "repository").get("full_name")
         if not isinstance(repository, str):
             raise LifecycleEventRejected("GitHub check run has no repository identity")
-        conclusion = check.get("conclusion")
-        if conclusion != "success":
-            return await self._outcome(event, "check_run", f"conclusion:{conclusion}")
+        head_sha = check.get("head_sha")
+        if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+            raise LifecycleEventRejected("GitHub check run has no immutable head commit")
+        check_id = check.get("id")
+        check_name = check.get("name")
+        check_app = check.get("app")
+        if (
+            type(check_id) is not int
+            or check_id <= 0
+            or not isinstance(check_name, str)
+            or not isinstance(check_app, dict)
+            or type(check_app.get("id")) is not int
+            or not isinstance(check_app.get("slug"), str)
+        ):
+            raise LifecycleEventRejected("GitHub check run has no exact check identity")
         advanced = 0
+        seen: set[int] = set()
         for reference in pulls:
             if not isinstance(reference, dict):
                 continue
             number = reference.get("number")
-            if type(number) is not int or number <= 0:
+            if type(number) is not int or number <= 0 or number in seen:
                 continue
+            seen.add(number)
             # Planning-PR checks are approval evidence only; merge remains the
             # publication gate. Implementation associations arrive through PR
             # events and advance to Review, never directly to Done.
             run = await run_sync_to_completion(self._store.by_pull_request, repository, number)
             if run is not None:
                 advanced += 1
+                continue
+            association = await run_sync_to_completion(
+                self._store.by_implementation_pull_request,
+                repository,
+                number,
+            )
+            if association is None or association.head_sha != head_sha:
+                continue
+            evidence = await self._github.pull_request_evidence(
+                repository,
+                number,
+                expected_head_sha=head_sha,
+            )
+            association = await run_sync_to_completion(
+                self._store.bind_implementation_pull_request,
+                repository=repository,
+                number=number,
+                plan_id=association.plan_id,
+                node_key=association.node_key,
+                work_package_id=association.work_package_id,
+                url=association.pull_request_url,
+                head_sha=evidence.head_sha,
+                observed_at=event.occurred_at,
+                pull_request_state=evidence.state,
+                merged_commit=evidence.merge_commit_sha if evidence.merged else None,
+            )
+            passed = self._implementation_evidence_passes(evidence)
+            association = await run_sync_to_completion(
+                self._store.record_implementation_check_result,
+                repository,
+                number,
+                head_sha=head_sha,
+                passed=passed,
+            )
+            if association is not None:
+                await self._project_implementation_work_package(
+                    association.work_package_id
+                )
+                advanced += int(passed)
         return await self._outcome(event, "check_run", f"successful:{advanced}")
 
     async def _reconcile(self, event: EventEnvelope) -> LifecycleOutcome:
@@ -657,6 +871,14 @@ class LifecycleService:
             if latest is None or candidate.plan_version > latest.plan_version:
                 latest_by_plan[candidate.plan_id] = candidate
         latest_runs = tuple(latest_by_plan.values())
+        latest_published_by_plan: dict[str, PlanRun] = {}
+        for candidate in runs:
+            if candidate.state != "published":
+                continue
+            latest = latest_published_by_plan.get(candidate.plan_id)
+            if latest is None or candidate.plan_version > latest.plan_version:
+                latest_published_by_plan[candidate.plan_id] = candidate
+        active_graph_runs = tuple(latest_published_by_plan.values())
         repaired_merges = 0
         for run in latest_runs:
             if (
@@ -701,6 +923,56 @@ class LifecycleService:
             if outcome.outcome in {"published", "already_published"}:
                 repaired_merges += 1
 
+        repaired_implementation = 0
+        implementation_failures = 0
+        associations = await run_sync_to_completion(
+            self._store.implementation_associations
+        )
+        for association in associations:
+            try:
+                evidence = await self._github.pull_request_evidence(
+                    association.repository,
+                    association.pull_request_number,
+                )
+                await run_sync_to_completion(
+                    self._store.bind_implementation_pull_request,
+                    repository=association.repository,
+                    number=association.pull_request_number,
+                    plan_id=association.plan_id,
+                    node_key=association.node_key,
+                    work_package_id=association.work_package_id,
+                    url=association.pull_request_url,
+                    head_sha=evidence.head_sha,
+                    observed_at=event.occurred_at,
+                    pull_request_state=evidence.state,
+                    merged_commit=(
+                        evidence.merge_commit_sha if evidence.merged else None
+                    ),
+                )
+                await run_sync_to_completion(
+                    self._store.record_implementation_check_result,
+                    association.repository,
+                    association.pull_request_number,
+                    head_sha=evidence.head_sha,
+                    passed=self._implementation_evidence_passes(evidence),
+                )
+            except (GitHubAdapterError, LifecycleStoreMismatch):
+                implementation_failures += 1
+                continue
+
+        refreshed_associations = await run_sync_to_completion(
+            self._store.implementation_associations
+        )
+        for work_package_id in sorted(
+            {association.work_package_id for association in refreshed_associations}
+        ):
+            try:
+                if await self._project_implementation_work_package(work_package_id):
+                    repaired_implementation += 1
+            except (LifecycleStoreMismatch, OpenProjectPublicationError):
+                implementation_failures += 1
+                continue
+
         current = await run_sync_to_completion(self._openproject.snapshot)
         try:
             identities = current.identities()
@@ -710,7 +982,7 @@ class LifecycleService:
                 "nightly_reconciliation",
                 "identity_conflict",
             )
-        findings = 0
+        findings = implementation_failures
         safe_repairs = 0
         status_ids = self._openproject.config.status_ids
         done_id = status_ids["Done"]
@@ -721,6 +993,31 @@ class LifecycleService:
             status_ids["Superseded"],
             status_ids["Rejected"],
         }
+        packages_by_id = {package.id: package for package in current.work_packages}
+        for work_package_id in {
+            association.work_package_id for association in refreshed_associations
+        }:
+            package = packages_by_id.get(work_package_id)
+            relevant = tuple(
+                association
+                for association in refreshed_associations
+                if association.work_package_id == work_package_id
+            )
+            if (
+                package is not None
+                and package.human_fields.get("status_id")
+                == status_ids["In Progress"]
+                and relevant
+                and not any(
+                    association.pull_request_state == "open"
+                    or association.merged_commit is not None
+                    for association in relevant
+                )
+                and event.occurred_at
+                - max(association.head_observed_at for association in relevant)
+                >= self._implementation_stale_after
+            ):
+                findings += 1
         for run in latest_runs:
             if run.state == "needs_input":
                 planner_state = await self._planner.get(run.thread_id)
@@ -737,12 +1034,13 @@ class LifecycleService:
                         status="Needs Input",
                     )
                     safe_repairs += 1
+        for run in active_graph_runs:
             if (
-                run.state != "published"
-                or run.approved_commit is None
+                run.approved_commit is None
                 or run.backlog_blob_sha1 is None
                 or run.backlog_sha256 is None
             ):
+                findings += 1
                 continue
             binding = ImmutableArtifactBinding(
                 repository=run.repository,
@@ -820,7 +1118,9 @@ class LifecycleService:
             "nightly_reconciliation",
             (
                 f"inspected:{len(latest_runs)}:findings:{findings}:"
-                f"repairs:{safe_repairs}:missed_merges:{repaired_merges}"
+                f"repairs:{safe_repairs}:missed_merges:{repaired_merges}:"
+                f"implementation_repairs:{repaired_implementation}:"
+                f"implementation_failures:{implementation_failures}"
             ),
         )
 
@@ -884,6 +1184,92 @@ class LifecycleService:
             if value not in result:
                 result.append(value)
         return tuple(result[:20])
+
+    def _implementation_evidence_passes(
+        self,
+        evidence: PullRequestEvidence,
+    ) -> bool:
+        required = self._implementation_required_checks.get(evidence.repository)
+        return required is not None and evidence.required_checks_pass(set(required))
+
+    async def _project_implementation_work_package(
+        self,
+        work_package_id: int,
+    ) -> bool:
+        associations = tuple(
+            association
+            for association in await run_sync_to_completion(
+                self._store.implementation_associations
+            )
+            if association.work_package_id == work_package_id
+        )
+        if not associations:
+            raise LifecycleStoreMismatch(
+                "implementation projection has no durable associations"
+            )
+        identities = {
+            (association.plan_id, association.node_key)
+            for association in associations
+        }
+        if len(identities) != 1:
+            raise LifecycleStoreMismatch(
+                "implementation work package has conflicting plan identities"
+            )
+        identity = next(iter(identities))
+        package = await run_sync_to_completion(self._openproject.resolve, identity)
+        if package is None or package.id != work_package_id:
+            raise LifecycleStoreMismatch(
+                "implementation projection work package no longer resolves"
+            )
+        desired_status, evidence_state = self._implementation_projection(associations)
+        status: str | None = None
+        if desired_status is not None:
+            status_ids = self._openproject.config.status_ids
+            current_id = package.human_fields.get("status_id")
+            ranks = {
+                status_ids["Proposed"]: 0,
+                status_ids["Ready"]: 0,
+                status_ids["In Progress"]: 1,
+                status_ids["Review"]: 2,
+            }
+            desired_id = status_ids[desired_status]
+            current_rank = ranks.get(current_id) if type(current_id) is int else None
+            desired_rank = ranks[desired_id]
+            if current_rank is not None and desired_rank > current_rank:
+                status = desired_status
+        evidence = (
+            evidence_state if package.evidence_state != evidence_state else None
+        )
+        if status is None and evidence is None:
+            return False
+        await run_sync_to_completion(
+            self._openproject.set_lifecycle_state,
+            work_package_id,
+            status=status,
+            evidence_state=evidence,
+        )
+        return True
+
+    @staticmethod
+    def _implementation_projection(
+        associations: tuple[ImplementationPrAssociation, ...],
+    ) -> tuple[str | None, str]:
+        if any(
+            association.merged_commit is not None for association in associations
+        ):
+            return "Review", "pr_merged"
+        if any(
+            association.pull_request_state == "open"
+            and association.successful_check_sha == association.head_sha
+            for association in associations
+        ):
+            return "Review", "check_passed"
+        if any(
+            association.pull_request_state == "open"
+            for association in associations
+        ):
+            return "In Progress", "pr_open"
+        return None, "pr_closed"
 
     @staticmethod
     def _positive_int(value: object, label: str) -> int:
