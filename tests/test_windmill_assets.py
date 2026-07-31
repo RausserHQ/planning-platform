@@ -146,3 +146,5 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "ARG NPM_VERSION=11.19.0" in dockerfile
     assert 'npm install --global "npm@${NPM_VERSION}"' in dockerfile
     assert 'tar/package.json").version' in dockerfile
+    assert "ENV PYTHONPATH=/opt/planning-platform" in dockerfile
+    assert "ADDITIONAL_PYTHON_PATHS=/opt/planning-platform" in dockerfile

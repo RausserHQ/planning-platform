@@ -25,7 +25,8 @@ RUN npm install --global "npm@${NPM_VERSION}" \
     && find /opt/planning-platform-workspace -type d -exec chmod 0755 {} + \
     && find /opt/planning-platform-workspace -type f -exec chmod 0644 {} +
 
-ENV ADDITIONAL_PYTHON_PATHS=/opt/planning-platform \
+ENV PYTHONPATH=/opt/planning-platform \
+    ADDITIONAL_PYTHON_PATHS=/opt/planning-platform \
     PIP_LOCAL_DEPENDENCIES="^planning-platform([<=> !].*)?$"
 
 USER 1000:1000
