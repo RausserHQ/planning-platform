@@ -3,7 +3,7 @@ name: Build planning platform images
 on:
   push:
     tags:
-      - v0.1.1
+      - v0.1.2
 
 permissions:
   contents: read
@@ -18,11 +18,11 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   PLANNER_IMAGE: ghcr.io/rausserhq/planning-platform/planner
-  PLANNER_TAG: v0.1.1
+  PLANNER_TAG: v0.1.2
   WINDMILL_IMAGE: ghcr.io/rausserhq/planning-platform/windmill
   WINDMILL_SOURCE_IMAGE: ghcr.io/rausserhq/planning-platform/windmill-source
-  WINDMILL_TAG: v1.775.2-planning.2
-  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.2
+  WINDMILL_TAG: v1.775.2-planning.3
+  WINDMILL_SOURCE_TAG: v1.775.2-ce-source.3
   WINDMILL_SHA: 64ec1aa490ab5537a73bcb6f6b7e926c6339af39
 
 jobs:
@@ -96,8 +96,8 @@ jobs:
           set -euo pipefail
           test "$(git -C upstream rev-parse HEAD)" = "${WINDMILL_SHA}"
           test -z "$(git -C upstream status --porcelain)"
-          rg -n '^version = "1\.775\.2"$' upstream/backend/Cargo.toml
-          ! rg -n 'features=.enterprise.|features = .enterprise.' upstream/Dockerfile
+          grep -En '^version = "1\.775\.2"$' upstream/backend/Cargo.toml
+          ! grep -En 'features=.enterprise.|features = .enterprise.' upstream/Dockerfile
 
       - name: Set up uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
@@ -176,9 +176,9 @@ jobs:
           docker pull --platform linux/amd64 "${image}"
           test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "1000:1000"
           docker run --rm --platform linux/amd64 --entrypoint python3 "${image}" -c \
-            'from importlib.metadata import version; print(version("planning-platform"))'
+            'from importlib.metadata import version; from pathlib import Path; root = Path("/opt/planning-platform-workspace"); files = [path for path in root.rglob("*") if path.is_file()]; print(version("planning-platform")); assert len(files) == 31; assert (root / "wmill.yaml").is_file(); assert (root / "f/planning/github_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/openproject_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/nightly_reconciliation.schedule.yaml").is_file()'
           docker run --rm --platform linux/amd64 --entrypoint wmill "${image}" --version \
-            | rg '1\.775\.2'
+            | grep -E '1\.775\.2'
           {
             echo "Windmill source: \`${WINDMILL_SHA}\` (AGPL v3)"
             echo "Windmill source image: \`${WINDMILL_SOURCE_IMAGE}:${WINDMILL_SOURCE_TAG}@${{ steps.source.outputs.digest }}\`"

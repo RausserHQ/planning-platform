@@ -5,7 +5,8 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).parents[1] / "windmill"
+REPO_ROOT = Path(__file__).parents[1]
+ROOT = REPO_ROOT / "windmill"
 PLANNING = ROOT / "f/planning"
 REQUIRED_FLOWS = {
     "idea_created",
@@ -105,3 +106,21 @@ def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> Non
     assert schedule["enabled"] is True
     assert schedule["is_flow"] is True
     assert schedule["timezone"] == "America/Los_Angeles"
+
+
+def test_release_image_contains_the_complete_workspace_snapshot() -> None:
+    workspace_files = sorted(
+        path.relative_to(ROOT)
+        for path in ROOT.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+    )
+    assert len(workspace_files) == 31
+
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
+    assert "!windmill/" in dockerignore
+    assert "!windmill/**" in dockerignore
+    assert "windmill/**/__pycache__/" in dockerignore
+    assert "windmill/**/*.pyc" in dockerignore
+
+    dockerfile = (REPO_ROOT / "deploy/windmill/extend.Dockerfile").read_text()
+    assert "COPY windmill/ /opt/planning-platform-workspace/" in dockerfile
