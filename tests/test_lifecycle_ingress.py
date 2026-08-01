@@ -11,6 +11,7 @@ from planning_platform.lifecycle.ingress import (
     convergence_check_envelope,
     github_envelope,
     openproject_envelope,
+    replan_affected_subgraph_envelope,
 )
 from planning_platform.lifecycle.webhooks import WebhookRejected
 
@@ -102,6 +103,35 @@ def test_convergence_ingress_requires_exact_plan_and_windmill_job_identity() -> 
     assert envelope.payload == {"plan_id": "single-repository", "plan_version": 1}
     with pytest.raises(ValueError, match="identity"):
         convergence_check_envelope(plan_id="", plan_version=1, delivery_id="job")
+
+
+def test_replan_ingress_binds_unique_roots_and_reason_to_one_windmill_job() -> None:
+    now = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
+    envelope = replan_affected_subgraph_envelope(
+        plan_id="single-repository",
+        base_plan_version=3,
+        affected_node_keys=("service-api", "service-worker"),
+        reason="Split the service migration after production feedback.",
+        delivery_id="wm-root-job-1176",
+        occurred_at=now,
+    )
+    assert envelope.event_type == "planning.replan_affected_subgraph"
+    assert envelope.source_delivery_id == "replan:wm-root-job-1176"
+    assert envelope.subject.plan_version == 3
+    assert envelope.payload == {
+        "plan_id": "single-repository",
+        "base_plan_version": 3,
+        "affected_node_keys": ["service-api", "service-worker"],
+        "reason": "Split the service migration after production feedback.",
+    }
+    with pytest.raises(ValueError, match="unique"):
+        replan_affected_subgraph_envelope(
+            plan_id="single-repository",
+            base_plan_version=3,
+            affected_node_keys=("service-api", "service-api"),
+            reason="bounded",
+            delivery_id="job",
+        )
 
 
 @pytest.mark.parametrize(

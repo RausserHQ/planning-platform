@@ -196,3 +196,47 @@ def convergence_check_envelope(
         signature=VerifiedSignature(verified=True, algorithm="internal"),
         payload={"plan_id": plan_id, "plan_version": plan_version},
     )
+
+
+def replan_affected_subgraph_envelope(
+    *,
+    plan_id: str,
+    base_plan_version: int,
+    affected_node_keys: tuple[str, ...],
+    reason: str,
+    delivery_id: str,
+    occurred_at: datetime | None = None,
+) -> EventEnvelope:
+    """Build the internal, operator-run bounded partial-replan envelope."""
+    if (
+        not plan_id
+        or base_plan_version <= 0
+        or not delivery_id
+        or not affected_node_keys
+        or len(affected_node_keys) != len(set(affected_node_keys))
+        or any(not isinstance(key, str) or not key for key in affected_node_keys)
+        or not isinstance(reason, str)
+        or not reason.strip()
+    ):
+        raise ValueError(
+            "bounded replan requires plan identity, unique affected keys, reason, "
+            "and Windmill job identity"
+        )
+    now = occurred_at or datetime.now(UTC)
+    payload = {
+        "plan_id": plan_id,
+        "base_plan_version": base_plan_version,
+        "affected_node_keys": list(affected_node_keys),
+        "reason": reason,
+    }
+    return envelope_for_delivery(
+        event_type="planning.replan_affected_subgraph",
+        source="windmill",
+        delivery_id=f"replan:{delivery_id}",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill-operator"),
+        subject=EventSubject(plan_id=plan_id, plan_version=base_plan_version),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload=payload,
+    )

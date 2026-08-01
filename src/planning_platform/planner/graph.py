@@ -15,6 +15,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import interrupt
 
 from planning_platform.models import BacklogPlan
+from planning_platform.replan import apply_replan_boundary
 from planning_platform.validation import SemanticValidationError, validate_plan
 
 from .artifacts import artifact_manifest, render_artifact_set
@@ -41,6 +42,7 @@ class PlannerState(TypedDict, total=False):
     idea: dict[str, Any]
     openproject_snapshot: dict[str, Any]
     repositories: list[dict[str, str]]
+    replan: dict[str, Any]
     classification: dict[str, Any]
     repository_context: dict[str, Any]
     compact_specification: dict[str, Any]
@@ -117,6 +119,7 @@ def _model_payload(state: PlannerState) -> dict[str, Any]:
         "requirements_draft": state.get("requirements_draft", {}),
         "decomposition": state.get("decomposition", {}),
         "relation_draft": state.get("relation_draft", {}),
+        "replan": state.get("replan"),
     }
 
 
@@ -268,22 +271,8 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
 
     async def validate_backlog(state: PlannerState) -> dict[str, Any]:
         declared_requirements = set(state["requirements_draft"]["requirements"])
-        covered_requirements: set[str] = set()
-        fabricated_requirements: set[str] = set()
-        for item in state["relation_draft"]["items"]:
-            item_requirements = set(item.get("source_requirements", ()))
-            covered_requirements.update(item_requirements)
-            fabricated_requirements.update(item_requirements - declared_requirements)
-        if fabricated_requirements:
-            raise ValueError(
-                "relation draft contains undeclared source requirements: "
-                f"{sorted(fabricated_requirements)}"
-            )
-        omitted_requirements = declared_requirements - covered_requirements
-        if omitted_requirements:
-            raise ValueError(
-                f"relation draft omits declared source requirements: {sorted(omitted_requirements)}"
-            )
+        relation_items = state["relation_draft"]["items"]
+        replan = state.get("replan")
         backlog = BacklogPlan.model_validate(
             {
                 "schema_version": "1.0.0",
@@ -300,9 +289,41 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
                     "approved_planning_commit": None,
                     "openproject_snapshot": state["openproject_snapshot"],
                 },
-                "items": state["relation_draft"]["items"],
+                "items": relation_items,
             }
         )
+        mutable_keys = set(backlog.by_key)
+        if isinstance(replan, dict):
+            prior = BacklogPlan.model_validate(replan.get("prior_plan"))
+            closure = set(replan.get("affected_node_keys", ()))
+            mutable_keys = closure | (set(backlog.by_key) - set(prior.by_key))
+            backlog = apply_replan_boundary(
+                prior,
+                backlog,
+                base_approved_commit=str(replan.get("base_approved_planning_commit", "")),
+                selected_root_keys=tuple(replan.get("selected_root_keys", ())),
+                affected_node_keys=tuple(replan.get("affected_node_keys", ())),
+            )
+        mutable_requirements = {
+            requirement
+            for item in backlog.items
+            if item.key in mutable_keys
+            for requirement in item.source_requirements
+        }
+        fabricated_requirements = mutable_requirements - declared_requirements
+        if fabricated_requirements:
+            raise ValueError(
+                "relation draft contains undeclared source requirements: "
+                f"{sorted(fabricated_requirements)}"
+            )
+        covered_requirements = {
+            requirement for item in backlog.items for requirement in item.source_requirements
+        }
+        omitted_requirements = declared_requirements - covered_requirements
+        if omitted_requirements:
+            raise ValueError(
+                f"relation draft omits declared source requirements: {sorted(omitted_requirements)}"
+            )
         issues = validate_plan(backlog)
         if issues:
             raise SemanticValidationError(issues)

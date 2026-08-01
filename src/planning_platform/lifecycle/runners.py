@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from planning_platform.loader import LoadedArtifact
-from planning_platform.publisher import PublicationEnvelope, PublishResult, publish
+from planning_platform.publisher import (
+    PublicationEnvelope,
+    PublishResult,
+    ReplanPublicationContext,
+    publish,
+)
 from planning_platform.reconciliation import ReconciliationReport, reconcile
 
 if TYPE_CHECKING:
@@ -27,6 +32,7 @@ class PublicationCommand:
     envelope: PublicationEnvelope
     approved_by_merge: bool
     merge_commit: str
+    replan_context: ReplanPublicationContext | None = None
 
     def __post_init__(self) -> None:
         if not self.approved_by_merge:
@@ -50,6 +56,7 @@ class PublicationRunner:
             command.envelope,
             apply=True,
             journal=journal,
+            replan_context=command.replan_context,
         )
 
 

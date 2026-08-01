@@ -20,8 +20,9 @@ from planning_platform.lifecycle.models import (
     VerifiedSignature,
     envelope_for_delivery,
 )
-from planning_platform.loader import load_artifact_bytes
-from planning_platform.models import with_approved_commit
+from planning_platform.loader import LoadedArtifact, load_artifact_bytes
+from planning_platform.models import BacklogPlan, with_approved_commit
+from planning_platform.openproject import managed_hash
 from planning_platform.openproject_adapter import (
     OpenProjectConflict,
     OpenProjectPublicationAdapter,
@@ -32,6 +33,7 @@ from planning_platform.planner.models import (
     OpenProjectSnapshotInput,
     PlannerEvent,
     PlanResponse,
+    ReplanContext,
     ResumePlanRequest,
     StartPlanRequest,
     idea_snapshot_digest,
@@ -41,7 +43,13 @@ from planning_platform.publication_journal import (
     PublicationJournal,
     PublicationJournalMismatch,
 )
-from planning_platform.publisher import PublicationEnvelope, PublicationRejected, publish
+from planning_platform.publisher import (
+    PublicationEnvelope,
+    PublicationRejected,
+    ReplanPublicationContext,
+    publish,
+)
+from planning_platform.replan import effective_node_binding, validate_replan_candidate
 from planning_platform.validation import validate_plan
 
 from .concurrency import run_sync_to_completion
@@ -69,6 +77,9 @@ class LifecycleOutcome:
     plan_version: int | None = None
     work_package_id: int | None = None
     pull_request_number: int | None = None
+    operation_count: int | None = None
+    applied_operation_count: int | None = None
+    resumed: bool | None = None
 
 
 class LifecycleEventRejected(ValueError):
@@ -93,9 +104,7 @@ class LifecycleService:
         planning_thread_stale_after: timedelta = timedelta(hours=24),
         publication_journal_factory: Callable[[], PublicationJournal] | None = None,
     ) -> None:
-        if not re.fullmatch(
-            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", planning_repository
-        ):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", planning_repository):
             raise ValueError("planning artifact repository is invalid")
         if implementation_stale_after <= timedelta(0):
             raise ValueError("implementation stale interval must be positive")
@@ -138,6 +147,8 @@ class LifecycleService:
             return await self._check_run(event)
         if event.event_type == "planning.convergence_check":
             return await self._convergence_check(event)
+        if event.event_type == "planning.replan_affected_subgraph":
+            return await self._replan_affected_subgraph(event)
         if event.event_type == "reconciliation.scheduled":
             return await self._reconcile(event)
         raise LifecycleEventRejected(f"unsupported lifecycle event: {event.event_type}")
@@ -197,6 +208,265 @@ class LifecycleService:
             plan_version=plan_version,
         )
 
+    async def _replan_affected_subgraph(self, event: EventEnvelope) -> LifecycleOutcome:
+        """Start exactly one bounded successor of an immutable published plan."""
+        if event.source != "windmill" or event.signature.algorithm != "internal":
+            raise LifecycleEventRejected("partial replan requires a Windmill internal event")
+        plan_id = event.subject.plan_id
+        base_version = event.subject.plan_version
+        payload = event.payload
+        roots = payload.get("affected_node_keys")
+        reason = payload.get("reason")
+        if (
+            not plan_id
+            or base_version is None
+            or type(base_version) is not int
+            or not isinstance(roots, list)
+            or not roots
+            or any(not isinstance(key, str) or not key for key in roots)
+            or len(roots) != len(set(roots))
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or payload
+            != {
+                "plan_id": plan_id,
+                "base_plan_version": base_version,
+                "affected_node_keys": roots,
+                "reason": reason,
+            }
+        ):
+            raise LifecycleEventRejected("partial replan requires one exact bounded request")
+        base = await run_sync_to_completion(self._store.get, plan_id, base_version)
+        if base is None:
+            raise LifecycleEventRejected("partial replan references an unknown base plan version")
+        if base.state != "published":
+            raise LifecycleEventRejected("partial replan base version must be published")
+        if (
+            base.approved_commit is None
+            or base.approval_evidence_sha256 is None
+            or base.backlog_blob_sha1 is None
+            or base.backlog_sha256 is None
+        ):
+            raise LifecycleEventRejected(
+                "partial replan base is missing immutable publication bindings"
+            )
+        binding = ImmutableArtifactBinding(
+            repository=base.repository,
+            commit_sha=base.approved_commit,
+            path=base.backlog_path,
+            blob_sha=base.backlog_blob_sha1,
+            content_sha256=base.backlog_sha256,
+        )
+        artifact = load_artifact_bytes(await self._github.read_immutable_artifact(binding))
+        prior = artifact.plan
+        if (
+            prior.plan.id != base.plan_id
+            or prior.plan.version != base.plan_version
+            or prior.plan.source_idea.work_package_id != base.idea_id
+            or artifact.blob_sha1 != binding.blob_sha
+            or artifact.sha256 != binding.content_sha256
+        ):
+            raise LifecycleEventRejected("immutable base backlog does not match its published run")
+        missing = set(roots) - set(prior.by_key)
+        if missing:
+            raise LifecycleEventRejected("partial replan references unknown affected roots")
+        selected = tuple(roots)
+        expected_replan = ReplanContext(
+            prior_plan=prior,
+            base_approved_planning_commit=base.approved_commit,
+            selected_root_keys=selected,
+            affected_node_keys=self._prior_descendant_keys(prior, set(selected)),
+            reason=reason,
+        )
+        published = await run_sync_to_completion(self._store.latest_published, plan_id)
+        if published != base:
+            raise LifecycleEventRejected(
+                "partial replan base version is not the latest published plan"
+            )
+        latest = await run_sync_to_completion(self._store.latest_for_idea, base.idea_id)
+        plan_version = base.plan_version + 1
+        if latest != base:
+            if (
+                latest is None
+                or latest.plan_id != base.plan_id
+                or latest.idea_id != base.idea_id
+                or latest.plan_version <= base.plan_version
+            ):
+                raise LifecycleEventRejected(
+                    "partial replan has an invalid successor history"
+                )
+            previous = self._recover_replan_request(latest)
+            expected_event = PlannerEvent(
+                idempotency_key=event.idempotency_key,
+                trace_id=event.trace_id,
+            )
+            if previous.event == expected_event and previous.replan == expected_replan:
+                return await self._resume_existing_replan(
+                    event,
+                    base,
+                    latest,
+                    expected_replan,
+                )
+            previous_replan = previous.replan
+            if (
+                latest.state != "failed"
+                or previous_replan is None
+                or previous.plan_id != base.plan_id
+                or previous.plan_version != latest.plan_version
+                or previous.idea.work_package_id != base.idea_id
+                or previous_replan.prior_plan != prior
+                or previous_replan.base_approved_planning_commit != base.approved_commit
+            ):
+                raise LifecycleEventRejected(
+                    "partial replan already has a different active successor"
+                )
+            plan_version = latest.plan_version + 1
+        context = []
+        current = await run_sync_to_completion(self._openproject.read_work_package, base.idea_id)
+        description = self._description(current)
+        repositories = self._repositories(description)
+        if not repositories:
+            raise LifecycleEventRejected("partial replan Idea no longer names a repository")
+        for repository in repositories:
+            _branch, snapshot = await self._github.context_snapshot(repository)
+            context.append(snapshot)
+        base_branch, _planning_head = await self._github.repository_head(self._planning_repository)
+        op_snapshot = await run_sync_to_completion(self._openproject.snapshot)
+        thread_id = f"openproject:{base.idea_id}:planning:{plan_version}"
+        artifact_prefix = f"planning/{base.plan_id}/v{plan_version}"
+        run = PlanRun(
+            idea_id=base.idea_id,
+            plan_id=base.plan_id,
+            plan_version=plan_version,
+            thread_id=thread_id,
+            repository=self._planning_repository,
+            base_branch=base_branch,
+            artifact_prefix=artifact_prefix,
+            backlog_path=f"{artifact_prefix}/backlog.yaml",
+            snapshot_sha256=op_snapshot.sha256,
+            snapshot_etag=op_snapshot.etag,
+            state="planning",
+        )
+        idea = IdeaSnapshot(
+            work_package_id=base.idea_id,
+            lock_version=self._nonnegative_int(current.get("lockVersion"), "lockVersion"),
+            updated_at=self._timestamp(current.get("updatedAt"), "updatedAt"),
+            title=str(current.get("subject", "")).strip(),
+            description=description,
+        )
+        snapshot_input = OpenProjectSnapshotInput(
+            captured_at=self._timestamp(op_snapshot.captured_at, "snapshot captured_at"),
+            etag=op_snapshot.etag,
+            sha256=op_snapshot.sha256,
+        )
+        request = StartPlanRequest(
+            event=PlannerEvent(idempotency_key=event.idempotency_key, trace_id=event.trace_id),
+            idea=idea,
+            plan_id=base.plan_id,
+            plan_version=plan_version,
+            idea_sha256=idea_snapshot_digest(idea, snapshot_input),
+            openproject_snapshot=snapshot_input,
+            repositories=tuple(context),
+            replan=expected_replan,
+        )
+        run = replace(
+            run,
+            start_request_ciphertext=self._recovery_cipher.seal(
+                purpose="planner-start", binding=run.thread_id, plaintext=request.model_dump_json()
+            ),
+        )
+        run = await run_sync_to_completion(self._store.begin, run)
+        await run_sync_to_completion(
+            self._openproject.set_lifecycle_state, base.idea_id, status="Planning"
+        )
+        response = await self._planner.start(request)
+        return await self._handle_planner_response(event, run, response)
+
+    async def _resume_existing_replan(
+        self,
+        event: EventEnvelope,
+        base: PlanRun,
+        run: PlanRun,
+        expected_replan: ReplanContext,
+    ) -> LifecycleOutcome:
+        """Recover only the exact operator request that inserted this successor."""
+        request = self._recover_replan_request(run)
+        expected_event = PlannerEvent(
+            idempotency_key=event.idempotency_key,
+            trace_id=event.trace_id,
+        )
+        if (
+            run.idea_id != base.idea_id
+            or run.plan_id != base.plan_id
+            or run.plan_version <= base.plan_version
+            or run.thread_id != f"openproject:{base.idea_id}:planning:{run.plan_version}"
+            or request.event != expected_event
+            or request.idea.work_package_id != base.idea_id
+            or request.plan_id != base.plan_id
+            or request.plan_version != run.plan_version
+            or request.openproject_snapshot.sha256 != run.snapshot_sha256
+            or request.openproject_snapshot.etag != run.snapshot_etag
+            or request.replan != expected_replan
+        ):
+            raise LifecycleEventRejected(
+                "bounded replan replay changed its immutable successor binding"
+            )
+        if run.state == "published":
+            return await self._outcome(
+                event,
+                "replan_affected_subgraph",
+                "already_published",
+                plan_id=run.plan_id,
+                plan_version=run.plan_version,
+                work_package_id=run.idea_id,
+                pull_request_number=run.pull_request_number,
+            )
+        if run.state == "failed":
+            return await self._outcome(
+                event,
+                "replan_affected_subgraph",
+                "already_failed",
+                plan_id=run.plan_id,
+                plan_version=run.plan_version,
+                work_package_id=run.idea_id,
+            )
+        if run.state not in {"planning", "needs_input", "pr_open"}:
+            raise LifecycleEventRejected(
+                "bounded replan successor is already in a publication transition"
+            )
+        await run_sync_to_completion(
+            self._openproject.set_lifecycle_state,
+            run.idea_id,
+            status="Planning",
+        )
+        try:
+            response = await self._planner.get(run.thread_id)
+        except PlannerThreadNotFound:
+            response = await self._planner.start(request)
+        return await self._handle_planner_response(event, run, response)
+
+    def _recover_start_request(self, run: PlanRun) -> StartPlanRequest:
+        try:
+            plaintext = self._recovery_cipher.open(
+                purpose="planner-start",
+                binding=run.thread_id,
+                ciphertext=run.start_request_ciphertext,
+            )
+            request = StartPlanRequest.model_validate_json(plaintext)
+        except (RecoveryPayloadRejected, ValueError) as error:
+            raise LifecycleEventRejected(
+                "lifecycle run has no recoverable planner start request"
+            ) from error
+        return request
+
+    def _recover_replan_request(self, run: PlanRun) -> StartPlanRequest:
+        request = self._recover_start_request(run)
+        if request.replan is None:
+            raise LifecycleEventRejected(
+                "bounded replan successor has no partial-replan binding"
+            )
+        return request
+
     async def _work_package_changed(self, event: EventEnvelope) -> LifecycleOutcome:
         raw = self._payload_object(event.payload, "work_package")
         idea_id = self._positive_int(raw.get("id"), "work-package ID")
@@ -209,6 +479,24 @@ class LifecycleService:
             )
 
         latest = await run_sync_to_completion(self._store.latest_for_idea, idea_id)
+        latest_published = (
+            None
+            if latest is None
+            else await run_sync_to_completion(self._store.latest_published, latest.plan_id)
+        )
+        if (
+            latest is not None
+            and latest_published is not None
+            and (latest.state == "published" or latest_published.plan_version < latest.plan_version)
+        ):
+            return await self._outcome(
+                event,
+                "bounded_replan_required",
+                f"ignored_after_{latest.state}",
+                plan_id=latest.plan_id,
+                plan_version=latest.plan_version,
+                work_package_id=idea_id,
+            )
         if latest is not None and latest.state not in {"published", "failed"}:
             try:
                 response = await self._planner.get(latest.thread_id)
@@ -256,9 +544,7 @@ class LifecycleService:
         for repository in repositories:
             _branch, snapshot = await self._github.context_snapshot(repository)
             context.append(snapshot)
-        base_branch, _planning_head = await self._github.repository_head(
-            self._planning_repository
-        )
+        base_branch, _planning_head = await self._github.repository_head(self._planning_repository)
         op_snapshot = await run_sync_to_completion(self._openproject.snapshot)
         plan_version = 1 if latest is None else latest.plan_version + 1
         plan_id = f"idea-{idea_id}"
@@ -491,9 +777,32 @@ class LifecycleService:
         issues = validate_plan(backlog.plan)
         if issues:
             codes = ",".join(sorted({issue.code for issue in issues}))
-            raise LifecycleEventRejected(
-                f"planner backlog failed semantic validation ({codes})"
+            raise LifecycleEventRejected(f"planner backlog failed semantic validation ({codes})")
+        try:
+            plaintext = self._recovery_cipher.open(
+                purpose="planner-start",
+                binding=run.thread_id,
+                ciphertext=run.start_request_ciphertext,
             )
+            start_request = StartPlanRequest.model_validate_json(plaintext)
+        except (RecoveryPayloadRejected, ValueError) as error:
+            raise LifecycleEventRejected(
+                "planner artifact has no recoverable lifecycle request"
+            ) from error
+        if start_request.replan is not None:
+            replan = start_request.replan
+            try:
+                validate_replan_candidate(
+                    replan.prior_plan,
+                    backlog.plan,
+                    base_approved_commit=replan.base_approved_planning_commit,
+                    selected_root_keys=replan.selected_root_keys,
+                    affected_node_keys=replan.affected_node_keys,
+                )
+            except ValueError as error:
+                raise LifecycleEventRejected(
+                    f"planner backlog escaped bounded replan scope: {error}"
+                ) from error
         branch = await self._github.ensure_planning_commit(
             repository=run.repository,
             branch_name=f"planning/{run.plan_id}-v{run.plan_version}",
@@ -596,9 +905,7 @@ class LifecycleService:
                     "GitHub merge evidence does not match the planning webhook"
                 )
             if evidence.approvals < 1:
-                raise LifecycleEventRejected(
-                    "planning PR has no current human approval"
-                )
+                raise LifecycleEventRejected("planning PR has no current human approval")
             if not evidence.required_checks_pass(set(_REQUIRED_PLANNING_CHECKS)):
                 raise LifecycleEventRejected(
                     "planning PR required validator check is not successful"
@@ -654,6 +961,7 @@ class LifecycleService:
             publication_target_sha256=self._openproject.publication_target_sha256,
             publication_identity=artifact.plan.plan.publication_identity,
         )
+        replan_context = await self._replan_publication_context(run, artifact)
         journal = self._publication_journal_factory()
         try:
             resumed = await run_sync_to_completion(journal.resume, envelope)
@@ -663,6 +971,7 @@ class LifecycleService:
                     artifact,
                     self._openproject,
                     envelope,
+                    replan_context=replan_context,
                 )
             else:
                 # A durable journal is the authority after the first mutation
@@ -675,6 +984,7 @@ class LifecycleService:
                 envelope,
                 apply=True,
                 journal=journal,
+                replan_context=replan_context,
             )
         except (
             OpenProjectConflict,
@@ -732,6 +1042,9 @@ class LifecycleService:
             plan_version=published.plan_version,
             work_package_id=published.idea_id,
             pull_request_number=number,
+            operation_count=len(result.operations),
+            applied_operation_count=len(result.applied_operations),
+            resumed=resumed is not None,
         )
 
     async def _implementation_pull_request(
@@ -763,12 +1076,8 @@ class LifecycleService:
             raise LifecycleEventRejected("implementation PR has no open or closed state")
         merged = pull.get("merged") is True
         merge_commit = pull.get("merge_commit_sha") if merged else None
-        if (
-            merged
-            and (
-                not isinstance(merge_commit, str)
-                or not re.fullmatch(r"[0-9a-f]{40}", merge_commit)
-            )
+        if merged and (
+            not isinstance(merge_commit, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_commit)
         ):
             raise LifecycleEventRejected("merged implementation PR has no merge commit")
         if merged and pull_request_state != "closed":
@@ -778,10 +1087,14 @@ class LifecycleService:
             repository,
             number,
         )
-        if existing is not None and (
-            existing.plan_id,
-            existing.node_key,
-        ) != identity:
+        if (
+            existing is not None
+            and (
+                existing.plan_id,
+                existing.node_key,
+            )
+            != identity
+        ):
             raise LifecycleStoreMismatch(
                 "implementation PR replay changed its work-package identity"
             )
@@ -793,14 +1106,38 @@ class LifecycleService:
                 self._store.latest_published,
                 identity[0],
             )
+            active_plan = None if active is None else await self._published_plan(active)
+            active_item = (
+                None if active_plan is None else active_plan.by_key.get(identity[1])
+            )
+            expected_version = None
+            expected_hash = None
+            if (
+                active is not None
+                and active.approved_commit is not None
+                and active_plan is not None
+                and active_item is not None
+            ):
+                expected_version, _expected_commit = effective_node_binding(
+                    active_plan,
+                    active.approved_commit,
+                    active_item.key,
+                )
+                expected_hash = managed_hash(
+                    with_approved_commit(active_plan, active.approved_commit),
+                    active_item,
+                )
             terminal_ids = {
                 self._openproject.config.status_ids[name]
                 for name in ("Done", "Superseded", "Rejected")
             }
             if (
                 active is None
-                or package.plan_version != active.plan_version
-                or package.repository != repository
+                or active_item is None
+                or package.plan_version != expected_version
+                or package.managed_hash != expected_hash
+                or active_item.repository != repository
+                or package.repository != active_item.repository
                 or package.human_fields.get("status_id") in terminal_ids
             ):
                 raise LifecycleEventRejected(
@@ -836,14 +1173,98 @@ class LifecycleService:
         return await self._outcome(
             event,
             "implementation_pr",
-            (
-                "merged"
-                if association.merged_commit is not None
-                else association.pull_request_state
-            ),
+            ("merged" if association.merged_commit is not None else association.pull_request_state),
             plan_id=identity[0],
             work_package_id=package.id,
             pull_request_number=number,
+        )
+
+    async def _published_artifact(self, run: PlanRun) -> LoadedArtifact:
+        if (
+            run.state != "published"
+            or run.approved_commit is None
+            or run.approval_evidence_sha256 is None
+            or run.backlog_blob_sha1 is None
+            or run.backlog_sha256 is None
+        ):
+            raise LifecycleEventRejected(
+                "active published plan is missing immutable artifact bindings"
+            )
+        binding = ImmutableArtifactBinding(
+            repository=run.repository,
+            commit_sha=run.approved_commit,
+            path=run.backlog_path,
+            blob_sha=run.backlog_blob_sha1,
+            content_sha256=run.backlog_sha256,
+        )
+        artifact = load_artifact_bytes(
+            await self._github.read_immutable_artifact(binding)
+        )
+        if (
+            artifact.plan.plan.id != run.plan_id
+            or artifact.plan.plan.version != run.plan_version
+            or artifact.plan.plan.source_idea.work_package_id != run.idea_id
+            or artifact.blob_sha1 != binding.blob_sha
+            or artifact.sha256 != binding.content_sha256
+        ):
+            raise LifecycleEventRejected(
+                "active published artifact does not match its lifecycle binding"
+            )
+        return artifact
+
+    async def _published_plan(self, run: PlanRun) -> BacklogPlan:
+        return (await self._published_artifact(run)).plan
+
+    async def _replan_publication_context(
+        self,
+        run: PlanRun,
+        artifact: LoadedArtifact,
+    ) -> ReplanPublicationContext | None:
+        request = self._recover_start_request(run)
+        scope = artifact.plan.plan.replan
+        authorized = request.replan
+        if (
+            request.plan_id != run.plan_id
+            or request.plan_version != run.plan_version
+            or request.idea.work_package_id != run.idea_id
+            or (scope is None) != (authorized is None)
+        ):
+            raise LifecycleEventRejected(
+                "planning publication changed its durable operator authorization"
+            )
+        if scope is None or authorized is None:
+            return None
+        base = await run_sync_to_completion(
+            self._store.get,
+            artifact.plan.plan.id,
+            scope.base_plan_version,
+        )
+        latest = await run_sync_to_completion(
+            self._store.latest_published,
+            artifact.plan.plan.id,
+        )
+        if base is None or base != latest or base.approved_commit is None:
+            raise LifecycleEventRejected(
+                "partial replan publication base is not the latest immutable published plan"
+            )
+        if (
+            authorized.prior_plan.plan.id != artifact.plan.plan.id
+            or authorized.prior_plan.plan.version != scope.base_plan_version
+            or authorized.base_approved_planning_commit != base.approved_commit
+        ):
+            raise LifecycleEventRejected(
+                "partial replan publication changed its durable operator authorization"
+            )
+        base_artifact = await self._published_artifact(base)
+        if authorized.prior_plan != base_artifact.plan:
+            raise LifecycleEventRejected(
+                "partial replan publication base differs from its durable operator request"
+            )
+        return ReplanPublicationContext(
+            base_artifact=base_artifact,
+            base_approved_commit=base.approved_commit,
+            selected_root_keys=authorized.selected_root_keys,
+            affected_node_keys=authorized.affected_node_keys,
         )
 
     async def _check_run(self, event: EventEnvelope) -> LifecycleOutcome:
@@ -919,9 +1340,7 @@ class LifecycleService:
                 passed=passed,
             )
             if association is not None:
-                await self._project_implementation_work_package(
-                    association.work_package_id
-                )
+                await self._project_implementation_work_package(association.work_package_id)
                 advanced += int(passed)
         return await self._outcome(event, "check_run", f"successful:{advanced}")
 
@@ -987,9 +1406,7 @@ class LifecycleService:
 
         repaired_implementation = 0
         implementation_failures = 0
-        associations = await run_sync_to_completion(
-            self._store.implementation_associations
-        )
+        associations = await run_sync_to_completion(self._store.implementation_associations)
         for association in associations:
             try:
                 evidence = await self._github.pull_request_evidence(
@@ -1007,9 +1424,7 @@ class LifecycleService:
                     head_sha=evidence.head_sha,
                     observed_at=event.occurred_at,
                     pull_request_state=evidence.state,
-                    merged_commit=(
-                        evidence.merge_commit_sha if evidence.merged else None
-                    ),
+                    merged_commit=(evidence.merge_commit_sha if evidence.merged else None),
                 )
                 await run_sync_to_completion(
                     self._store.record_implementation_check_result,
@@ -1071,8 +1486,7 @@ class LifecycleService:
             )
             if (
                 package is not None
-                and package.human_fields.get("status_id")
-                == status_ids["In Progress"]
+                and package.human_fields.get("status_id") == status_ids["In Progress"]
                 and relevant
                 and not any(
                     association.pull_request_state == "open"
@@ -1201,6 +1615,9 @@ class LifecycleService:
         plan_version: int | None = None,
         work_package_id: int | None = None,
         pull_request_number: int | None = None,
+        operation_count: int | None = None,
+        applied_operation_count: int | None = None,
+        resumed: bool | None = None,
     ) -> LifecycleOutcome:
         result = LifecycleOutcome(
             action=action,
@@ -1209,6 +1626,9 @@ class LifecycleService:
             plan_version=plan_version,
             work_package_id=work_package_id,
             pull_request_number=pull_request_number,
+            operation_count=operation_count,
+            applied_operation_count=applied_operation_count,
+            resumed=resumed,
         )
         await run_sync_to_completion(
             self._store.audit,
@@ -1226,6 +1646,16 @@ class LifecycleService:
         if not isinstance(value, dict):
             raise LifecycleEventRejected(f"event payload has no {key} object")
         return value
+
+    @staticmethod
+    def _prior_descendant_keys(prior: Any, roots: set[str]) -> tuple[str, ...]:
+        """Keep caller root order, then prior-plan order for the bounded closure."""
+        closure = set(roots)
+        while True:
+            expanded = closure | {item.key for item in prior.items if item.parent in closure}
+            if expanded == closure:
+                return tuple(item.key for item in prior.items if item.key in closure)
+            closure = expanded
 
     @staticmethod
     def _link_title(value: dict[str, Any], key: str) -> str:
@@ -1265,19 +1695,12 @@ class LifecycleService:
     ) -> bool:
         associations = tuple(
             association
-            for association in await run_sync_to_completion(
-                self._store.implementation_associations
-            )
+            for association in await run_sync_to_completion(self._store.implementation_associations)
             if association.work_package_id == work_package_id
         )
         if not associations:
-            raise LifecycleStoreMismatch(
-                "implementation projection has no durable associations"
-            )
-        identities = {
-            (association.plan_id, association.node_key)
-            for association in associations
-        }
+            raise LifecycleStoreMismatch("implementation projection has no durable associations")
+        identities = {(association.plan_id, association.node_key) for association in associations}
         if len(identities) != 1:
             raise LifecycleStoreMismatch(
                 "implementation work package has conflicting plan identities"
@@ -1304,9 +1727,7 @@ class LifecycleService:
             desired_rank = ranks[desired_id]
             if current_rank is not None and desired_rank > current_rank:
                 status = desired_status
-        evidence = (
-            evidence_state if package.evidence_state != evidence_state else None
-        )
+        evidence = evidence_state if package.evidence_state != evidence_state else None
         if status is None and evidence is None:
             return False
         await run_sync_to_completion(
@@ -1321,9 +1742,7 @@ class LifecycleService:
     def _implementation_projection(
         associations: tuple[ImplementationPrAssociation, ...],
     ) -> tuple[str | None, str]:
-        if any(
-            association.merged_commit is not None for association in associations
-        ):
+        if any(association.merged_commit is not None for association in associations):
             return "Review", "pr_merged"
         if any(
             association.pull_request_state == "open"
@@ -1331,10 +1750,7 @@ class LifecycleService:
             for association in associations
         ):
             return "Review", "check_passed"
-        if any(
-            association.pull_request_state == "open"
-            for association in associations
-        ):
+        if any(association.pull_request_state == "open" for association in associations):
             return "In Progress", "pr_open"
         return None, "pr_closed"
 

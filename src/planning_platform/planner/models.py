@@ -9,7 +9,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from planning_platform.models import BacklogItem
+from planning_platform.models import BacklogItem, BacklogPlan
 
 MAX_PLANNER_REQUEST_BYTES = 4 * 1024 * 1024
 
@@ -68,6 +68,31 @@ class OpenProjectSnapshotInput(StrictModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class ReplanContext(StrictModel):
+    """Immutable prior plan and the exact subtree an operator authorized to change."""
+
+    prior_plan: BacklogPlan
+    base_approved_planning_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    selected_root_keys: tuple[str, ...] = Field(min_length=1)
+    affected_node_keys: tuple[str, ...] = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=4_096)
+
+    @model_validator(mode="after")
+    def selected_roots_define_the_exact_prior_closure(self) -> ReplanContext:
+        prior = self.prior_plan.by_key
+        roots = self.selected_root_keys
+        if len(roots) != len(set(roots)) or any(key not in prior for key in roots):
+            raise ValueError("replan selected roots must be unique prior node keys")
+        if len(self.affected_node_keys) != len(set(self.affected_node_keys)):
+            raise ValueError("replan affected node keys must be unique")
+        expected = _descendant_closure(self.prior_plan, set(roots))
+        if set(self.affected_node_keys) != expected:
+            raise ValueError(
+                "replan affected node keys must equal the selected-root descendant closure"
+            )
+        return self
+
+
 class StartPlanRequest(StrictModel):
     event: PlannerEvent
     idea: IdeaSnapshot
@@ -76,12 +101,21 @@ class StartPlanRequest(StrictModel):
     idea_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     openproject_snapshot: OpenProjectSnapshotInput
     repositories: tuple[RepositorySnapshot, ...] = Field(min_length=1, max_length=20)
+    replan: ReplanContext | None = None
 
     @model_validator(mode="after")
     def idea_matches_hash(self) -> StartPlanRequest:
         actual = idea_snapshot_digest(self.idea, self.openproject_snapshot)
         if actual != self.idea_sha256:
             raise ValueError("Idea fields do not match idea_sha256")
+        if self.replan is not None:
+            prior = self.replan.prior_plan.plan
+            if (
+                prior.id != self.plan_id
+                or prior.version >= self.plan_version
+                or prior.source_idea.work_package_id != self.idea.work_package_id
+            ):
+                raise ValueError("replan context does not bind an earlier plan for this Idea")
         _validate_request_size(self)
         return self
 
@@ -213,3 +247,12 @@ def _validate_request_size(request: BaseModel) -> None:
     size = len(request.model_dump_json().encode("utf-8"))
     if size > MAX_PLANNER_REQUEST_BYTES:
         raise ValueError(f"planner request exceeds {MAX_PLANNER_REQUEST_BYTES} UTF-8 bytes")
+
+
+def _descendant_closure(plan: BacklogPlan, roots: set[str]) -> set[str]:
+    closure = set(roots)
+    while True:
+        expanded = closure | {item.key for item in plan.items if item.parent in closure}
+        if expanded == closure:
+            return closure
+        closure = expanded

@@ -22,6 +22,7 @@ EventType = Literal[
     "openproject.work_package_changed",
     "planning.artifacts_ready",
     "planning.convergence_check",
+    "planning.replan_affected_subgraph",
     "planning.pr_merged",
     "reconciliation.scheduled",
     "windmill.dead_letter_replayed",

@@ -89,6 +89,46 @@ def validate_plan(
     repositories = {repository.name for repository in plan.plan.repositories}
     if plan.plan.publication_identity != f"{plan.plan.id}:v{plan.plan.version}":
         issues.append(ValidationIssue("publication_identity", "must equal plan id and version"))
+    replan = plan.plan.replan
+    if replan is not None:
+        affected = set(replan.affected_node_keys)
+        selected = set(replan.selected_root_keys)
+        binding_keys = [binding.node_key for binding in replan.retained_node_bindings]
+        if replan.base_plan_version >= plan.plan.version:
+            issues.append(
+                ValidationIssue("replan_base", "base plan version must precede this plan")
+            )
+        if not selected <= affected:
+            issues.append(ValidationIssue("replan_scope", "selected roots must be affected nodes"))
+        for node_key in sorted(selected - known):
+            issues.append(
+                ValidationIssue(
+                    "replan_scope",
+                    "selected root must exist in the replanned artifact",
+                    node_key,
+                )
+            )
+        if len(binding_keys) != len(set(binding_keys)):
+            issues.append(
+                ValidationIssue("replan_binding", "retained node bindings must be unique")
+            )
+        for binding in replan.retained_node_bindings:
+            if binding.node_key not in known:
+                issues.append(
+                    ValidationIssue(
+                        "replan_binding",
+                        "retained node binding must reference an artifact node",
+                        binding.node_key,
+                    )
+                )
+            if binding.node_key in affected or binding.plan_version > replan.base_plan_version:
+                issues.append(
+                    ValidationIssue(
+                        "replan_binding",
+                        "retained node binding conflicts with the replan boundary",
+                        binding.node_key,
+                    )
+                )
     for key in sorted({key for key in keys if keys.count(key) > 1}):
         issues.append(ValidationIssue("duplicate_key", f"duplicate node key {key}", key))
 

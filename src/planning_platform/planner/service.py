@@ -117,6 +117,14 @@ class PlannerService:
                 for repository in request.repositories
             ],
         }
+        if request.replan is not None:
+            initial["replan"] = {
+                "base_approved_planning_commit": (request.replan.base_approved_planning_commit),
+                "selected_root_keys": list(request.replan.selected_root_keys),
+                "affected_node_keys": list(request.replan.affected_node_keys),
+                "reason": sanitize_checkpoint_text(request.replan.reason, limit=4_096),
+                "prior_plan": request.replan.prior_plan.model_dump(mode="json"),
+            }
         await graph.ainvoke(initial, config, context=runtime)
         return await self._response(graph, thread_id)
 

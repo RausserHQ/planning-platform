@@ -1,13 +1,22 @@
-summary: Replan a bounded affected subgraph
-description: Starts a higher plan version while preserving stable identity and human-owned fields.
+summary: Operator-only bounded affected-subgraph replan
+description: Starts exactly one successor from immutable published artifacts; callers can select only stable prior roots.
 value:
   modules:
+    - id: envelope
+      value:
+        type: script
+        path: f/planning/replan_event
+        input_transforms:
+          plan_id: {type: javascript, expr: flow_input.plan_id}
+          base_plan_version: {type: javascript, expr: flow_input.base_plan_version}
+          affected_node_keys: {type: javascript, expr: flow_input.affected_node_keys}
+          reason: {type: javascript, expr: flow_input.reason}
     - id: lifecycle
       value:
         type: script
-        path: f/planning/lifecycle_job
+        path: f/planning/replan_affected_subgraph
         input_transforms:
-          event: {type: javascript, expr: flow_input.event}
+          event: {type: javascript, expr: results.envelope}
       retry:
         exponential: {attempts: 4, seconds: 1, multiplier: 5, random_factor: 0}
   failure_module:
@@ -16,11 +25,19 @@ value:
       type: script
       path: f/planning/dead_letter
       input_transforms:
-        event: {type: javascript, expr: flow_input.event}
+        event: {type: javascript, expr: 'results.envelope ?? {}'}
         error: {type: javascript, expr: previous_result}
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object
+  additionalProperties: false
   properties:
-    event: {type: object, additionalProperties: true}
-  required: [event]
+    plan_id: {type: string, minLength: 1}
+    base_plan_version: {type: integer, minimum: 1}
+    affected_node_keys:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      items: {type: string, minLength: 1}
+    reason: {type: string, minLength: 1, maxLength: 4096}
+  required: [plan_id, base_plan_version, affected_node_keys, reason]

@@ -174,13 +174,33 @@ def test_convergence_proof_is_operator_only_and_uses_a_stable_windmill_identity(
     assert '"wm_failure": "convergence_check_failed"' in dead_letter_source
 
 
+def test_partial_replan_is_operator_only_and_root_job_bound() -> None:
+    flow = _document(PLANNING / "replan_affected_subgraph.flow/flow.yaml")
+    assert flow["schema"]["required"] == [
+        "plan_id",
+        "base_plan_version",
+        "affected_node_keys",
+        "reason",
+    ]
+    assert [module["value"]["path"] for module in flow["value"]["modules"]] == [
+        "f/planning/replan_event",
+        "f/planning/replan_affected_subgraph",
+    ]
+    assert flow["value"]["modules"][1]["value"]["input_transforms"]["event"] == {
+        "type": "javascript",
+        "expr": "results.envelope",
+    }
+    assert "WM_ROOT_FLOW_JOB_ID" in (PLANNING / "replan_event.py").read_text()
+    assert "WM_JOB_ID" in (PLANNING / "replan_affected_subgraph.py").read_text()
+
+
 def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     workspace_files = sorted(
         path.relative_to(ROOT)
         for path in ROOT.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     )
-    assert len(workspace_files) == 42
+    assert len(workspace_files) == 46
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert "!windmill/" in dockerignore
