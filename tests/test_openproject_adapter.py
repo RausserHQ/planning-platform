@@ -76,6 +76,10 @@ def _config() -> OpenProjectAdapterConfig:
 
 def test_openproject_target_hash_binds_semantic_instance_config() -> None:
     config = _config()
+    assert (
+        openproject_target_sha256(config)
+        == "2e7408cf62af0bf032ed4eccf9be9c11b6543e238486e6ce78547487df4092ee"
+    )
     assert openproject_target_sha256(config) == openproject_target_sha256(
         replace(config, base_url=config.base_url + "/")
     )
@@ -84,6 +88,14 @@ def test_openproject_target_hash_binds_semantic_instance_config() -> None:
     )
     assert openproject_target_sha256(config) != openproject_target_sha256(
         replace(config, timeout_seconds=config.timeout_seconds + 1)
+    )
+    assert openproject_target_sha256(config) != openproject_target_sha256(
+        replace(config, canonical_origin="https://openproject.example.test")
+    )
+    assert openproject_target_sha256(
+        replace(config, canonical_origin="https://openproject.example.test")
+    ) == openproject_target_sha256(
+        replace(config, canonical_origin="https://openproject.example.test/")
     )
 
 

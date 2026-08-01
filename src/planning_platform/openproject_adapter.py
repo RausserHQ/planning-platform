@@ -28,6 +28,7 @@ from .openproject import (
     canonical_hash,
     replace_generated_description,
 )
+from .openproject_origin import canonical_openproject_origin
 from .publication_journal import AmbiguousPublicationEffect
 
 _API_PREFIX = "/api/v3"
@@ -70,6 +71,7 @@ class OpenProjectAdapterConfig:
     custom_field_ids: Mapping[str, int]
     alert_assignee_id: int
     priority_ids: Mapping[str, int] = field(default_factory=dict)
+    canonical_origin: str | None = None
     timeout_seconds: float = 10.0
     page_size: int = 100
     max_collection_pages: int = 100
@@ -83,6 +85,12 @@ class OpenProjectAdapterConfig:
             object.__setattr__(self, name, MappingProxyType(dict(values)))
         if not self.base_url.startswith(("http://", "https://")):
             raise ValueError("base_url must be an HTTP(S) URL")
+        if self.canonical_origin is not None:
+            object.__setattr__(
+                self,
+                "canonical_origin",
+                canonical_openproject_origin(self.canonical_origin),
+            )
         if (
             type(self.project_id) is not int
             or self.project_id <= 0
@@ -161,6 +169,8 @@ def openproject_target_sha256(config: OpenProjectAdapterConfig) -> str:
         "max_collection_pages": config.max_collection_pages,
         "max_collection_items": config.max_collection_items,
     }
+    if config.canonical_origin is not None:
+        document["canonical_origin"] = config.canonical_origin
     return hashlib.sha256(
         json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
