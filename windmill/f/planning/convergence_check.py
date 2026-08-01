@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import asdict
 from typing import Any
@@ -49,7 +50,7 @@ def _windmill_result(
     }
 
 
-async def main(event: dict[str, Any]) -> dict[str, Any] | str:
+async def _main_async(event: dict[str, Any]) -> dict[str, Any] | str:
     envelope = _trusted_envelope(event)
     async with LifecycleRuntime.from_environment() as runtime:
         result = await execute_delivery(
@@ -58,3 +59,7 @@ async def main(event: dict[str, Any]) -> dict[str, Any] | str:
             runtime.service.handle,
         )
     return _windmill_result(envelope, result)
+
+
+def main(event: dict[str, Any]) -> dict[str, Any] | str:
+    return asyncio.run(_main_async(event))

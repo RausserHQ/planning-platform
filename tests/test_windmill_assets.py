@@ -25,6 +25,18 @@ REQUIRED_FLOWS = {
     "dead_letter_recovery",
     "alertmanager_webhook",
 }
+ASYNC_BACKED_SCRIPTS = {
+    "convergence_check",
+    "dead_letter",
+    "lifecycle_job",
+    "nightly_reconciliation",
+    "publish_openproject_graph",
+    "recover_dead_letter",
+    "replan_affected_subgraph",
+}
+BAKED_DEPENDENCY_LOCK = (
+    "# py: 3.12\n# Dependencies are provided by the pinned planning-platform Windmill image.\n"
+)
 
 
 def _document(path: Path) -> dict[str, object]:
@@ -44,11 +56,29 @@ def test_windmill_workspace_has_every_versioned_flow_and_executable_script() -> 
     for source in PLANNING.glob("*.py"):
         metadata = source.with_suffix(".script.yaml")
         assert metadata.is_file(), source
-        tree = ast.parse(source.read_text())
-        assert any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
+        lock = source.with_suffix(".script.lock")
+        assert lock.read_text() == BAKED_DEPENDENCY_LOCK, source
+        assert _document(metadata)["lock"] == (f"!inline f/planning/{source.stem}.script.lock"), (
+            source
+        )
+
+        source_text = source.read_text()
+        tree = ast.parse(source_text)
+        entrypoints = [
+            node
             for node in tree.body
-        ), source
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
+        ]
+        assert len(entrypoints) == 1, source
+        assert isinstance(entrypoints[0], ast.FunctionDef), source
+        async_helpers = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_main_async"
+        ]
+        assert bool(async_helpers) is (source.stem in ASYNC_BACKED_SCRIPTS), source
+        if async_helpers:
+            assert "return asyncio.run(_main_async(" in source_text, source
 
 
 def test_flow_modules_resolve_and_retries_use_supported_bounded_shape() -> None:
@@ -101,10 +131,9 @@ def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> Non
         script = preprocessor["value"]
         assert isinstance(script, dict)
         assert script["language"] == "python3"
+        assert script["lock"] == BAKED_DEPENDENCY_LOCK
         assert "def preprocessor(event)" in str(script["content"])
-        expected_script = (
-            "alertmanager_delivery" if source == "alertmanager" else "verify_webhook"
-        )
+        expected_script = "alertmanager_delivery" if source == "alertmanager" else "verify_webhook"
         assert expected_script in str(value["modules"][0])
         if source == "alertmanager":
             assert trigger["request_type"] == "sync"
@@ -141,9 +170,10 @@ def test_convergence_proof_is_operator_only_and_uses_a_stable_windmill_identity(
         "type": "javascript",
         "expr": "results.envelope ?? {}",
     }
-    assert flow["value"]["failure_module"]["value"]["input_transforms"][
-        "preserve_failure"
-    ] == {"type": "static", "value": True}
+    assert flow["value"]["failure_module"]["value"]["input_transforms"]["preserve_failure"] == {
+        "type": "static",
+        "value": True,
+    }
     assert not (PLANNING / "convergence_check.http_trigger.yaml").exists()
     assert not (PLANNING / "convergence_check.schedule.yaml").exists()
 
@@ -200,7 +230,7 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
         for path in ROOT.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     )
-    assert len(workspace_files) == 46
+    assert len(workspace_files) == 58
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert "!windmill/" in dockerignore
@@ -224,14 +254,15 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "ADDITIONAL_PYTHON_PATHS=/opt/planning-platform" in dockerfile
 
     workflow = (REPO_ROOT / ".github/workflows/release-images.yml").read_text()
-    assert (
-        "WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@sha256:"
-        in workflow
-    )
+    assert "WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@sha256:" in workflow
     assert "Verify official Windmill CE base identity" in workflow
     assert "WINDMILL_BASE=${{ env.WINDMILL_BASE }}" in workflow
     assert "context: upstream" not in workflow
     assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
+    assert "tests/verify_windmill_entrypoints.py" in workflow
+    assert "--workspace /opt/planning-platform-workspace --expected-python 3.12" in workflow
+    assert "--workdir /opt/planning-platform-workspace" in workflow
     assert "--entrypoint wmill" in workflow
+    assert 'wmill "${image}" lint --locks-required' in workflow
     assert "grep -Fx 'CLI version: 1.775.2' >/dev/null" in workflow
     assert "grep -Fqx 'CLI version: 1.775.2'" not in workflow

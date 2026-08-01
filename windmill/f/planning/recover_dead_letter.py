@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Any
@@ -16,7 +17,7 @@ from planning_platform.lifecycle.runtime import LifecycleRuntime
 from planning_platform.lifecycle.worker import execute_claimed_delivery
 
 
-async def main(
+async def _main_async(
     event: dict[str, Any],
     operator: str,
     reason: str,
@@ -68,3 +69,11 @@ async def main(
             failure_mode="dead_letter",
         )
     return asdict(result)
+
+
+def main(
+    event: dict[str, Any],
+    operator: str,
+    reason: str,
+) -> dict[str, Any] | str:
+    return asyncio.run(_main_async(event, operator, reason))

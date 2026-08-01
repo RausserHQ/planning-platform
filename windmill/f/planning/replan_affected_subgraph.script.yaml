@@ -1,6 +1,7 @@
 summary: Execute a trusted bounded partial replan
 description: Rejects any event that is not bound to the current Windmill root job.
 kind: script
+lock: '!inline f/planning/replan_affected_subgraph.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

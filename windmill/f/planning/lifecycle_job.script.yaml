@@ -1,6 +1,7 @@
 summary: Execute one verified planning lifecycle delivery
 description: Claims a durable delivery lease and coordinates deterministic external effects.
 kind: script
+lock: '!inline f/planning/lifecycle_job.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

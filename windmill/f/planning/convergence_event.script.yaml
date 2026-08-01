@@ -1,6 +1,7 @@
 summary: Bind a convergence proof to the Windmill root job
 description: Builds one trusted internal envelope without a caller-controlled delivery identity.
 kind: script
+lock: '!inline f/planning/convergence_event.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

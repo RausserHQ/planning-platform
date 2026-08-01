@@ -1,6 +1,7 @@
 summary: Execute one trusted convergence proof
 description: Audits a read-only proof and marks every non-zero result as a Windmill failure.
 kind: script
+lock: '!inline f/planning/convergence_check.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object
