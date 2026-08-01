@@ -1,0 +1,42 @@
+summary: Operator-only immutable plan convergence proof
+description: Uses a stable Windmill job identity to audit a read-only zero-operation proof for one exact published plan version.
+value:
+  modules:
+    - id: envelope
+      value:
+        type: script
+        path: f/planning/convergence_event
+        input_transforms:
+          plan_id: {type: javascript, expr: flow_input.plan_id}
+          plan_version: {type: javascript, expr: flow_input.plan_version}
+    - id: convergence
+      value:
+        type: script
+        path: f/planning/convergence_check
+        input_transforms:
+          event: {type: javascript, expr: results.envelope}
+      retry:
+        exponential: {attempts: 3, seconds: 30, multiplier: 4, random_factor: 0}
+        retry_if: {expr: 'error.name != "ManualFailure"'}
+  failure_module:
+    id: failure
+    value:
+      type: script
+      path: f/planning/dead_letter
+      input_transforms:
+        event:
+          type: javascript
+          expr: results.envelope ?? {}
+        error:
+          type: javascript
+          expr: previous_result
+        preserve_failure:
+          type: static
+          value: true
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    plan_id: {type: string, minLength: 1}
+    plan_version: {type: integer, minimum: 1}
+  required: [plan_id, plan_version]

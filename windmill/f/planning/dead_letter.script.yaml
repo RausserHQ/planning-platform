@@ -13,5 +13,8 @@ schema:
         - object
         - "null"
       additionalProperties: true
+    preserve_failure:
+      type: boolean
+      default: false
   required:
     - event

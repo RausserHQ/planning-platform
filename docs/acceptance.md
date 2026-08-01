@@ -16,6 +16,8 @@ For every pilot, record only identifiers and hashes:
 - OpenProject IDs by stable node key and relation counts;
 - Windmill job/delivery IDs;
 - first-publication operation counts and replay operation count;
+- immutable convergence-proof plan ID/version, Windmill job/delivery and trace
+  IDs, and the audited `zero_operations` result;
 - human-owned fields before and after replan.
 
 The run is passing only when the live sequence demonstrates interrupt/resume,
@@ -23,6 +25,12 @@ planning PR merge, journaled publication, correct hierarchy/relations,
 implementation PR/check synchronization, one intentionally suppressed webhook
 repaired by reconciliation, one bounded partial replan, and an unchanged
 zero-operation replay.
+
+For the final published version of each pilot, manually run the operator-only
+Git-synced `convergence_check` Windmill flow with that exact plan ID/version.
+The acceptance record must show its immutable Git binding, audit record, and
+`zero_operations`. A `drift_operations:<n>` result is non-success evidence and
+must not be repaired through this proof flow.
 
 Operational evidence also includes one pod restart per service, a database and
 attachment restore into isolation, a deliberately invalid webhook, a stale

@@ -1101,6 +1101,28 @@ class PostgresLifecycleStore:
             ).fetchone()
         return None if row is None else self._restore(row)
 
+    def stale_thread_count(self, cutoff: datetime) -> int:
+        """Count stale latest nonterminal planning threads without updating them."""
+        if cutoff.tzinfo is None:
+            raise ValueError("stale-thread cutoff must include a timezone")
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT count(*)
+                FROM (
+                    SELECT DISTINCT ON (plan_id) state, updated_at
+                    FROM {self._SCHEMA}.plan_runs
+                    ORDER BY plan_id, plan_version DESC
+                ) AS latest
+                WHERE state NOT IN ('published','failed')
+                  AND updated_at <= %s
+                """,
+                (cutoff.astimezone(UTC),),
+            ).fetchone()
+        if row is None or not isinstance(row[0], int):
+            raise LifecycleStoreMismatch("stale-thread count has an invalid database shape")
+        return row[0]
+
     def by_pull_request(self, repository: str, number: int) -> PlanRun | None:
         with psycopg.connect(self._database_url) as connection:
             row = connection.execute(

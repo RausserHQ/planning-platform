@@ -1,0 +1,16 @@
+summary: Bind a convergence proof to the Windmill root job
+description: Builds one trusted internal envelope without a caller-controlled delivery identity.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    plan_id:
+      type: string
+      minLength: 1
+    plan_version:
+      type: integer
+      minimum: 1
+  required:
+    - plan_id
+    - plan_version

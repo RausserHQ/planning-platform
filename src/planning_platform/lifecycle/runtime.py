@@ -58,6 +58,16 @@ def _implementation_required_checks() -> dict[str, tuple[str, ...]]:
     return result
 
 
+def _positive_integer(name: str) -> int:
+    try:
+        value = int(_required(name))
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be an integer") from error
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
 @dataclass
 class LifecycleRuntime:
     service: LifecycleService
@@ -99,14 +109,15 @@ class LifecycleRuntime:
             openproject.close()
             raise RuntimeError("planning lifecycle schema is not ready; run explicit migrations")
         try:
-            implementation_stale_hours = int(
-                _required("PLANNING_IMPLEMENTATION_STALE_HOURS")
+            implementation_stale_hours = _positive_integer(
+                "PLANNING_IMPLEMENTATION_STALE_HOURS"
             )
-        except ValueError as error:
+            planning_thread_stale_seconds = _positive_integer(
+                "PLANNING_THREAD_STALE_SECONDS"
+            )
+        except RuntimeError:
             openproject.close()
-            raise RuntimeError(
-                "PLANNING_IMPLEMENTATION_STALE_HOURS must be an integer"
-            ) from error
+            raise
         return cls(
             service=LifecycleService(
                 planner=planner,
@@ -119,6 +130,9 @@ class LifecycleRuntime:
                 implementation_required_checks=_implementation_required_checks(),
                 implementation_stale_after=timedelta(
                     hours=implementation_stale_hours
+                ),
+                planning_thread_stale_after=timedelta(
+                    seconds=planning_thread_stale_seconds
                 ),
             ),
             deduplicator=dedupe,

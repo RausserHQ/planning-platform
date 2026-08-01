@@ -33,7 +33,8 @@ from planning_platform.lifecycle.store import (
     PlanRun,
 )
 from planning_platform.loader import load_artifact
-from planning_platform.openproject import OpenProjectSnapshot, WorkPackageSnapshot
+from planning_platform.models import with_approved_commit
+from planning_platform.openproject import OpenProjectSnapshot, WorkPackageSnapshot, managed_hash
 from planning_platform.planner.models import (
     ArtifactBundle,
     ArtifactContent,
@@ -107,6 +108,18 @@ class MemoryStore:
 
     def all(self) -> tuple[PlanRun, ...]:
         return () if self.run is None else (self.run,)
+
+    def get(self, plan_id: str, plan_version: int) -> PlanRun | None:
+        if (
+            self.run is not None
+            and self.run.plan_id == plan_id
+            and self.run.plan_version == plan_version
+        ):
+            return self.run
+        return None
+
+    def stale_thread_count(self, _cutoff: datetime) -> int:
+        return 0
 
     def begin(self, run: PlanRun) -> PlanRun:
         if self.run is None:
@@ -1665,11 +1678,162 @@ class ReconciliationStore:
     def all(self) -> tuple[PlanRun, ...]:
         return self.runs
 
+    def stale_thread_count(self, _cutoff: datetime) -> int:
+        return 0
+
     def implementation_associations(self) -> tuple[ImplementationPrAssociation, ...]:
         return ()
 
     def audit(self, **values: Any) -> None:
         self.audit_rows.append((str(values["action"]), str(values["outcome"])))
+
+
+class StaleThreadStore(ReconciliationStore):
+    def __init__(self, runs: tuple[PlanRun, ...], stale_threads: int) -> None:
+        super().__init__(runs)
+        self.stale_threads = stale_threads
+        self.cutoffs: list[datetime] = []
+
+    def stale_thread_count(self, cutoff: datetime) -> int:
+        self.cutoffs.append(cutoff)
+        return self.stale_threads
+
+
+class ConvergenceOpenProjectFake:
+    def __init__(self, snapshot: OpenProjectSnapshot) -> None:
+        self._snapshot = snapshot
+        self.snapshot_reads = 0
+
+    def snapshot(self) -> OpenProjectSnapshot:
+        self.snapshot_reads += 1
+        return self._snapshot
+
+
+def _published_convergence_run(artifact: object) -> PlanRun:
+    return PlanRun(
+        idea_id=1,
+        plan_id="single-repository",
+        plan_version=1,
+        thread_id="openproject:1:planning:1",
+        repository="Acme/service",
+        base_branch="a" * 40,
+        artifact_prefix="planning/single-repository/v1",
+        backlog_path="planning/single-repository/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag="fixture",
+        state="published",
+        planning_commit="c" * 40,
+        pull_request_number=17,
+        pull_request_url="https://github.com/Acme/service/pull/17",
+        approved_commit="a" * 40,
+        approval_evidence_sha256="d" * 64,
+        backlog_blob_sha1=artifact.blob_sha1,  # type: ignore[attr-defined]
+        backlog_sha256=artifact.sha256,  # type: ignore[attr-defined]
+    )
+
+
+def _convergence_event(*, plan_id: str = "single-repository", plan_version: int = 1):
+    now = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
+    return envelope_for_delivery(
+        event_type="planning.convergence_check",
+        source="windmill",
+        delivery_id="convergence:wm-job-1176",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill-operator"),
+        subject=EventSubject(plan_id=plan_id, plan_version=plan_version),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"plan_id": plan_id, "plan_version": plan_version},
+    )
+
+
+@pytest.mark.asyncio
+async def test_convergence_proof_audits_zero_operations_without_mutating() -> None:
+    fixture = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+    artifact = load_artifact(fixture)
+    run = _published_convergence_run(artifact)
+    approved = with_approved_commit(artifact.plan, run.approved_commit)
+    item = approved.items[0]
+    snapshot = OpenProjectSnapshot(
+        captured_at="2026-07-31T03:00:00Z",
+        etag="fixture",
+        sha256="b" * 64,
+        work_packages=(
+            WorkPackageSnapshot(
+                id=101,
+                lock_version=1,
+                plan_id=run.plan_id,
+                node_key=item.key,
+                plan_version=run.plan_version,
+                repository=item.repository,
+                managed_hash=managed_hash(approved, item),
+            ),
+        ),
+    )
+    store = MemoryStore(run)
+    binding = ImmutableArtifactBinding(
+        repository=run.repository,
+        commit_sha=run.approved_commit,
+        path=run.backlog_path,
+        blob_sha=run.backlog_blob_sha1,
+        content_sha256=run.backlog_sha256,
+    )
+    openproject = ConvergenceOpenProjectFake(snapshot)
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=PublicationGitHubFake(fixture.read_bytes(), binding),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+
+    outcome = await service.handle(_convergence_event())
+
+    assert outcome.action == "convergence_check"
+    assert outcome.outcome == "zero_operations"
+    assert store.audit_rows == [("convergence_check", "zero_operations")]
+    assert openproject.snapshot_reads == 1
+    assert store.run == run
+
+
+@pytest.mark.asyncio
+async def test_convergence_proof_reports_drift_and_rejects_unpublished_or_mismatched_identity(
+) -> None:
+    fixture = Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+    artifact = load_artifact(fixture)
+    run = _published_convergence_run(artifact)
+    binding = ImmutableArtifactBinding(
+        repository=run.repository,
+        commit_sha=run.approved_commit,
+        path=run.backlog_path,
+        blob_sha=run.backlog_blob_sha1,
+        content_sha256=run.backlog_sha256,
+    )
+    store = MemoryStore(run)
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=ConvergenceOpenProjectFake(
+            OpenProjectSnapshot("2026-07-31T03:00:00Z", "fixture", "b" * 64, ())
+        ),  # type: ignore[arg-type]
+        github=PublicationGitHubFake(fixture.read_bytes(), binding),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+
+    assert (await service.handle(_convergence_event())).outcome == "drift_operations:1"
+    with pytest.raises(LifecycleEventRejected, match="exact plan identity"):
+        await service.handle(
+            _convergence_event(plan_id="single-repository").model_copy(
+                update={"payload": {"plan_id": "other", "plan_version": 1}}
+            )
+        )
+    store.run = replace(run, state="publishing")
+    with pytest.raises(LifecycleEventRejected, match="published"):
+        await service.handle(_convergence_event())
 
 
 class ReconciliationOpenProjectFake:
@@ -1713,6 +1877,41 @@ class ReconciliationGitHubFake:
 
     async def repository_head(self, _repository: str) -> tuple[str, str]:
         return "main", "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_reports_stale_threads_without_repairing_them() -> None:
+    now = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
+    store = StaleThreadStore((), stale_threads=2)
+    service = LifecycleService(
+        planner=object(),  # type: ignore[arg-type]
+        openproject=ReconciliationOpenProjectFake(
+            OpenProjectSnapshot("2026-07-31T03:00:00Z", "snapshot", "b" * 64, ())
+        ),  # type: ignore[arg-type]
+        github=ReconciliationGitHubFake({}),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        planning_thread_stale_after=timedelta(seconds=90),
+        **_service_policy(),
+    )
+    event = envelope_for_delivery(
+        event_type="reconciliation.scheduled",
+        source="scheduler",
+        delivery_id="stale-thread-finding",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill"),
+        subject=EventSubject(),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"schedule": "nightly"},
+    )
+
+    outcome = await service.handle(event)
+
+    assert "stale_threads:2" in outcome.outcome
+    assert store.cutoffs == [now - timedelta(seconds=90)]
+    assert store.audit_rows[-1] == ("nightly_reconciliation", outcome.outcome)
 
 
 @pytest.mark.asyncio
