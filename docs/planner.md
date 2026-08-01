@@ -124,6 +124,9 @@ It supplies immutable prior backlog bytes, selected stable root keys, their exac
 prior descendant closure, and a bounded reason. The planner persists a sanitized
 reason, preserves every node outside that closure model-exactly, retains selected
 roots, and accepts new nodes only when their parent chain reaches a selected root.
+Selected roots cannot be nested, and every pre-existing affected node remains
+owned by the same selected root even when an operator replans several roots at
+once; a candidate cannot move an existing branch from one selected root to another.
 The approved artifact carries retained per-node version and planning-commit
 bindings, so publication and reconciliation leave protected work packages fully
 untouched instead of advancing their managed metadata with the affected subtree.

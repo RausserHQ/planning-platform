@@ -1544,8 +1544,18 @@ def test_pinned_bootstrap_uses_v176_models_and_exact_webhook_events() -> None:
     assert "templated: true" in bootstrap
     assert "default_done_ratio" in bootstrap
     assert "IssuePriority.where" in bootstrap
+    assert bootstrap.count('workspace_type: "project"') == 2
+    assert 'project.workspace_type == "project"' in bootstrap
+    assert 'template.workspace_type == "project"' in bootstrap
+    assert 'WEBHOOK_DESCRIPTION = "Planning Platform lifecycle events".freeze' in bootstrap
+    assert "webhook.description = WEBHOOK_DESCRIPTION" in bootstrap
+    assert "webhook.description == WEBHOOK_DESCRIPTION" in bootstrap
     assert "workflow.author = false" in bootstrap
     assert "role.permissions = required_permissions" in bootstrap
+    assert bootstrap.count(
+        'enabled_module_names | ["work_package_tracking"]'
+    ) == 2
+    assert 'enabled_module_names = ["work_package_tracking"]' not in bootstrap
     assert (
         "alert_role.permissions = %i[view_work_packages work_package_assigned]"
         in bootstrap

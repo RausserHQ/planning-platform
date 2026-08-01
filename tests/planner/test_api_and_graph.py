@@ -177,6 +177,64 @@ def test_replan_request_and_backlog_validation_are_closed_over_selected_roots() 
         )
 
 
+def test_replan_preserves_each_existing_nodes_selected_root() -> None:
+    loaded = load_artifact(
+        Path(__file__).parents[2] / "evals/fixtures/single-repository/backlog.yaml"
+    ).plan
+    seed = loaded.items[0]
+    root_a = seed.model_copy(update={"key": "root-a", "type": "Epic", "parent": None})
+    child_a = seed.model_copy(
+        update={"key": "child-a", "type": "Story", "parent": root_a.key}
+    )
+    root_b = seed.model_copy(update={"key": "root-b", "type": "Epic", "parent": None})
+    prior = loaded.model_copy(update={"items": (root_a, child_a, root_b)})
+    proposal = prior.model_copy(
+        update={
+            "plan": prior.plan.model_copy(
+                update={
+                    "version": 2,
+                    "publication_identity": f"{prior.plan.id}:v2",
+                }
+            )
+        }
+    )
+    bounded = apply_replan_boundary(
+        prior,
+        proposal,
+        base_approved_commit="c" * 40,
+        selected_root_keys=(root_a.key, root_b.key),
+        affected_node_keys=(root_a.key, child_a.key, root_b.key),
+    )
+    escaped = bounded.model_copy(
+        update={
+            "items": tuple(
+                item.model_copy(update={"parent": root_b.key})
+                if item.key == child_a.key
+                else item
+                for item in bounded.items
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="changed selected-root ownership"):
+        validate_replan_candidate(
+            prior,
+            escaped,
+            base_approved_commit="c" * 40,
+            selected_root_keys=(root_a.key, root_b.key),
+            affected_node_keys=(root_a.key, child_a.key, root_b.key),
+        )
+
+    with pytest.raises(ValueError, match="nested selected roots"):
+        apply_replan_boundary(
+            prior,
+            proposal,
+            base_approved_commit="c" * 40,
+            selected_root_keys=(root_a.key, child_a.key),
+            affected_node_keys=(root_a.key, child_a.key),
+        )
+
+
 @pytest.mark.asyncio
 async def test_deterministic_replan_artifact_preserves_protected_nodes_and_bindings() -> None:
     prior = load_artifact(

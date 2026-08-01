@@ -34,6 +34,7 @@ FIELD_ROWS = {
   "Alert fingerprint" => "string"
 }.freeze
 IDEA_HEADINGS = ["Problem", "Desired outcome", "Why now", "Constraints", "Non-goals", "Relevant repositories", "Existing context", "Success signal"].freeze
+WEBHOOK_DESCRIPTION = "Planning Platform lifecycle events".freeze
 
 def one!(scope, label)
   rows = scope.to_a
@@ -53,11 +54,16 @@ ActiveRecord::Base.transaction do
     Project.create!(
       name: ENV.fetch("PLANNING_PLATFORM_PROJECT_NAME", "Planning Platform"),
       identifier: project_identifier,
+      workspace_type: "project",
       active: true,
       public: false
     )
   end
-  abort "planning project is not an active private project" unless project.active? && !project.public?
+  abort "planning project is not an active private project workspace" unless \
+    project.workspace_type == "project" && project.active? && !project.public?
+  project.enabled_module_names = project.enabled_module_names | ["work_package_tracking"]
+  abort "planning project work package module is disabled" unless \
+    project.enabled_module_names.include?("work_package_tracking")
 
   service_login = ENV.fetch("PLANNING_PLATFORM_SERVICE_USER")
   service_user = one!(User.where("LOWER(login) = ?", service_login.downcase), "publisher service user") do
@@ -176,9 +182,19 @@ ActiveRecord::Base.transaction do
   abort "workflow matrix mismatch" unless Workflow.where(role: role, type: types.values).count == types.length * statuses.length * statuses.length
 
   template = one!(Project.where("LOWER(identifier) = ?", "#{project.identifier}-idea-template".downcase), "Idea template project") do
-    Project.create!(name: "#{project.name} Idea template", identifier: "#{project.identifier}-idea-template", active: false, templated: true)
+    Project.create!(
+      name: "#{project.name} Idea template",
+      identifier: "#{project.identifier}-idea-template",
+      workspace_type: "project",
+      active: false,
+      templated: true
+    )
   end
-  abort "Idea template project mismatch" unless template.templated?
+  abort "Idea template project mismatch" unless \
+    template.workspace_type == "project" && template.templated?
+  template.enabled_module_names = template.enabled_module_names | ["work_package_tracking"]
+  abort "Idea template work package module is disabled" unless \
+    template.enabled_module_names.include?("work_package_tracking")
   template.types = (template.types.to_a + types.values).uniq
   template.work_package_custom_fields = (template.work_package_custom_fields.to_a + fields.values).uniq
   template.save!
@@ -193,13 +209,16 @@ ActiveRecord::Base.transaction do
     Webhooks::Webhook.new(name: "planning-platform-openproject-events")
   end
   webhook.url = ENV.fetch("PLANNING_PLATFORM_WEBHOOK_URL")
+  webhook.description = WEBHOOK_DESCRIPTION
   webhook.secret = webhook_secret
   webhook.enabled = true
   webhook.all_projects = false
   webhook.projects = [project]
   webhook.event_names = %w[work_package:created work_package:updated work_package_comment:comment work_package_comment:internal_comment]
   webhook.save!
-  abort "webhook configuration mismatch" unless webhook.enabled? && webhook.projects == [project] && webhook.event_names.sort == %w[work_package:created work_package:updated work_package_comment:comment work_package_comment:internal_comment]
+  abort "webhook configuration mismatch" unless \
+    webhook.description == WEBHOOK_DESCRIPTION && webhook.enabled? && webhook.projects == [project] && \
+    webhook.event_names.sort == %w[work_package:created work_package:updated work_package_comment:comment work_package_comment:internal_comment]
 end
 
 puts "planning-platform OpenProject bootstrap verified"

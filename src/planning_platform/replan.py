@@ -131,6 +131,18 @@ def validate_replan_candidate(
     prior_by_key = prior.by_key
     candidate_by_key = candidate.by_key
     if (
+        not roots
+        or len(selected) != len(roots)
+        or not roots <= set(prior_by_key)
+        or len(affected) != len(closure)
+        or not roots <= closure
+    ):
+        raise ValueError("replan has invalid selected roots or affected closure")
+    for root in roots:
+        parent = prior_by_key[root].parent
+        if parent is not None and _selected_root_owner(parent, prior_by_key, roots) is not None:
+            raise ValueError("replan has nested selected roots")
+    if (
         candidate.plan.id != prior.plan.id
         or candidate.plan.version <= prior.plan.version
         or candidate.plan.source_idea.work_package_id != prior.plan.source_idea.work_package_id
@@ -153,9 +165,18 @@ def validate_replan_candidate(
         if candidate_by_key[key].parent != prior_by_key[key].parent:
             raise ValueError(f"replan changed selected-root boundary parent: {key}")
 
+    for key in sorted((closure & set(prior_by_key) & set(candidate_by_key)) - roots):
+        prior_owner = _selected_root_owner(key, prior_by_key, roots)
+        candidate_owner = _selected_root_owner(key, candidate_by_key, roots)
+        if prior_owner is None or candidate_owner != prior_owner:
+            raise ValueError(f"replan changed selected-root ownership: {key}")
+
     mutable_keys = closure | (set(candidate_by_key) - set(prior_by_key))
     for key in sorted(mutable_keys - roots):
-        if key in candidate_by_key and not _reaches_selected_root(key, candidate_by_key, roots):
+        if (
+            key in candidate_by_key
+            and _selected_root_owner(key, candidate_by_key, roots) is None
+        ):
             raise ValueError(f"replan node is not rooted in a selected root: {key}")
 
     protected = set(prior_by_key) - closure
@@ -163,21 +184,23 @@ def validate_replan_candidate(
         raise ValueError("replan changed a relation across the protected boundary")
 
 
-def _reaches_selected_root(
+def _selected_root_owner(
     key: str,
     items: dict[str, BacklogItem],
     roots: set[str],
-) -> bool:
-    seen = {key}
+) -> str | None:
+    seen: set[str] = set()
     current = key
-    while current not in roots:
+    while current not in seen:
+        if current in roots:
+            return current
+        seen.add(current)
         item = items.get(current)
         parent = None if item is None else item.parent
-        if not isinstance(parent, str) or parent in seen or parent not in items:
-            return False
-        seen.add(parent)
+        if not isinstance(parent, str) or parent not in items:
+            return None
         current = parent
-    return True
+    return None
 
 
 def _cross_boundary_edges(
