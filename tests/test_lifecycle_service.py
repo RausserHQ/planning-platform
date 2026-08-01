@@ -695,10 +695,69 @@ class OutOfScopeReplanPlanner:
         return self.bundle
 
 
+class CrossRootReplanPlanner:
+    def __init__(self) -> None:
+        self.bundle: ArtifactBundle | None = None
+
+    async def start(self, request: StartPlanRequest) -> PlanResponse:
+        assert request.replan is not None
+        prior = request.replan.prior_plan
+        root_a, child_a, root_b = prior.items
+        scope = build_replan_scope(
+            prior,
+            base_approved_commit=request.replan.base_approved_planning_commit,
+            selected_root_keys=request.replan.selected_root_keys,
+            affected_node_keys=request.replan.affected_node_keys,
+        )
+        data = prior.model_dump(mode="json")
+        data["plan"].update(
+            {
+                "version": request.plan_version,
+                "publication_identity": f"{request.plan_id}:v{request.plan_version}",
+                "source_idea": {
+                    "work_package_id": request.idea.work_package_id,
+                    "lock_version": request.idea.lock_version,
+                    "updated_at": request.idea.updated_at.isoformat(),
+                },
+                "repositories": [
+                    {"name": repository.name, "commit": repository.commit}
+                    for repository in request.repositories
+                ],
+                "approved_planning_commit": None,
+                "openproject_snapshot": request.openproject_snapshot.model_dump(mode="json"),
+                "replan": scope.model_dump(mode="json"),
+            }
+        )
+        data["items"] = [
+            root_a.model_dump(mode="json"),
+            child_a.model_copy(update={"parent": root_b.key}).model_dump(mode="json"),
+            root_b.model_dump(mode="json"),
+        ]
+        plan = type(prior).model_validate(data)
+        content = yaml.safe_dump(plan.model_dump(mode="json"), sort_keys=False)
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        self.bundle = ArtifactBundle(
+            thread_id=f"openproject:{request.idea.work_package_id}:planning:{request.plan_version}",
+            artifacts=(ArtifactContent(path="backlog.yaml", sha256=digest, content=content),),
+        )
+        return PlanResponse(
+            thread_id=self.bundle.thread_id,
+            status="artifacts_ready",
+            trace_id=str(request.event.trace_id),
+            interrupt=None,
+            artifact_manifest=(ArtifactManifestEntry(path="backlog.yaml", sha256=digest),),
+        )
+
+    async def artifacts(self, thread_id: str) -> ArtifactBundle:
+        assert self.bundle is not None and self.bundle.thread_id == thread_id
+        return self.bundle
+
+
 def _replan_event(
     *,
     source: str = "windmill",
     delivery_id: str = "replan:wm-root-job-1176",
+    affected_node_keys: list[str] | None = None,
 ):
     now = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
     return envelope_for_delivery(
@@ -713,7 +772,7 @@ def _replan_event(
         payload={
             "plan_id": "single-repository",
             "base_plan_version": 1,
-            "affected_node_keys": ["implement-core"],
+            "affected_node_keys": affected_node_keys or ["implement-core"],
             "reason": "Refine only the implementation branch.",
         },
     )
@@ -901,6 +960,63 @@ async def test_lifecycle_rejects_planner_artifact_outside_replan_scope_before_gi
 
     with pytest.raises(LifecycleEventRejected, match="escaped bounded replan scope"):
         await service.handle(_replan_event())
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_rejects_cross_root_reparent_before_github() -> None:
+    loaded = load_artifact(
+        Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"
+    )
+    seed = loaded.plan.items[0]
+    root_a = seed.model_copy(update={"key": "root-a", "type": "Epic", "parent": None})
+    child_a = seed.model_copy(
+        update={"key": "child-a", "type": "Story", "parent": root_a.key}
+    )
+    root_b = seed.model_copy(update={"key": "root-b", "type": "Epic", "parent": None})
+    prior = loaded.plan.model_copy(update={"items": (root_a, child_a, root_b)})
+    raw = yaml.safe_dump(prior.model_dump(mode="json"), sort_keys=False).encode()
+    artifact = load_artifact_bytes(raw)
+    base = PlanRun(
+        idea_id=1,
+        plan_id=prior.plan.id,
+        plan_version=1,
+        thread_id="openproject:1:planning:1",
+        repository=_PLANNING_REPOSITORY,
+        base_branch="main",
+        artifact_prefix="planning/single-repository/v1",
+        backlog_path="planning/single-repository/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag="fixture",
+        state="published",
+        approved_commit="c" * 40,
+        approval_evidence_sha256="d" * 64,
+        backlog_blob_sha1=artifact.blob_sha1,
+        backlog_sha256=artifact.sha256,
+    )
+    binding = ImmutableArtifactBinding(
+        repository=base.repository,
+        commit_sha=base.approved_commit,
+        path=base.backlog_path,
+        blob_sha=base.backlog_blob_sha1,
+        content_sha256=base.backlog_sha256,
+    )
+    service = LifecycleService(
+        planner=CrossRootReplanPlanner(),  # type: ignore[arg-type]
+        openproject=ReplanOpenProjectFake(),  # type: ignore[arg-type]
+        github=ReplanGitHubFake(raw, binding),  # type: ignore[arg-type]
+        store=VersionedReplanStore(base),  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+
+    with pytest.raises(
+        LifecycleEventRejected,
+        match="changed selected-root ownership",
+    ):
+        await service.handle(
+            _replan_event(affected_node_keys=[root_a.key, root_b.key])
+        )
 
 
 class ResumeCrashPlanner:

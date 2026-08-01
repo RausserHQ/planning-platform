@@ -111,7 +111,10 @@ validates incoming OpenProject webhook signatures as
 webhook secret.
 
 The publisher role is project-scoped and only receives work-package creation,
-editing, and relation permissions. A separate alert-assignee role grants only
+editing, and relation permissions. Bootstrap idempotently enables OpenProject's
+`work_package_tracking` module on both the private planning project and its Idea
+template while preserving unrelated enabled modules; role permissions remain
+inactive without that project module. A separate alert-assignee role grants only
 `view_work_packages` and passive `work_package_assigned` eligibility to the
 pre-existing active human account named by
 `PLANNING_PLATFORM_ALERT_ASSIGNEE_LOGIN`. Bootstrap removes that dedicated role

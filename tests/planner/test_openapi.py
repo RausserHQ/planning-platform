@@ -73,3 +73,34 @@ def test_static_openapi_matches_runtime_operations_security_and_core_schemas() -
                 assert operation["security"] == [{"InternalToken": []}]
             else:
                 assert "security" not in operation
+
+
+def test_replan_openapi_enforces_the_artifact_identity_bounds() -> None:
+    path = Path(__file__).parents[2] / "docs/api/planner.openapi.yaml"
+    schemas = yaml.safe_load(path.read_text())["components"]["schemas"]
+
+    for schema_name in ("ReplanContext", "ReplanScope"):
+        schema = schemas[schema_name]
+        for field in ("selected_root_keys", "affected_node_keys"):
+            values = schema["properties"][field]
+            assert values["minItems"] == 1
+            assert values["uniqueItems"] is True
+            assert values["items"] == {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 96,
+                "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+            }
+
+    scope = schemas["ReplanScope"]["properties"]
+    assert scope["base_plan_version"]["minimum"] == 1
+    assert scope["retained_node_bindings"]["uniqueItems"] is True
+    binding = schemas["ReplanNodeBinding"]["properties"]
+    assert binding["node_key"] == {
+        "type": "string",
+        "minLength": 3,
+        "maxLength": 96,
+        "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
+    }
+    assert binding["plan_version"]["minimum"] == 1
+    assert binding["planning_commit"]["pattern"] == "^[0-9a-f]{40}$"

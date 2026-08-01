@@ -271,13 +271,21 @@ components:
         selected_root_keys:
           items:
             type: string
+            maxLength: 96
+            minLength: 3
+            pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
           type: array
           minItems: 1
+          uniqueItems: true
         affected_node_keys:
           items:
             type: string
+            maxLength: 96
+            minLength: 3
+            pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
           type: array
           minItems: 1
+          uniqueItems: true
         reason:
           type: string
           maxLength: 4096
@@ -374,18 +382,30 @@ components:
       properties:
         base_plan_version:
           type: integer
+          minimum: 1
         selected_root_keys:
           items:
             type: string
+            maxLength: 96
+            minLength: 3
+            pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
           type: array
+          minItems: 1
+          uniqueItems: true
         affected_node_keys:
           items:
             type: string
+            maxLength: 96
+            minLength: 3
+            pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
           type: array
+          minItems: 1
+          uniqueItems: true
         retained_node_bindings:
           items:
             $ref: "#/components/schemas/ReplanNodeBinding"
           type: array
+          uniqueItems: true
       additionalProperties: false
       type: object
       required:
@@ -398,10 +418,15 @@ components:
       properties:
         node_key:
           type: string
+          maxLength: 96
+          minLength: 3
+          pattern: "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
         plan_version:
           type: integer
+          minimum: 1
         planning_commit:
           type: string
+          pattern: "^[0-9a-f]{40}$"
       additionalProperties: false
       type: object
       required: [node_key, plan_version, planning_commit]

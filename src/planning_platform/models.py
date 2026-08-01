@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+STABLE_NODE_KEY_PATTERN = r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+StableNodeKey = Annotated[
+    str,
+    Field(min_length=3, max_length=96, pattern=STABLE_NODE_KEY_PATTERN),
+]
 
 
 class ContractModel(BaseModel):
@@ -31,18 +37,37 @@ class SnapshotReference(ContractModel):
 class ReplanNodeBinding(ContractModel):
     """Managed-field provenance retained for one protected prior node."""
 
-    node_key: str
-    plan_version: int
-    planning_commit: str
+    node_key: StableNodeKey
+    plan_version: int = Field(ge=1)
+    planning_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
 
 
 class ReplanScope(ContractModel):
     """Artifact-visible boundary and provenance for a partial replan."""
 
-    base_plan_version: int
-    selected_root_keys: tuple[str, ...]
-    affected_node_keys: tuple[str, ...]
-    retained_node_bindings: tuple[ReplanNodeBinding, ...]
+    base_plan_version: int = Field(ge=1)
+    selected_root_keys: tuple[StableNodeKey, ...] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+    affected_node_keys: tuple[StableNodeKey, ...] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+    retained_node_bindings: tuple[ReplanNodeBinding, ...] = Field(
+        json_schema_extra={"uniqueItems": True},
+    )
+
+    @model_validator(mode="after")
+    def identities_are_unique(self) -> ReplanScope:
+        if len(self.selected_root_keys) != len(set(self.selected_root_keys)):
+            raise ValueError("replan selected root keys must be unique")
+        if len(self.affected_node_keys) != len(set(self.affected_node_keys)):
+            raise ValueError("replan affected node keys must be unique")
+        binding_keys = [binding.node_key for binding in self.retained_node_bindings]
+        if len(binding_keys) != len(set(binding_keys)):
+            raise ValueError("replan retained node bindings must be unique")
+        return self
 
 
 class Plan(ContractModel):

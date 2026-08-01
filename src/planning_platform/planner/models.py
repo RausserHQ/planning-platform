@@ -9,7 +9,7 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
-from planning_platform.models import BacklogItem, BacklogPlan
+from planning_platform.models import BacklogItem, BacklogPlan, StableNodeKey
 
 MAX_PLANNER_REQUEST_BYTES = 4 * 1024 * 1024
 
@@ -73,8 +73,14 @@ class ReplanContext(StrictModel):
 
     prior_plan: BacklogPlan
     base_approved_planning_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    selected_root_keys: tuple[str, ...] = Field(min_length=1)
-    affected_node_keys: tuple[str, ...] = Field(min_length=1)
+    selected_root_keys: tuple[StableNodeKey, ...] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
+    affected_node_keys: tuple[StableNodeKey, ...] = Field(
+        min_length=1,
+        json_schema_extra={"uniqueItems": True},
+    )
     reason: str = Field(min_length=1, max_length=4_096)
 
     @model_validator(mode="after")
@@ -85,6 +91,15 @@ class ReplanContext(StrictModel):
             raise ValueError("replan selected roots must be unique prior node keys")
         if len(self.affected_node_keys) != len(set(self.affected_node_keys)):
             raise ValueError("replan affected node keys must be unique")
+        for root in roots:
+            current = prior[root].parent
+            seen = {root}
+            while current is not None and current not in seen:
+                if current in roots:
+                    raise ValueError("replan selected roots must not be nested")
+                seen.add(current)
+                item = prior.get(current)
+                current = None if item is None else item.parent
         expected = _descendant_closure(self.prior_plan, set(roots))
         if set(self.affected_node_keys) != expected:
             raise ValueError(
