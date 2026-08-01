@@ -173,7 +173,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.13` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.14` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits
@@ -182,3 +182,8 @@ image also contains the reviewed workspace snapshot at
 `/opt/planning-platform-workspace`, so the
 one-shot sync Job does not fetch mutable source at runtime. GitOps consumes the
 resulting immutable digests, never the mutable display tags.
+
+The Windmill extension installs native Python dependencies with Windmill's
+preinstalled uv-managed Python 3.12 and verifies imports with that same
+interpreter. The base image's operating-system Python is not the Windmill job
+runtime and must not be used to select extension wheels.
