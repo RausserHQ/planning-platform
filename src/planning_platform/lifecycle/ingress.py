@@ -172,3 +172,27 @@ def scheduled_envelope(
         signature=VerifiedSignature(verified=True, algorithm="internal"),
         payload={"schedule": "nightly_reconciliation"},
     )
+
+
+def convergence_check_envelope(
+    *,
+    plan_id: str,
+    plan_version: int,
+    delivery_id: str,
+    occurred_at: datetime | None = None,
+) -> EventEnvelope:
+    """Build the internal, operator-run convergence proof envelope."""
+    if not plan_id or plan_version <= 0 or not delivery_id:
+        raise ValueError("plan identity and Windmill job identity are required")
+    now = occurred_at or datetime.now(UTC)
+    return envelope_for_delivery(
+        event_type="planning.convergence_check",
+        source="windmill",
+        delivery_id=f"convergence:{delivery_id}",
+        occurred_at=now,
+        received_at=now,
+        actor=EventActor(kind="system", id="windmill-operator"),
+        subject=EventSubject(plan_id=plan_id, plan_version=plan_version),
+        signature=VerifiedSignature(verified=True, algorithm="internal"),
+        payload={"plan_id": plan_id, "plan_version": plan_version},
+    )

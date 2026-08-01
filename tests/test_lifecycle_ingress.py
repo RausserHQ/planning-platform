@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from planning_platform.lifecycle.ingress import github_envelope, openproject_envelope
+from planning_platform.lifecycle.ingress import (
+    convergence_check_envelope,
+    github_envelope,
+    openproject_envelope,
+)
 from planning_platform.lifecycle.webhooks import WebhookRejected
 
 
@@ -80,6 +84,24 @@ def test_ingress_rejects_missing_resource_timestamp_instead_of_using_receipt_tim
             secret=b"secret",
             received_at=datetime(2026, 7, 30, 19, 0, tzinfo=UTC),
         )
+
+
+def test_convergence_ingress_requires_exact_plan_and_windmill_job_identity() -> None:
+    now = datetime(2026, 7, 31, 3, 0, tzinfo=UTC)
+    envelope = convergence_check_envelope(
+        plan_id="single-repository",
+        plan_version=1,
+        delivery_id="wm-root-job-1176",
+        occurred_at=now,
+    )
+    assert envelope.event_type == "planning.convergence_check"
+    assert envelope.source == "windmill"
+    assert envelope.source_delivery_id == "convergence:wm-root-job-1176"
+    assert envelope.subject.plan_id == "single-repository"
+    assert envelope.subject.plan_version == 1
+    assert envelope.payload == {"plan_id": "single-repository", "plan_version": 1}
+    with pytest.raises(ValueError, match="identity"):
+        convergence_check_envelope(plan_id="", plan_version=1, delivery_id="job")
 
 
 @pytest.mark.parametrize(

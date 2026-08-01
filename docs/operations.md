@@ -29,6 +29,8 @@ pod.
      `{"Acme/service":["implementation-tests"]}`;
    - `PLANNING_IMPLEMENTATION_STALE_HOURS` to the positive interval after
      which an In Progress item with only closed-unmerged PRs is reported.
+   - `PLANNING_THREAD_STALE_SECONDS` to the positive interval after which the
+     latest nonterminal plan run is reported as a stale planning thread.
    OpenProject ingress resolves the service actor ID through
    `/api/v3/users/me` with the scoped publisher token; comment markers are
    never used as identity.
@@ -72,6 +74,21 @@ local `planning-platform` dependency. The image replaces Windmill's inherited
 root-home Bun link with the pinned npm-installed `wmill` executable under
 `/usr/bin`, and the release gate executes it explicitly as UID/GID 1000.
 
+## Immutable convergence proof
+
+An operator may run the Git-synced `convergence_check` flow for one exact
+published `plan_id` and positive `plan_version`. The flow derives its delivery
+identity from the Windmill root job, reads the stored immutable bindings and
+the exact GitHub artifact, snapshots OpenProject, and records a
+`convergence_check` audit row. `zero_operations` is the only successful
+acceptance result; `drift_operations:<n>` records the number of planned
+mutations and performs no repair, publish, journal, or OpenProject write.
+In the Windmill workspace, manually run the `convergence_check` flow and enter
+only the published plan ID and version; never provide or reuse an approval
+event. Windmill supplies the job identity used for the delivery key.
+Record the plan identity, Windmill job/delivery identity, trace ID, and audit
+outcome. Do not use this flow to approve, publish, or repair a plan.
+
 ## Recovery
 
 - A retryable failure expires only its token-fenced lease. A heartbeat keeps a
@@ -98,7 +115,10 @@ root-home Bun link with the pinned npm-installed `wmill` executable under
   was already committed, restores a missing `Needs Input` status, and unblocks
   or blocks work only when the approved graph makes the transition
   unambiguous. Closed-unmerged implementation evidence becomes a stale finding
-  after the configured interval. Other drift is reported.
+  after the configured interval. Latest nonterminal planning runs whose
+  existing `updated_at` is at or older than `PLANNING_THREAD_STALE_SECONDS`
+  are reported as `stale_threads:<n>` without a repair or timestamp touch.
+  Other drift is reported.
 
 Never edit a delivery row, publication journal, LangGraph checkpoint, or
 OpenProject managed hash by hand.
@@ -153,7 +173,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.9` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.10` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits

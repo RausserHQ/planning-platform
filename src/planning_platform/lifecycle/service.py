@@ -90,6 +90,7 @@ class LifecycleService:
         planning_repository: str,
         implementation_required_checks: Mapping[str, Collection[str]],
         implementation_stale_after: timedelta = timedelta(hours=48),
+        planning_thread_stale_after: timedelta = timedelta(hours=24),
         publication_journal_factory: Callable[[], PublicationJournal] | None = None,
     ) -> None:
         if not re.fullmatch(
@@ -98,6 +99,8 @@ class LifecycleService:
             raise ValueError("planning artifact repository is invalid")
         if implementation_stale_after <= timedelta(0):
             raise ValueError("implementation stale interval must be positive")
+        if planning_thread_stale_after <= timedelta(0):
+            raise ValueError("planning thread stale interval must be positive")
         normalized_checks: dict[str, frozenset[str]] = {}
         for repository, checks in implementation_required_checks.items():
             values = frozenset(checks)
@@ -117,6 +120,7 @@ class LifecycleService:
         self._planning_repository = planning_repository
         self._implementation_required_checks = normalized_checks
         self._implementation_stale_after = implementation_stale_after
+        self._planning_thread_stale_after = planning_thread_stale_after
         self._publication_journal_factory = publication_journal_factory or (
             lambda: PostgresPublicationJournal(self._publication_database_url)
         )
@@ -132,9 +136,66 @@ class LifecycleService:
             return await self._pull_request(event)
         if event.event_type == "github.check_run":
             return await self._check_run(event)
+        if event.event_type == "planning.convergence_check":
+            return await self._convergence_check(event)
         if event.event_type == "reconciliation.scheduled":
             return await self._reconcile(event)
         raise LifecycleEventRejected(f"unsupported lifecycle event: {event.event_type}")
+
+    async def _convergence_check(self, event: EventEnvelope) -> LifecycleOutcome:
+        """Prove an approved immutable plan is converged without mutating anything."""
+        if event.source != "windmill" or event.signature.algorithm != "internal":
+            raise LifecycleEventRejected("convergence proof requires a Windmill internal event")
+        plan_id = event.subject.plan_id
+        plan_version = event.subject.plan_version
+        if (
+            not plan_id
+            or plan_version is None
+            or plan_version <= 0
+            or event.payload != {"plan_id": plan_id, "plan_version": plan_version}
+        ):
+            raise LifecycleEventRejected("convergence proof requires one exact plan identity")
+        run = await run_sync_to_completion(self._store.get, plan_id, plan_version)
+        if run is None:
+            raise LifecycleEventRejected("convergence proof references an unknown plan version")
+        if run.state != "published":
+            raise LifecycleEventRejected("convergence proof requires a published plan version")
+        if (
+            run.approved_commit is None
+            or run.approval_evidence_sha256 is None
+            or run.backlog_blob_sha1 is None
+            or run.backlog_sha256 is None
+        ):
+            raise LifecycleEventRejected("published plan is missing immutable publication bindings")
+        binding = ImmutableArtifactBinding(
+            repository=run.repository,
+            commit_sha=run.approved_commit,
+            path=run.backlog_path,
+            blob_sha=run.backlog_blob_sha1,
+            content_sha256=run.backlog_sha256,
+        )
+        artifact = load_artifact_bytes(await self._github.read_immutable_artifact(binding))
+        if (
+            artifact.plan.plan.id != plan_id
+            or artifact.plan.plan.version != plan_version
+            or artifact.blob_sha1 != binding.blob_sha
+            or artifact.sha256 != binding.content_sha256
+        ):
+            raise LifecycleEventRejected(
+                "immutable artifact does not match the published plan identity"
+            )
+        snapshot = await run_sync_to_completion(self._openproject.snapshot)
+        approved = with_approved_commit(artifact.plan, run.approved_commit)
+        operations = plan_diff(approved, snapshot, trace_id=str(event.trace_id))
+        mutation_count = sum(operation.kind != "record_audit" for operation in operations)
+        outcome = "zero_operations" if mutation_count == 0 else f"drift_operations:{mutation_count}"
+        return await self._outcome(
+            event,
+            "convergence_check",
+            outcome,
+            plan_id=plan_id,
+            plan_version=plan_version,
+        )
 
     async def _work_package_changed(self, event: EventEnvelope) -> LifecycleOutcome:
         raw = self._payload_object(event.payload, "work_package")
@@ -983,7 +1044,11 @@ class LifecycleService:
                 "nightly_reconciliation",
                 "identity_conflict",
             )
-        findings = implementation_failures
+        stale_threads = await run_sync_to_completion(
+            self._store.stale_thread_count,
+            event.occurred_at - self._planning_thread_stale_after,
+        )
+        findings = implementation_failures + stale_threads
         safe_repairs = 0
         status_ids = self._openproject.config.status_ids
         done_id = status_ids["Done"]
@@ -1121,7 +1186,8 @@ class LifecycleService:
                 f"inspected:{len(latest_runs)}:findings:{findings}:"
                 f"repairs:{safe_repairs}:missed_merges:{repaired_merges}:"
                 f"implementation_repairs:{repaired_implementation}:"
-                f"implementation_failures:{implementation_failures}"
+                f"implementation_failures:{implementation_failures}:"
+                f"stale_threads:{stale_threads}"
             ),
         )
 

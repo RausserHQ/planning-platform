@@ -14,20 +14,36 @@ from planning_platform.lifecycle.models import EventEnvelope
 from planning_platform.lifecycle.runtime import LifecycleRuntime
 
 
+def _handler_result(
+    result: dict[str, str],
+    preserve_failure: bool,
+) -> dict[str, Any]:
+    if not preserve_failure:
+        return result
+    return {
+        "wm_failure": "convergence_check_failed",
+        "result": result,
+    }
+
+
 async def main(
     event: dict[str, Any],
     error: dict[str, Any] | None = None,
-) -> dict[str, str]:
+    preserve_failure: bool = False,
+) -> dict[str, Any]:
     try:
         envelope = EventEnvelope.model_validate(event)
     except ValueError:
         # An invalid signature can fail in the verifier before a trusted
         # envelope exists. Keep Windmill's native failure record, but never
         # persist attacker-controlled input in the lifecycle dead-letter table.
-        return {
-            "state": "rejected",
-            "message": "unverified delivery was not persisted",
-        }
+        return _handler_result(
+            {
+                "state": "rejected",
+                "message": "unverified delivery was not persisted",
+            },
+            preserve_failure,
+        )
     safe_error = error if isinstance(error, dict) else {}
     name = str(safe_error.get("name") or safe_error.get("error") or "WindmillFlowError")
     step_id = str(safe_error.get("step_id") or safe_error.get("step") or "unknown")
@@ -57,9 +73,15 @@ async def main(
             now=datetime.now(UTC),
         )
         if claim.state == "completed":
-            return {"state": "completed", "message": "delivery already completed"}
+            return _handler_result(
+                {"state": "completed", "message": "delivery already completed"},
+                preserve_failure,
+            )
         if claim.state == "dead_letter":
-            return {"state": "dead_letter", "message": "delivery already dead-lettered"}
+            return _handler_result(
+                {"state": "dead_letter", "message": "delivery already dead-lettered"},
+                preserve_failure,
+            )
         if not claim.acquired or claim.claim_token is None:
             raise RuntimeError("delivery lease is still active during terminal failure")
         await run_sync_to_completion(
@@ -79,4 +101,7 @@ async def main(
         )
     # Windmill already retains the full terminal error. Do not echo an
     # arbitrary error message that could contain request or secret material.
-    return {"state": "dead_letter", "message": "terminal failure recorded"}
+    return _handler_result(
+        {"state": "dead_letter", "message": "terminal failure recorded"},
+        preserve_failure,
+    )

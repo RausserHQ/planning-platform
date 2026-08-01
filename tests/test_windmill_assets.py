@@ -19,6 +19,7 @@ REQUIRED_FLOWS = {
     "openproject_work_package_changed",
     "github_pull_request_event",
     "github_check_run_event",
+    "convergence_check",
     "nightly_reconciliation",
     "replan_affected_subgraph",
     "dead_letter_recovery",
@@ -127,13 +128,59 @@ def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> Non
     assert schedule["timezone"] == "America/Los_Angeles"
 
 
+def test_convergence_proof_is_operator_only_and_uses_a_stable_windmill_identity() -> None:
+    flow = _document(PLANNING / "convergence_check.flow/flow.yaml")
+    assert flow["schema"]["required"] == ["plan_id", "plan_version"]
+    modules = flow["value"]["modules"]
+    assert [module["value"]["path"] for module in modules] == [
+        "f/planning/convergence_event",
+        "f/planning/convergence_check",
+    ]
+    assert modules[1]["retry"]["retry_if"] == {"expr": 'error.name != "ManualFailure"'}
+    assert flow["value"]["failure_module"]["value"]["input_transforms"]["event"] == {
+        "type": "javascript",
+        "expr": "results.envelope ?? {}",
+    }
+    assert flow["value"]["failure_module"]["value"]["input_transforms"][
+        "preserve_failure"
+    ] == {"type": "static", "value": True}
+    assert not (PLANNING / "convergence_check.http_trigger.yaml").exists()
+    assert not (PLANNING / "convergence_check.schedule.yaml").exists()
+
+    source = (PLANNING / "convergence_event.py").read_text()
+    metadata = _document(PLANNING / "convergence_event.script.yaml")
+    assert set(metadata["schema"]["properties"]) == {"plan_id", "plan_version"}
+    tree = ast.parse(source)
+    entrypoint = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
+    )
+    assert [argument.arg for argument in entrypoint.args.args] == ["plan_id", "plan_version"]
+    assert "WM_ROOT_FLOW_JOB_ID" in source
+    assert "WM_JOB_ID" in source
+    assert "delivery_id or" not in source
+    assert "convergence_check_envelope" in source
+
+    check_source = (PLANNING / "convergence_check.py").read_text()
+    check_metadata = _document(PLANNING / "convergence_check.script.yaml")
+    assert set(check_metadata["schema"]["properties"]) == {"event"}
+    assert '"wm_failure": result.outcome' in check_source
+    assert '"wm_failure": "convergence_result_unavailable"' in check_source
+    assert "convergence envelope is not bound to this Windmill root job" in check_source
+    assert "execute_delivery" in check_source
+
+    dead_letter_source = (PLANNING / "dead_letter.py").read_text()
+    assert '"wm_failure": "convergence_check_failed"' in dead_letter_source
+
+
 def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     workspace_files = sorted(
         path.relative_to(ROOT)
         for path in ROOT.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     )
-    assert len(workspace_files) == 37
+    assert len(workspace_files) == 42
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert "!windmill/" in dockerignore

@@ -133,6 +133,50 @@ def test_lifecycle_store_replays_immutable_binding_and_tracks_pr_state() -> None
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_stale_thread_count_uses_latest_nonterminal_run_and_includes_cutoff_boundary() -> None:
+    assert DATABASE_URL is not None
+    store = PostgresLifecycleStore(DATABASE_URL)
+    store.setup()
+    cutoff = datetime.now(UTC).replace(microsecond=0)
+    older = cutoff - timedelta(seconds=1)
+    newer = cutoff + timedelta(seconds=1)
+    latest_terminal = _run(uuid4().hex)
+    older_version = PlanRun(
+        **{
+            **latest_terminal.__dict__,
+            "plan_version": 2,
+            "thread_id": f"{latest_terminal.thread_id}:v2",
+            "snapshot_etag": f"{latest_terminal.snapshot_etag}:v2",
+        }
+    )
+    stale = _run(uuid4().hex)
+    boundary = _run(uuid4().hex)
+    failed = _run(uuid4().hex)
+    fresh = _run(uuid4().hex)
+    for run in (latest_terminal, older_version, stale, boundary, failed, fresh):
+        store.begin(run)
+    with psycopg.connect(DATABASE_URL) as connection, connection.transaction():
+        for run, state, updated_at in (
+            (latest_terminal, "planning", older),
+            (older_version, "published", older),
+            (stale, "planning", older),
+            (boundary, "needs_input", cutoff),
+            (failed, "failed", older),
+            (fresh, "planning", newer),
+        ):
+            connection.execute(
+                """
+                UPDATE planning_lifecycle.plan_runs
+                SET state=%s, updated_at=%s
+                WHERE plan_id=%s AND plan_version=%s
+                """,
+                (state, updated_at, run.plan_id, run.plan_version),
+            )
+
+    assert store.stale_thread_count(cutoff) == 2
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
 def test_implementation_pr_mapping_is_immutable_monotonic_and_head_bound() -> None:
     assert DATABASE_URL is not None
     store = PostgresLifecycleStore(DATABASE_URL)
