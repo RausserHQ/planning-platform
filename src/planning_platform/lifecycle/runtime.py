@@ -15,7 +15,7 @@ from planning_platform.github_adapter import (
     GitHubAppInstallationToken,
 )
 from planning_platform.openproject_adapter import OpenProjectPublicationAdapter
-from planning_platform.openproject_discovery import discover_openproject_config
+from planning_platform.openproject_transport import discover_openproject_adapter
 from planning_platform.publication_journal import PostgresPublicationJournal
 
 from .dedupe import PostgresDeliveryDeduplicator
@@ -81,12 +81,12 @@ class LifecycleRuntime:
         lifecycle_database = _required("PLANNING_LIFECYCLE_DATABASE_URL")
         openproject_url = _required("OPENPROJECT_BASE_URL")
         openproject_token = _required("OPENPROJECT_API_TOKEN")
-        config = discover_openproject_config(
+        openproject = discover_openproject_adapter(
             base_url=openproject_url,
+            canonical_origin=_required("OPENPROJECT_CANONICAL_ORIGIN"),
             project_identifier=_required("OPENPROJECT_PROJECT_IDENTIFIER"),
             token=openproject_token,
         )
-        openproject = OpenProjectPublicationAdapter(config, openproject_token)
         async_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
         token_provider = GitHubAppInstallationToken(
             async_client,

@@ -15,8 +15,7 @@ from planning_platform.alert_delivery import (
     operational_alert_transition_at,
 )
 from planning_platform.lifecycle.store import PostgresLifecycleStore
-from planning_platform.openproject_adapter import OpenProjectPublicationAdapter
-from planning_platform.openproject_discovery import discover_openproject_config
+from planning_platform.openproject_transport import discover_openproject_adapter
 
 
 def _required(name: str) -> str:
@@ -34,11 +33,6 @@ def main(event: dict[str, Any]) -> dict[str, object]:
     database_url = _required("PLANNING_LIFECYCLE_DATABASE_URL")
     openproject_url = _required("OPENPROJECT_BASE_URL")
     openproject_token = _required("OPENPROJECT_API_TOKEN")
-    config = discover_openproject_config(
-        base_url=openproject_url,
-        project_identifier=_required("OPENPROJECT_PROJECT_IDENTIFIER"),
-        token=openproject_token,
-    )
     store = PostgresLifecycleStore(database_url)
     results: list[dict[str, object]] = []
     trace_id = str(uuid5(NAMESPACE_URL, f"planning-alert-group:{envelope.group_key}"))
@@ -46,7 +40,13 @@ def main(event: dict[str, Any]) -> dict[str, object]:
         delivery_job_id = UUID(_required("WM_JOB_ID"))
     except ValueError as error:
         raise RuntimeError("WM_JOB_ID must be a UUID") from error
-    with OpenProjectPublicationAdapter(config, openproject_token) as adapter:
+    adapter = discover_openproject_adapter(
+        base_url=openproject_url,
+        canonical_origin=_required("OPENPROJECT_CANONICAL_ORIGIN"),
+        project_identifier=_required("OPENPROJECT_PROJECT_IDENTIFIER"),
+        token=openproject_token,
+    )
+    with adapter:
         for alert_index, alert in enumerate(envelope.alerts):
             lock_name = f"planning-alert:{alert.fingerprint}"
             payload_sha256 = operational_alert_payload_sha256(alert)

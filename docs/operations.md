@@ -21,6 +21,10 @@ pod.
 5. Install Windmill CE 1.775.2 and sync `windmill/` with CLI 1.775.2.
 6. Start planner and Windmill workers, then enable the signed webhook routes.
    The worker environment must set:
+   - `OPENPROJECT_BASE_URL` to the cluster-internal OpenProject service URL and
+     `OPENPROJECT_CANONICAL_ORIGIN` to its public HTTPS origin. OpenProject
+     requests keep the internal transport route while sending the canonical
+     `Host` and `X-Forwarded-Proto` headers required by Rails;
    - `PLANNING_ARTIFACT_REPOSITORY` to the one repository that contains the
      `planning-backlog-validation` workflow;
    - `PLANNING_IMPLEMENTATION_REQUIRED_CHECKS_JSON` to a non-empty JSON object
@@ -173,7 +177,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.15` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.16` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits

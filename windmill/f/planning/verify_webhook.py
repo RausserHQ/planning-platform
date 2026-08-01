@@ -11,6 +11,7 @@ from planning_platform.lifecycle.ingress import (
     github_envelope,
     openproject_envelope,
 )
+from planning_platform.openproject_transport import openproject_client
 
 
 def _secret(name: str) -> bytes:
@@ -22,18 +23,20 @@ def _secret(name: str) -> bytes:
 
 def _openproject_service_actor_id() -> str:
     base_url = os.environ.get("OPENPROJECT_BASE_URL", "").rstrip("/")
+    canonical_origin = os.environ.get("OPENPROJECT_CANONICAL_ORIGIN", "")
     token = os.environ.get("OPENPROJECT_API_TOKEN", "")
-    if not base_url or not token:
+    if not base_url or not canonical_origin or not token:
         raise RuntimeError(
-            "OPENPROJECT_BASE_URL and OPENPROJECT_API_TOKEN are required"
+            "OPENPROJECT_BASE_URL, OPENPROJECT_CANONICAL_ORIGIN, and "
+            "OPENPROJECT_API_TOKEN are required"
         )
     try:
-        response = httpx.get(
-            f"{base_url}/api/v3/users/me",
-            auth=httpx.BasicAuth("apikey", token),
-            headers={"Accept": "application/hal+json"},
-            timeout=httpx.Timeout(10.0),
-        )
+        with openproject_client(
+            base_url=base_url,
+            canonical_origin=canonical_origin,
+            token=token,
+        ) as client:
+            response = client.get("/api/v3/users/me")
     except httpx.TransportError as error:
         raise RuntimeError("OpenProject service-identity lookup failed") from error
     if response.status_code != 200:

@@ -175,6 +175,7 @@ def _custom_field_ids(schema: Mapping[str, Any]) -> dict[str, int]:
 def discover_openproject_config(
     *,
     base_url: str,
+    canonical_origin: str | None = None,
     project_identifier: str,
     token: str,
     client: httpx.Client | None = None,
@@ -280,6 +281,7 @@ def discover_openproject_config(
             )
         return OpenProjectAdapterConfig(
             base_url=base_url,
+            canonical_origin=canonical_origin,
             project_id=project_id,
             type_ids=types,
             status_ids=statuses,

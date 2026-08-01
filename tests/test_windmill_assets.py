@@ -150,6 +150,12 @@ def test_webhook_triggers_preserve_raw_body_and_enter_a_v2_preprocessor() -> Non
     assert 'UUID(_required("WM_JOB_ID"))' in delivery_source
     assert "operational_alert_payload_sha256" in delivery_source
     assert "pg_advisory_xact_lock" in delivery_source
+    assert "discover_openproject_adapter(" in delivery_source
+    assert '_required("OPENPROJECT_CANONICAL_ORIGIN")' in delivery_source
+
+    verifier_source = (PLANNING / "verify_webhook.py").read_text()
+    assert "openproject_client(" in verifier_source
+    assert 'os.environ.get("OPENPROJECT_CANONICAL_ORIGIN"' in verifier_source
 
     schedule = _document(PLANNING / "nightly_reconciliation.schedule.yaml")
     assert schedule["enabled"] is True
