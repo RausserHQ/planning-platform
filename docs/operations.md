@@ -186,6 +186,7 @@ resulting immutable digests, never the mutable display tags.
 The Windmill extension installs native Python dependencies with Windmill's
 preinstalled uv-managed Python 3.12 and verifies imports with that same
 interpreter. The base image's operating-system Python is not the Windmill job
-runtime and must not be used to select extension wheels. The non-root release
-smoke gives `uv` an ephemeral writable cache while it locates that managed
-interpreter; the base image's shared worker cache remains unchanged.
+runtime and must not be used to select extension wheels. Image construction
+gives root's `uv` operations an ephemeral build-only cache, leaving the base
+image's shared cache untouched. The non-root release smoke then locates the
+managed interpreter through that normal worker cache path.

@@ -166,7 +166,7 @@ jobs:
           docker run --rm --platform linux/amd64 \
             --mount "type=bind,src=${GITHUB_WORKSPACE}/tests/verify_windmill_entrypoints.py,dst=/tmp/verify_windmill_entrypoints.py,readonly" \
             --entrypoint sh "${image}" -ec \
-            'uv_cache="$(mktemp -d /tmp/windmill-smoke-uv.XXXXXX)"; export UV_CACHE_DIR="$uv_cache"; windmill_python="$(uv python find 3.12 --system --python-preference only-managed)"; exec "$windmill_python" /tmp/verify_windmill_entrypoints.py --workspace /opt/planning-platform-workspace --expected-python 3.12'
+            'windmill_python="$(uv python find 3.12 --system --python-preference only-managed)"; exec "$windmill_python" /tmp/verify_windmill_entrypoints.py --workspace /opt/planning-platform-workspace --expected-python 3.12'
           docker run --rm --platform linux/amd64 --user 1000:1000 \
             --entrypoint wmill "${image}" --version \
             | grep -Fx 'CLI version: 1.775.2' >/dev/null
