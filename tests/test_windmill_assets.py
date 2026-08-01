@@ -267,6 +267,12 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "context: upstream" not in workflow
     assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
     assert "tests/verify_windmill_entrypoints.py" in workflow
+    assert (
+        'uv_cache="$(mktemp -d /tmp/windmill-smoke-uv.XXXXXX)"; '
+        'export UV_CACHE_DIR="$uv_cache"; '
+        'windmill_python="$(uv python find 3.12 --system '
+        '--python-preference only-managed)"'
+    ) in workflow
     assert "--workspace /opt/planning-platform-workspace --expected-python 3.12" in workflow
     assert 'exec "$windmill_python" /tmp/verify_windmill_entrypoints.py' in workflow
     assert "--workdir /opt/planning-platform-workspace" in workflow
