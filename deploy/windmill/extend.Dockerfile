@@ -1,7 +1,7 @@
 ARG WINDMILL_BASE=ghcr.io/windmill-labs/windmill:1.775.2@sha256:ef39329523f4806e5cd5169ffa7af2618f39439bcf659115e8bb804c592d7132
 FROM ${WINDMILL_BASE}
 
-ARG PLANNING_PLATFORM_VERSION=0.1.14
+ARG PLANNING_PLATFORM_VERSION=0.1.15
 ARG NPM_VERSION=11.19.0
 
 USER root
@@ -11,6 +11,8 @@ RUN npm install --global "npm@${NPM_VERSION}" \
     && test "$(npm --version)" = "${NPM_VERSION}" \
     && test "$(node -p 'require(process.argv[1] + "/npm/node_modules/tar/package.json").version' "$(npm root --global)")" = "7.5.19" \
     && npm cache clean --force \
+    && build_uv_cache="$(mktemp -d /tmp/planning-platform-build-uv.XXXXXX)" \
+    && export UV_CACHE_DIR="${build_uv_cache}" \
     && windmill_python="$(uv python find 3.12 --system --python-preference only-managed)" \
     && "${windmill_python}" -c 'import sys; assert sys.version_info[:2] == (3, 12)' \
     && uv pip install --python "${windmill_python}" --require-hashes \
@@ -22,6 +24,7 @@ RUN npm install --global "npm@${NPM_VERSION}" \
     && PYTHONPATH=/opt/planning-platform "${windmill_python}" -c \
       'from cryptography.hazmat.primitives.ciphers.aead import AESGCM; from importlib.metadata import version; from psycopg import pq; import sys; assert version("planning-platform") == sys.argv[1]; assert pq.__impl__ == "binary"; assert AESGCM is not None' \
       "${PLANNING_PLATFORM_VERSION}" \
+    && rm -rf "${build_uv_cache:?}" \
     && rm -f /usr/bin/wmill \
     && npm install --global "windmill-cli@1.775.2" \
     && wmill_version="$(wmill --version)" \

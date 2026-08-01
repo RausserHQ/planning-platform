@@ -248,6 +248,20 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
         'windmill_python="$(uv python find 3.12 --system '
         '--python-preference only-managed)"'
     ) in dockerfile
+    cache_create = (
+        'build_uv_cache="$(mktemp -d /tmp/planning-platform-build-uv.XXXXXX)"'
+    )
+    cache_export = 'export UV_CACHE_DIR="${build_uv_cache}"'
+    cache_remove = 'rm -rf "${build_uv_cache:?}"'
+    assert cache_create in dockerfile
+    assert cache_export in dockerfile
+    assert cache_remove in dockerfile
+    assert (
+        dockerfile.index(cache_create)
+        < dockerfile.index(cache_export)
+        < dockerfile.index('windmill_python="$(uv python find')
+        < dockerfile.index(cache_remove)
+    )
     assert 'uv pip install --python "${windmill_python}" --require-hashes' in dockerfile
     assert 'uv pip install --python "${windmill_python}" --no-deps' in dockerfile
     assert 'pq.__impl__ == "binary"' in dockerfile
@@ -267,6 +281,8 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "context: upstream" not in workflow
     assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
     assert "tests/verify_windmill_entrypoints.py" in workflow
+    assert "windmill-smoke-uv" not in workflow
+    assert 'export UV_CACHE_DIR="$uv_cache"' not in workflow
     assert "--workspace /opt/planning-platform-workspace --expected-python 3.12" in workflow
     assert 'exec "$windmill_python" /tmp/verify_windmill_entrypoints.py' in workflow
     assert "--workdir /opt/planning-platform-workspace" in workflow
