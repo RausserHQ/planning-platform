@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import asdict
 
@@ -10,7 +11,7 @@ from planning_platform.lifecycle.runtime import LifecycleRuntime
 from planning_platform.lifecycle.worker import execute_delivery
 
 
-async def main(delivery_id: str | None = None) -> dict[str, object] | str:
+async def _main_async(delivery_id: str | None = None) -> dict[str, object] | str:
     stable_delivery = (
         delivery_id or os.environ.get("WM_ROOT_FLOW_JOB_ID") or os.environ.get("WM_JOB_ID")
     )
@@ -24,3 +25,7 @@ async def main(delivery_id: str | None = None) -> dict[str, object] | str:
             runtime.service.handle,
         )
     return asdict(result) if not isinstance(result, str) else result
+
+
+def main(delivery_id: str | None = None) -> dict[str, object] | str:
+    return asyncio.run(_main_async(delivery_id))

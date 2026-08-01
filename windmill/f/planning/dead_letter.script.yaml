@@ -1,6 +1,7 @@
 summary: Record a terminal planning delivery failure
 description: Persists only trusted event identity and sanitized failure classification.
 kind: script
+lock: '!inline f/planning/dead_letter.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

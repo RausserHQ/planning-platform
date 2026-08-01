@@ -1,6 +1,7 @@
 summary: Record terminal Planning Platform alert delivery failure
 description: Persists only authenticated alert identity and sanitized failure state.
 kind: script
+lock: '!inline f/planning/alert_delivery_failure.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

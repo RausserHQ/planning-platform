@@ -1,6 +1,7 @@
 summary: Verify and normalize a planning webhook
 description: Verifies the exact raw request body before producing a trusted event envelope.
 kind: script
+lock: '!inline f/planning/verify_webhook.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

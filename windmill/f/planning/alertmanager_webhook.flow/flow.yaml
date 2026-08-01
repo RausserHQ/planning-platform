@@ -21,6 +21,9 @@ value:
     value:
       type: rawscript
       language: python3
+      lock: |
+        # py: 3.12
+        # Dependencies are provided by the pinned planning-platform Windmill image.
       content: |
         def preprocessor(event):
             return {"event": event}

@@ -1,6 +1,7 @@
 summary: Recover one trusted dead-lettered delivery
 description: Requires an operator identity and reason, audits authorization, and token-fences the replay.
 kind: script
+lock: '!inline f/planning/recover_dead_letter.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

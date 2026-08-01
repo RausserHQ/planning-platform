@@ -1,6 +1,7 @@
 summary: Reconcile durable planning state
 description: Inspects canonical systems and applies only deterministic safe repairs.
 kind: script
+lock: '!inline f/planning/nightly_reconciliation.script.lock'
 schema:
   $schema: https://json-schema.org/draft/2020-12/schema
   type: object

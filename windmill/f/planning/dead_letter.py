@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
@@ -26,7 +27,7 @@ def _handler_result(
     }
 
 
-async def main(
+async def _main_async(
     event: dict[str, Any],
     error: dict[str, Any] | None = None,
     preserve_failure: bool = False,
@@ -105,3 +106,11 @@ async def main(
         {"state": "dead_letter", "message": "terminal failure recorded"},
         preserve_failure,
     )
+
+
+def main(
+    event: dict[str, Any],
+    error: dict[str, Any] | None = None,
+    preserve_failure: bool = False,
+) -> dict[str, Any]:
+    return asyncio.run(_main_async(event, error, preserve_failure))
