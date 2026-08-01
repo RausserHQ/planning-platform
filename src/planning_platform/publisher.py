@@ -10,6 +10,7 @@ from .diff import PublicationOperation, plan_diff
 from .loader import LoadedArtifact
 from .models import with_approved_commit
 from .openproject import OpenProjectSnapshot, WorkPackageSnapshot
+from .replan import validate_replan_candidate
 from .validation import SemanticValidationError, validate_plan
 
 if TYPE_CHECKING:
@@ -57,6 +58,16 @@ class PublicationEnvelope:
 
 
 @dataclass(frozen=True)
+class ReplanPublicationContext:
+    """Immutable published base required to prove a partial-replan boundary."""
+
+    base_artifact: LoadedArtifact
+    base_approved_commit: str
+    selected_root_keys: tuple[str, ...]
+    affected_node_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PublishResult:
     operations: tuple[PublicationOperation, ...]
     applied: bool
@@ -92,6 +103,49 @@ def _check_publication_target(
 ) -> None:
     if adapter.publication_target_sha256 != envelope.publication_target_sha256:
         raise PublicationRejected("OpenProject publication target changed")
+
+
+def _check_replan_boundary(
+    artifact: LoadedArtifact,
+    context: ReplanPublicationContext | None,
+) -> None:
+    scope = artifact.plan.plan.replan
+    if scope is None:
+        if context is not None:
+            raise PublicationRejected("ordinary publication has unexpected replan context")
+        return
+    if context is None:
+        raise PublicationRejected(
+            "partial replan publication requires its immutable published base artifact"
+        )
+    if not _SHA1.fullmatch(context.base_approved_commit):
+        raise PublicationRejected("partial replan base has an invalid approved commit")
+    base = context.base_artifact.plan
+    base_issues = validate_plan(base)
+    if base_issues:
+        raise PublicationRejected("partial replan base artifact is semantically invalid")
+    embedded_commit = base.plan.approved_planning_commit
+    if embedded_commit is not None and embedded_commit != context.base_approved_commit:
+        raise PublicationRejected("partial replan base approved commit does not match its artifact")
+    if (
+        scope.selected_root_keys != context.selected_root_keys
+        or scope.affected_node_keys != context.affected_node_keys
+    ):
+        raise PublicationRejected(
+            "partial replan artifact changed its operator-authorized boundary"
+        )
+    try:
+        validate_replan_candidate(
+            base,
+            artifact.plan,
+            base_approved_commit=context.base_approved_commit,
+            selected_root_keys=context.selected_root_keys,
+            affected_node_keys=context.affected_node_keys,
+        )
+    except ValueError as error:
+        raise PublicationRejected(
+            "partial replan escaped its immutable published boundary"
+        ) from error
 
 
 def _check_envelope(
@@ -147,12 +201,14 @@ def _publish(
     *,
     apply: bool = False,
     journal: PublicationJournal | None = None,
+    replan_context: ReplanPublicationContext | None = None,
 ) -> PublishResult:
     """Validate, bind exact bytes, stale-check, then apply refreshed mutations."""
     issues = validate_plan(artifact.plan)
     if issues:
         raise SemanticValidationError(issues)
     _check_artifact_envelope(artifact, envelope)
+    _check_replan_boundary(artifact, replan_context)
     _check_publication_target(adapter, envelope)
     if apply:
         if journal is None or not journal.ready():
@@ -251,10 +307,18 @@ def publish(
     *,
     apply: bool = False,
     journal: PublicationJournal | None = None,
+    replan_context: ReplanPublicationContext | None = None,
 ) -> PublishResult:
     """Publish with unconditional release of any durable journal session fence."""
     try:
-        return _publish(artifact, adapter, envelope, apply=apply, journal=journal)
+        return _publish(
+            artifact,
+            adapter,
+            envelope,
+            apply=apply,
+            journal=journal,
+            replan_context=replan_context,
+        )
     finally:
         if journal is not None:
             close = getattr(journal, "close", None)

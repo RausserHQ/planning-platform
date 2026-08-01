@@ -1,0 +1,10 @@
+summary: Execute a trusted bounded partial replan
+description: Rejects any event that is not bound to the current Windmill root job.
+kind: script
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  additionalProperties: false
+  properties:
+    event: {type: object, additionalProperties: true}
+  required: [event]

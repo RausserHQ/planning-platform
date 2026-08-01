@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from .models import BacklogItem, BacklogPlan
+from .replan import effective_node_binding
 
 
 def canonical_hash(value: object) -> str:
@@ -175,6 +176,11 @@ def managed_fields(plan: BacklogPlan, item: BacklogItem) -> dict[str, Any]:
     Every member is either a native v3 field/custom field or the exact bounded
     generated region, so an adapter can recompute this hash from a fresh read.
     """
+    effective_version, effective_commit = effective_node_binding(
+        plan,
+        plan.plan.approved_planning_commit,
+        item.key,
+    )
     return {
         "title": item.title,
         "work_package_type": item.type,
@@ -185,9 +191,9 @@ def managed_fields(plan: BacklogPlan, item: BacklogItem) -> dict[str, Any]:
         "source_requirements": list(item.source_requirements),
         "plan_id": plan.plan.id,
         "node_key": item.key,
-        "plan_version": plan.plan.version,
+        "plan_version": effective_version,
         "agent_eligibility": item.agent_eligibility.eligible,
-        "planning_commit": plan.plan.approved_planning_commit,
+        "planning_commit": effective_commit,
     }
 
 

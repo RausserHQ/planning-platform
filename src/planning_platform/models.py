@@ -28,6 +28,23 @@ class SnapshotReference(ContractModel):
     sha256: str
 
 
+class ReplanNodeBinding(ContractModel):
+    """Managed-field provenance retained for one protected prior node."""
+
+    node_key: str
+    plan_version: int
+    planning_commit: str
+
+
+class ReplanScope(ContractModel):
+    """Artifact-visible boundary and provenance for a partial replan."""
+
+    base_plan_version: int
+    selected_root_keys: tuple[str, ...]
+    affected_node_keys: tuple[str, ...]
+    retained_node_bindings: tuple[ReplanNodeBinding, ...]
+
+
 class Plan(ContractModel):
     id: str
     version: int
@@ -36,6 +53,7 @@ class Plan(ContractModel):
     repositories: tuple[Repository, ...]
     approved_planning_commit: str | None
     openproject_snapshot: SnapshotReference
+    replan: ReplanScope | None = None
 
 
 class AcceptanceCriterion(ContractModel):

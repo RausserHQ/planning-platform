@@ -116,3 +116,18 @@ and `max`.
 Stable threads are derived as
 `openproject:<idea-work-package-id>:planning:<plan-version>`. Clients cannot
 provide a thread ID on start.
+
+## Bounded partial replans
+
+An operator-only Windmill flow may create the next version of a published plan.
+It supplies immutable prior backlog bytes, selected stable root keys, their exact
+prior descendant closure, and a bounded reason. The planner persists a sanitized
+reason, preserves every node outside that closure model-exactly, retains selected
+roots, and accepts new nodes only when their parent chain reaches a selected root.
+The approved artifact carries retained per-node version and planning-commit
+bindings, so publication and reconciliation leave protected work packages fully
+untouched instead of advancing their managed metadata with the affected subtree.
+Every mutating publication path must load the immutable latest published base
+artifact, recover the encrypted operator request, and re-run the same boundary
+proof against its exact selected roots and closure; generic publication without
+that independent context rejects partial-replan artifacts.

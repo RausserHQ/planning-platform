@@ -15,7 +15,7 @@ from planning_platform.loader import (
     load_plan,
     validate_schema,
 )
-from planning_platform.models import BacklogItem
+from planning_platform.models import BacklogItem, ReplanNodeBinding, ReplanScope
 from planning_platform.validation import validate_plan
 
 FIXTURES = Path(__file__).parents[1] / "evals/fixtures"
@@ -114,6 +114,45 @@ def test_duplicate_and_cycle_rejection() -> None:
     cyclic_item = plan.items[0].model_copy(update={"blocked_by": (plan.items[0].key,)})
     cyclic = plan.model_copy(update={"items": (cyclic_item,)})
     assert "dependency_cycle" in {issue.code for issue in validate_plan(cyclic)}
+
+
+def test_replan_provenance_must_reference_nodes_in_the_artifact() -> None:
+    base = load_plan(FIXTURES / "single-repository/backlog.yaml")
+    item = base.items[0]
+    malformed = base.model_copy(
+        update={
+            "plan": base.plan.model_copy(
+                update={
+                    "version": 2,
+                    "publication_identity": f"{base.plan.id}:v2",
+                    "replan": ReplanScope(
+                        base_plan_version=1,
+                        selected_root_keys=("ghost-root",),
+                        affected_node_keys=("ghost-root",),
+                        retained_node_bindings=(
+                            ReplanNodeBinding(
+                                node_key="ghost-protected",
+                                plan_version=1,
+                                planning_commit="c" * 40,
+                            ),
+                        ),
+                    ),
+                }
+            ),
+            "items": (item,),
+        }
+    )
+
+    issues = validate_plan(malformed)
+
+    assert any(
+        issue.code == "replan_scope" and issue.node_key == "ghost-root"
+        for issue in issues
+    )
+    assert any(
+        issue.code == "replan_binding" and issue.node_key == "ghost-protected"
+        for issue in issues
+    )
 
 
 def test_parent_cross_repository_plain_blocker_and_missing_evidence_are_rejected() -> None:

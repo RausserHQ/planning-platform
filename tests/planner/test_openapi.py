@@ -8,18 +8,31 @@ import yaml  # type: ignore[import-untyped]
 from planning_platform.planner.api import create_app
 
 CORE_SCHEMAS = {
+    "AcceptanceCriterion",
+    "AgentEligibility",
     "ArtifactBundle",
     "ArtifactContent",
     "ArtifactManifestEntry",
+    "BacklogItem",
+    "BacklogPlan",
     "IdeaSnapshot",
     "OpenProjectSnapshotInput",
     "PendingInterrupt",
+    "Plan",
     "PlannerEvent",
     "PlanResponse",
+    "ReplanContext",
+    "ReplanNodeBinding",
+    "ReplanScope",
+    "Repository",
     "RepositoryFile",
     "RepositorySnapshot",
+    "RequiredEvidence",
+    "ResultPredicate",
     "ResumePlanRequest",
     "StartPlanRequest",
+    "SnapshotReference",
+    "SourceIdea",
 }
 
 

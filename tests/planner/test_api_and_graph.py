@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, ValidationError
 
+from planning_platform.loader import load_artifact, load_artifact_bytes
 from planning_platform.planner.api import create_app
 from planning_platform.planner.execution import (
     ExecutionInProgress,
@@ -43,6 +45,7 @@ from planning_platform.planner.models import (
     repository_snapshot_digest,
 )
 from planning_platform.planner.service import PlannerService
+from planning_platform.replan import apply_replan_boundary, validate_replan_candidate
 from planning_platform.validation import SemanticValidationError
 
 INTERNAL_TOKEN = "internal-test-token"
@@ -107,6 +110,101 @@ def start_payload(
         ],
     }
     return payload
+
+
+def test_replan_request_and_backlog_validation_are_closed_over_selected_roots() -> None:
+    prior = load_artifact(
+        Path(__file__).parents[2] / "evals/fixtures/single-repository/backlog.yaml"
+    ).plan
+    root = prior.items[0]
+    protected = root.model_copy(update={"key": "protected-node"})
+    prior = prior.model_copy(update={"items": (root, protected)})
+    payload = start_payload(idea_id=1)
+    payload.update({"plan_id": prior.plan.id, "plan_version": 2})
+    payload["replan"] = {
+        "prior_plan": prior.model_dump(mode="json"),
+        "base_approved_planning_commit": "c" * 40,
+        "selected_root_keys": [root.key],
+        "affected_node_keys": [root.key],
+        "reason": "Refine only the selected branch.",
+    }
+    request = StartPlanRequest.model_validate(payload)
+    assert request.replan is not None
+    with pytest.raises(ValidationError, match="descendant closure"):
+        StartPlanRequest.model_validate(
+            {**payload, "replan": {**payload["replan"], "affected_node_keys": ["protected-node"]}}
+        )
+
+    changed_protected = protected.model_copy(update={"title": "Changed outside scope"})
+    child = root.model_copy(update={"key": "new-selected-child", "parent": root.key})
+    proposed = prior.model_copy(
+        update={
+            "plan": prior.plan.model_copy(
+                update={
+                    "version": 2,
+                    "publication_identity": f"{prior.plan.id}:v2",
+                }
+            ),
+            "items": (root, changed_protected, child),
+        }
+    )
+    bounded = apply_replan_boundary(
+        prior,
+        proposed,
+        base_approved_commit="c" * 40,
+        selected_root_keys=(root.key,),
+        affected_node_keys=(root.key,),
+    )
+    assert bounded.by_key[protected.key] == protected
+    assert bounded.plan.replan is not None
+    assert bounded.plan.replan.retained_node_bindings[0].node_key == protected.key
+
+    escaped = bounded.model_copy(
+        update={
+            "items": tuple(
+                item.model_copy(update={"parent": protected.key}) if item.key == child.key else item
+                for item in bounded.items
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="not rooted"):
+        validate_replan_candidate(
+            prior,
+            escaped,
+            base_approved_commit="c" * 40,
+            selected_root_keys=(root.key,),
+            affected_node_keys=(root.key,),
+        )
+
+
+@pytest.mark.asyncio
+async def test_deterministic_replan_artifact_preserves_protected_nodes_and_bindings() -> None:
+    prior = load_artifact(
+        Path(__file__).parents[2] / "evals/fixtures/single-repository/backlog.yaml"
+    ).plan
+    root = prior.items[0]
+    protected = root.model_copy(update={"key": "protected-node", "title": "Protected node"})
+    prior = prior.model_copy(update={"items": (root, protected)})
+    payload = start_payload(idea_id=prior.plan.source_idea.work_package_id)
+    payload.update({"plan_id": prior.plan.id, "plan_version": 2})
+    payload["replan"] = {
+        "prior_plan": prior.model_dump(mode="json"),
+        "base_approved_planning_commit": "c" * 40,
+        "selected_root_keys": [root.key],
+        "affected_node_keys": [root.key],
+        "reason": "Refine only the selected root.",
+    }
+    service, _, _, _ = make_service()
+
+    response, _ = await service.start(StartPlanRequest.model_validate(payload))
+    bundle = await service.artifacts(response.thread_id)
+    content = next(item.content for item in bundle.artifacts if item.path == "backlog.yaml")
+    artifact = load_artifact_bytes(content.encode())
+
+    assert artifact.plan.by_key[protected.key] == protected
+    assert artifact.plan.plan.replan is not None
+    assert artifact.plan.plan.replan.retained_node_bindings[0].node_key == protected.key
+    assert artifact.plan.plan.replan.retained_node_bindings[0].planning_commit == "c" * 40
 
 
 def make_service(
