@@ -244,6 +244,13 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert 'npm install --global "npm@${NPM_VERSION}"' in dockerfile
     assert 'tar/package.json").version' in dockerfile
     assert "rm -f /usr/bin/wmill" in dockerfile
+    assert (
+        'windmill_python="$(uv python find 3.12 --system '
+        '--python-preference only-managed)"'
+    ) in dockerfile
+    assert 'uv pip install --python "${windmill_python}" --require-hashes' in dockerfile
+    assert 'uv pip install --python "${windmill_python}" --no-deps' in dockerfile
+    assert 'pq.__impl__ == "binary"' in dockerfile
     assert 'npm install --global "windmill-cli@1.775.2"' in dockerfile
     assert 'wmill_version="$(wmill --version)"' in dockerfile
     assert 'grep -Fx "CLI version: 1.775.2" >/dev/null' in dockerfile
@@ -261,6 +268,7 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
     assert "docker run --rm --platform linux/amd64 --user 1000:1000" in workflow
     assert "tests/verify_windmill_entrypoints.py" in workflow
     assert "--workspace /opt/planning-platform-workspace --expected-python 3.12" in workflow
+    assert 'exec "$windmill_python" /tmp/verify_windmill_entrypoints.py' in workflow
     assert "--workdir /opt/planning-platform-workspace" in workflow
     assert "--entrypoint wmill" in workflow
     assert 'wmill "${image}" lint --locks-required' in workflow

@@ -11,6 +11,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from psycopg import pq
+
 EXPECTED_SCRIPT_COUNT = 12
 EXPECTED_ASYNC_BACKED_COUNT = 7
 REQUIRED_ARGUMENTS: dict[str, Any] = {
@@ -80,6 +83,10 @@ def main() -> None:
     actual_python = f"{sys.version_info.major}.{sys.version_info.minor}"
     if actual_python != args.expected_python:
         raise RuntimeError(f"expected Python {args.expected_python}, found Python {actual_python}")
+    if pq.__impl__ != "binary":
+        raise RuntimeError(f"expected psycopg binary implementation, found {pq.__impl__}")
+    if AESGCM is None:
+        raise RuntimeError("cryptography native extension is unavailable")
 
     scripts = sorted((args.workspace / "f/planning").glob("*.py"))
     if len(scripts) != EXPECTED_SCRIPT_COUNT:
