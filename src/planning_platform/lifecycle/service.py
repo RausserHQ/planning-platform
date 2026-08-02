@@ -62,11 +62,115 @@ from .store import (
     PostgresLifecycleStore,
 )
 
-_REPOSITORY = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:https://github\.com/)?"
-    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?(?![A-Za-z0-9_.-])"
+_REPOSITORY_ENTRY = re.compile(
+    r"(?:https://github\.com/)?"
+    r"(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]*[A-Za-z0-9_-])"
+    r"(?:\.git)?/?"
+)
+_RELEVANT_REPOSITORIES_HEADING = re.compile(
+    r"^[ \t]{0,3}#{1,6}[ \t]+relevant repositories(?:[ \t]+#+)?[ \t]*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
+_MARKDOWN_FENCE = re.compile(
+    r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$"
+)
+_MARKDOWN_LIST_PREFIX = re.compile(
+    r"^(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)"
+)
+_MARKDOWN_CODE_SPAN = re.compile(
+    r"^(?P<fence>`+)(?P<value>.+)(?P=fence)$"
+)
+_MARKDOWN_LINK = re.compile(
+    r"^\[[^\]\r\n]+\]\([ \t]*"
+    r"(?:<(?P<angle>https://github\.com/[^>\s]+)>|"
+    r"(?P<plain>https://github\.com/[^\s)]+))"
+    r"(?:[ \t]+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|\([^()\r\n]*\)))?"
+    r"[ \t]*\)$"
 )
 _REQUIRED_PLANNING_CHECKS = frozenset({"planning-backlog-validation"})
+
+
+def _without_html_comments(
+    line: str,
+    *,
+    in_comment: bool,
+) -> tuple[str | None, bool]:
+    contains_comment = in_comment
+    cursor = 0
+    while cursor < len(line):
+        if in_comment:
+            end = line.find("-->", cursor)
+            if end == -1:
+                return None, True
+            cursor = end + 3
+            in_comment = False
+            continue
+        start = line.find("<!--", cursor)
+        if start == -1:
+            break
+        contains_comment = True
+        cursor = start + 4
+        in_comment = True
+    return (None if contains_comment else line), in_comment
+
+
+def _visible_markdown_lines(description: str) -> tuple[str | None, ...]:
+    visible: list[str | None] = []
+    fence_character: str | None = None
+    fence_length = 0
+    in_html_comment = False
+    for line in description.splitlines():
+        if fence_character is not None:
+            fence = _MARKDOWN_FENCE.match(line)
+            if fence is not None:
+                marker = fence.group("fence")
+                if (
+                    marker[0] == fence_character
+                    and len(marker) >= fence_length
+                    and not fence.group("tail").strip()
+                ):
+                    fence_character = None
+                    fence_length = 0
+            continue
+        if not in_html_comment:
+            fence = _MARKDOWN_FENCE.match(line)
+            if fence is not None:
+                marker = fence.group("fence")
+                fence_character = marker[0]
+                fence_length = len(marker)
+                continue
+        visible_line, in_html_comment = _without_html_comments(
+            line,
+            in_comment=in_html_comment,
+        )
+        visible.append(visible_line)
+    return tuple(visible)
+
+
+def _markdown_section_boundary(line: str | None) -> bool:
+    return line is None or _MARKDOWN_HEADING.match(line) is not None
+
+
+def _repository_entry(line: str) -> str | None:
+    if line.startswith("\t") or line.startswith("    "):
+        return None
+    candidate = _MARKDOWN_LIST_PREFIX.sub("", line.strip(), count=1).strip()
+    if not candidate:
+        return None
+    code_span = _MARKDOWN_CODE_SPAN.fullmatch(candidate)
+    if code_span is not None:
+        candidate = code_span.group("value").strip()
+    elif candidate.startswith("<") and candidate.endswith(">"):
+        candidate = candidate[1:-1].strip()
+    else:
+        link = _MARKDOWN_LINK.fullmatch(candidate)
+        if link is not None:
+            candidate = link.group("angle") or link.group("plain")
+    match = _REPOSITORY_ENTRY.fullmatch(candidate)
+    if match is None:
+        return None
+    return match.group("repository").removesuffix(".git")
 
 
 @dataclass(frozen=True)
@@ -1675,9 +1779,37 @@ class LifecycleService:
 
     @staticmethod
     def _repositories(description: str) -> tuple[str, ...]:
+        lines = _visible_markdown_lines(description)
+        sections: list[str] = []
+        for index, line in enumerate(lines):
+            if (
+                line is None
+                or _RELEVANT_REPOSITORIES_HEADING.fullmatch(line) is None
+            ):
+                continue
+            end = next(
+                (
+                    candidate
+                    for candidate in range(index + 1, len(lines))
+                    if _markdown_section_boundary(lines[candidate])
+                ),
+                len(lines),
+            )
+            sections.append(
+                "\n".join(
+                    candidate
+                    for candidate in lines[index + 1 : end]
+                    if candidate is not None
+                )
+            )
+        if len(sections) != 1:
+            return ()
+
         result: list[str] = []
-        for match in _REPOSITORY.finditer(description):
-            value = match.group(1).removesuffix(".git")
+        for line in sections[0].splitlines():
+            value = _repository_entry(line)
+            if value is None:
+                continue
             if value not in result:
                 result.append(value)
         return tuple(result[:20])
