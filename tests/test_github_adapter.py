@@ -463,13 +463,35 @@ async def test_typed_planner_client_authenticates_and_parses_artifact_bundle() -
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-Planning-Internal-Token"] == "internal-token"
         assert request.url.path == "/v1/plans/openproject:42:planning:1/artifacts"
+        assert request.extensions["timeout"] == {
+            "connect": 600.0,
+            "pool": 600.0,
+            "read": 600.0,
+            "write": 600.0,
+        }
         return httpx.Response(200, json={"thread_id": "thread", "artifacts": []})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        result = await PlannerClient("https://planner.test", "internal-token", client).artifacts(
-            "openproject:42:planning:1"
-        )
+        result = await PlannerClient(
+            "https://planner.test",
+            "internal-token",
+            client,
+            timeout_seconds=600,
+        ).artifacts("openproject:42:planning:1")
     assert result.thread_id == "thread"
+
+
+@pytest.mark.parametrize("timeout_seconds", (0, 30, 901, float("inf"), float("nan")))
+def test_typed_planner_client_rejects_unbounded_timeout(timeout_seconds: float) -> None:
+    from planning_platform.lifecycle.planner_client import PlannerClient
+
+    with pytest.raises(ValueError, match="timeout"):
+        PlannerClient(
+            "https://planner.test",
+            "internal-token",
+            object(),  # type: ignore[arg-type]
+            timeout_seconds=timeout_seconds,
+        )
 
 
 @pytest.mark.asyncio
