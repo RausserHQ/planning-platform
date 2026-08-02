@@ -68,6 +68,24 @@ def _positive_integer(name: str) -> int:
     return value
 
 
+def _bounded_integer(
+    name: str,
+    *,
+    minimum: int,
+    maximum: int,
+    default: int | None = None,
+) -> int:
+    raw = os.environ.get(name)
+    raw = str(default) if raw is None and default is not None else _required(name)
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}") from error
+    if value < minimum or value > maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
 @dataclass
 class LifecycleRuntime:
     service: LifecycleService
@@ -79,6 +97,12 @@ class LifecycleRuntime:
     @classmethod
     def from_environment(cls) -> LifecycleRuntime:
         lifecycle_database = _required("PLANNING_LIFECYCLE_DATABASE_URL")
+        planner_timeout_seconds = _bounded_integer(
+            "PLANNER_HTTP_TIMEOUT_SECONDS",
+            minimum=31,
+            maximum=900,
+            default=600,
+        )
         openproject_url = _required("OPENPROJECT_BASE_URL")
         openproject_token = _required("OPENPROJECT_API_TOKEN")
         openproject = discover_openproject_adapter(
@@ -99,6 +123,7 @@ class LifecycleRuntime:
             _required("PLANNER_URL"),
             _required("PLANNER_INTERNAL_TOKEN"),
             async_client,
+            timeout_seconds=planner_timeout_seconds,
         )
         store = PostgresLifecycleStore(lifecycle_database)
         dedupe = PostgresDeliveryDeduplicator(lifecycle_database)

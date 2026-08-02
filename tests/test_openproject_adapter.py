@@ -257,6 +257,26 @@ def _collection(
     )
 
 
+def _unpaginated_collection(
+    values: list[dict[str, Any]],
+    *,
+    total: int | None = None,
+    links: dict[str, object] | None = None,
+) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "_type": "Collection",
+            "count": len(values),
+            "total": len(values) if total is None else total,
+            "_links": {"self": {"href": "/api/v3/work_packages/7/activities"}}
+            if links is None
+            else links,
+            "_embedded": {"elements": values},
+        },
+    )
+
+
 def _form(payload: dict[str, Any], *, href: str, method: str) -> httpx.Response:
     """Captured v17.6 form shape; commit is authoritative, not guessed by client."""
     return httpx.Response(
@@ -529,6 +549,41 @@ def test_pagination_validates_every_page_before_following_next_link() -> None:
 
     with pytest.raises(OpenProjectPublicationError, match="metadata is inconsistent"):
         _adapter(httpx.MockTransport(handler)).resolve(("plan-a", "node"))
+
+
+def test_unpaginated_collection_requires_complete_bounded_metadata() -> None:
+    path = "/api/v3/work_packages/7/activities"
+    value = {"id": 1}
+
+    adapter = _adapter(
+        httpx.MockTransport(lambda request: _unpaginated_collection([value]))
+    )
+    assert adapter._collection(path, params={"pageSize": "100"}) == [value]
+
+    for response in (
+        _unpaginated_collection([value], total=2),
+        _unpaginated_collection(
+            [value],
+            links={
+                "self": {"href": path},
+                "nextByOffset": {
+                    "href": f"{path}?pageSize=100&offset=2",
+                    "method": "get",
+                },
+            },
+        ),
+        _unpaginated_collection(
+            [value],
+            links={"self": {"href": path}, "jumpTo": {"href": f"{path}?offset=1"}},
+        ),
+        _unpaginated_collection(
+            [value],
+            links={"self": {"href": f"{path}?pageSize=100&offset=2"}},
+        ),
+    ):
+        rejected = _adapter(httpx.MockTransport(lambda request, value=response: value))
+        with pytest.raises(OpenProjectPublicationError, match="metadata is inconsistent"):
+            rejected._collection(path, params={"pageSize": "100"})
 
 
 def test_pagination_without_next_link_must_make_bounded_progress() -> None:
@@ -1857,7 +1912,7 @@ def test_lifecycle_status_evidence_and_comment_updates_are_form_first_and_replay
             }
             return httpx.Response(200, json=current)
         if path == "/api/v3/work_packages/7/activities" and request.method == "GET":
-            return _collection(activities)
+            return _unpaginated_collection(activities)
         if path == "/api/v3/work_packages/7/activities" and request.method == "POST":
             writes += 1
             activity = {

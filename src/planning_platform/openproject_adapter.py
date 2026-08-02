@@ -539,6 +539,36 @@ class OpenProjectPublicationAdapter:
             count = response.get("count")
             total = response.get("total")
             offset = response.get("offset")
+            if offset is None:
+                links = response.get("_links")
+                if (
+                    pages != 1
+                    or values
+                    or response.get("_type") != "Collection"
+                    or type(count) is not int
+                    or type(total) is not int
+                    or response.get("pageSize") is not None
+                    or count != total
+                    or count != len(elements)
+                    or total < 0
+                    or total > self.config.max_collection_items
+                    or not isinstance(links, Mapping)
+                    or set(links) != {"self"}
+                ):
+                    raise OpenProjectPublicationError(
+                        "OpenProject collection pagination metadata is inconsistent"
+                    )
+                _method, self_target = self._safe_api_link(
+                    links["self"],
+                    methods={"GET"},
+                    paths=(path,),
+                    absent_method_is_get=True,
+                )
+                if self_target != path:
+                    raise OpenProjectPublicationError(
+                        "OpenProject collection pagination metadata is inconsistent"
+                    )
+                return list(elements)
             if not all(type(value) is int for value in (count, total, offset)):
                 raise OpenProjectPublicationError(
                     "OpenProject collection lacks pagination metadata"

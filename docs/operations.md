@@ -32,9 +32,13 @@ pod.
      non-empty array of trusted required-check names, for example
      `{"Acme/service":["implementation-tests"]}`;
    - `PLANNING_IMPLEMENTATION_STALE_HOURS` to the positive interval after
-     which an In Progress item with only closed-unmerged PRs is reported.
+     which an In Progress item with only closed-unmerged PRs is reported;
    - `PLANNING_THREAD_STALE_SECONDS` to the positive interval after which the
-     latest nonterminal plan run is reported as a stale planning thread.
+     latest nonterminal plan run is reported as a stale planning thread; and
+   - `PLANNER_HTTP_TIMEOUT_SECONDS` to a bounded value from 31 through 900
+     seconds. The production value is 600 seconds so synchronous model-backed
+     planning requests are not cut off by the shared GitHub client's 30-second
+     default.
    OpenProject ingress resolves the service actor ID through
    `/api/v3/users/me` with the scoped publisher token; comment markers are
    never used as identity.
@@ -177,7 +181,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.17` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.18` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits
