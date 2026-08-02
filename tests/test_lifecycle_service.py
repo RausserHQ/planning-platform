@@ -106,6 +106,109 @@ def _service_policy() -> dict[str, object]:
     }
 
 
+def test_repositories_are_scoped_to_one_exact_relevant_repositories_section() -> None:
+    description = """# Build the planning platform
+
+Restart/replay behavior remains deterministic.
+
+## Relevant repositories
+
+- https://github.com/RausserHQ/planning-platform.git
+- RausserHQ/planning-platform
+
+## Acceptance
+
+The requests/limits table and App/API contract are prose, not repositories.
+"""
+    assert LifecycleService._repositories(description) == (
+        "RausserHQ/planning-platform",
+    )
+    assert LifecycleService._repositories("RausserHQ/planning-platform") == ()
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+RausserHQ/planning-platform
+
+## Relevant repositories
+RausserHQ/homelab-platform
+"""
+    ) == ()
+    assert LifecycleService._repositories(
+        """### ReLeVaNt RePoSiToRiEs ###
+- `RausserHQ/homelab-platform`
+
+#### Notes
+RausserHQ/not-a-repository
+"""
+    ) == ("RausserHQ/homelab-platform",)
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+- RausserHQ/planning-platform
+
+The App/API shape follows Acme/contract.
+"""
+    ) == ("RausserHQ/planning-platform",)
+    assert LifecycleService._repositories(
+        """```markdown
+## Relevant repositories
+Acme/should-not-be-used
+```
+"""
+    ) == ()
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+- [planning](https://github.com/RausserHQ/planning-platform.git)
+- [planning with title](https://github.com/RausserHQ/planning-platform "Project")
+- [planning with angle destination](<https://github.com/RausserHQ/planning-platform>)
+
+~~~markdown
+## Relevant repositories
+Acme/should-not-be-used
+~~~
+"""
+    ) == ("RausserHQ/planning-platform",)
+    assert LifecycleService._repositories(
+        """<!--
+## Relevant repositories
+Acme/should-not-be-used
+-->
+"""
+    ) == ()
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+- RausserHQ/planning-platform
+
+<!--
+## Relevant repositories
+Acme/should-not-be-used
+-->
+"""
+    ) == ("RausserHQ/planning-platform",)
+    assert LifecycleService._repositories(
+        """<!-- not a heading -->## Relevant repositories
+Acme/should-not-be-used
+"""
+    ) == ()
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+- RausserHQ/planning-platform
+
+<!-- not a heading -->## Relevant repositories
+Acme/should-not-be-used
+"""
+    ) == ("RausserHQ/planning-platform",)
+    assert LifecycleService._repositories(
+        """<!-- not a fence -->```markdown
+## Relevant repositories
+- RausserHQ/planning-platform
+"""
+    ) == ("RausserHQ/planning-platform",)
+    assert LifecycleService._repositories(
+        """## Relevant repositories
+    Acme/indented-code-is-not-an-entry
+"""
+    ) == ()
+
+
 def _implementation_artifact():
     loaded = load_artifact(
         Path(__file__).parents[1] / "evals/fixtures/single-repository/backlog.yaml"

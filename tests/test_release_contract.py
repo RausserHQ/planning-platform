@@ -34,7 +34,7 @@ def test_release_workflow_matches_package_version_and_windmill_revision() -> Non
     )
 
     assert re.search(
-        r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.17$",
+        r"(?m)^\s+WINDMILL_TAG: v1\.775\.2-planning\.18$",
         workflow,
     )
     assert (
