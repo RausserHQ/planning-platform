@@ -704,7 +704,7 @@ class LifecycleService:
         return await self._handle_planner_response(event, run, response)
 
     async def _planning_input(self, event: EventEnvelope) -> LifecycleOutcome:
-        activity = self._payload_object(event.payload, "work_package_comment")
+        activity = self._payload_object(event.payload, "activity")
         links = activity.get("_links")
         work_package_link = links.get("workPackage") if isinstance(links, dict) else None
         href = work_package_link.get("href") if isinstance(work_package_link, dict) else None

@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +15,8 @@ from planning_platform.lifecycle.ingress import (
     replan_affected_subgraph_envelope,
 )
 from planning_platform.lifecycle.webhooks import WebhookRejected
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _event(payload: dict[str, object], *, body: dict[str, object] | None = None):
@@ -161,13 +164,17 @@ def test_openproject_ingress_uses_trusted_actor_identity_not_comment_markers(
     now = datetime(2026, 7, 30, 19, 0, tzinfo=UTC)
     payload: dict[str, object] = {
         "action": "work_package_comment:comment",
-        "work_package_comment": {
+        "activity": {
+            "_type": "Activity::Comment",
             "id": 19,
             "createdAt": "2026-07-30T18:59:00Z",
+            "internal": False,
             "comment": {"raw": comment},
-            "_links": {"workPackage": {"href": "/api/v3/work_packages/42"}},
+            "_links": {
+                "workPackage": {"href": "/api/v3/work_packages/42"},
+                "user": {"href": f"/api/v3/users/{actor_id}"},
+            },
         },
-        "actor": {"id": actor_id, "name": "Planning Publisher"},
     }
 
     envelope = openproject_envelope(
@@ -182,3 +189,80 @@ def test_openproject_ingress_uses_trusted_actor_identity_not_comment_markers(
     assert envelope.actor.id == str(actor_id)
     assert envelope.subject.idea_id == 42
     assert envelope.payload == payload
+
+
+def test_openproject_17_6_human_comment_fixture_is_verified_and_normalized() -> None:
+    payload = json.loads(
+        (FIXTURES / "openproject-17.6-comment-webhook.json").read_text(encoding="utf-8")
+    )
+
+    envelope = openproject_envelope(
+        _openproject_event(payload),
+        secret=b"secret",
+        trusted_service_actor_ids={"7"},
+        received_at=datetime(2026, 7, 30, 19, 0, tzinfo=UTC),
+    )
+
+    assert envelope.event_type == "openproject.idea_comment"
+    assert envelope.actor.kind == "human"
+    assert envelope.actor.id == "8"
+    assert envelope.subject.idea_id == 42
+    assert envelope.occurred_at == datetime(2026, 7, 30, 18, 59, tzinfo=UTC)
+    assert envelope.payload == payload
+
+
+def test_openproject_17_6_service_work_package_event_remains_accepted() -> None:
+    payload: dict[str, object] = {
+        "action": "work_package:updated",
+        "work_package": {
+            "_type": "WorkPackage",
+            "id": 42,
+            "updatedAt": "2026-07-30T18:59:00Z",
+        },
+        "actor": {"_type": "User", "id": 7, "name": "Planning Publisher"},
+    }
+
+    envelope = openproject_envelope(
+        _openproject_event(payload),
+        secret=b"secret",
+        trusted_service_actor_ids={"7"},
+        received_at=datetime(2026, 7, 30, 19, 0, tzinfo=UTC),
+    )
+
+    assert envelope.event_type == "openproject.work_package_changed"
+    assert envelope.actor.kind == "service"
+    assert envelope.actor.id == "7"
+    assert envelope.subject.idea_id == 42
+    assert envelope.payload == payload
+
+
+def test_openproject_ingress_rejects_unrelated_actions_and_tampered_comment_bytes() -> None:
+    unrelated: dict[str, object] = {
+        "action": "project:updated",
+        "work_package": {
+            "_type": "WorkPackage",
+            "id": 42,
+            "updatedAt": "2026-07-30T18:59:00Z",
+        },
+        "actor": {"id": 7},
+    }
+    with pytest.raises(WebhookRejected, match="unsupported OpenProject webhook event"):
+        openproject_envelope(
+            _openproject_event(unrelated),
+            secret=b"secret",
+            trusted_service_actor_ids={"7"},
+            received_at=datetime(2026, 7, 30, 19, 0, tzinfo=UTC),
+        )
+
+    payload = json.loads(
+        (FIXTURES / "openproject-17.6-comment-webhook.json").read_text(encoding="utf-8")
+    )
+    event = _openproject_event(payload)
+    event["headers"]["x-op-signature"] = "sha1=" + "0" * 40
+    with pytest.raises(WebhookRejected, match="does not match"):
+        openproject_envelope(
+            event,
+            secret=b"secret",
+            trusted_service_actor_ids={"7"},
+            received_at=datetime(2026, 7, 30, 19, 0, tzinfo=UTC),
+        )
