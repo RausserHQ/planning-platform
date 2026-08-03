@@ -501,6 +501,221 @@ async def test_interrupt_resume_replay_and_comment_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_repairs_an_unacceptable_decomposition_critique() -> None:
+    class RejectThenAcceptCritic(DeterministicPlanningModel):
+        critique_calls = 0
+
+        async def generate(self, stage, schema, payload):
+            if schema is DecompositionDraft and stage == "revise_decomposition":
+                draft = cast(
+                    DecompositionDraft,
+                    await super().generate(stage, schema, payload),
+                )
+                revised = draft.items[0].model_copy(
+                    update={
+                        "key": "implement-revised-request",
+                        "title": "Implement the revised request",
+                    }
+                )
+                return DecompositionDraft(items=(revised,))
+            if schema is RelationDraft and payload.get("relation_draft"):
+                return RelationDraft.model_validate(payload["relation_draft"])
+            if schema is DecompositionCritique:
+                self.critique_calls += 1
+                if self.critique_calls == 1:
+                    return DecompositionCritique(
+                        acceptable=False,
+                        findings=("Split the implementation into a narrower story.",),
+                    )
+                assert stage == "critique_decomposition"
+                assert payload["critique"]["findings"] == [
+                    "Split the implementation into a narrower story."
+                ]
+            return await super().generate(stage, schema, payload)
+
+    model = RejectThenAcceptCritic()
+    service, _, _, _ = make_service(model=model)
+    app = create_app(service, internal_token=INTERNAL_TOKEN)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        started = await client.post(
+            "/v1/plans",
+            json=start_payload(
+                idea_id=71,
+                description="Choose? a material platform architecture.",
+            ),
+        )
+        pending = started.json()
+        assert pending["status"] == "needs_input"
+        resumed = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json={
+                "event": {
+                    "idempotency_key": "resume:critique-repair:0001",
+                    "trace_id": str(uuid4()),
+                },
+                "interrupt_id": pending["interrupt"]["interrupt_id"],
+                "comment_id": 9071,
+                "comment_created_at": after_timestamp(
+                    pending["interrupt"]["created_at"]
+                ),
+                "answer": "Use option 1.",
+            },
+        )
+        artifacts = await client.get(
+            f"/v1/plans/{pending['thread_id']}/artifacts"
+        )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "artifacts_ready"
+    assert model.critique_calls == 2
+    backlog = next(
+        artifact["content"]
+        for artifact in artifacts.json()["artifacts"]
+        if artifact["path"] == "backlog.yaml"
+    )
+    assert "key: implement-revised-request" in backlog
+    assert "key: implement-request\n" not in backlog
+
+
+@pytest.mark.asyncio
+async def test_resume_returns_typed_failure_when_critique_repair_is_rejected() -> None:
+    class AlwaysRejectingCritic(DeterministicPlanningModel):
+        critique_calls = 0
+
+        async def generate(self, stage, schema, payload):
+            if schema is DecompositionCritique:
+                self.critique_calls += 1
+                return DecompositionCritique(
+                    acceptable=False,
+                    findings=("The proposed stories remain overbroad.",),
+                )
+            return await super().generate(stage, schema, payload)
+
+    model = AlwaysRejectingCritic()
+    service, _, _, _ = make_service(model=model)
+    app = create_app(service, internal_token=INTERNAL_TOKEN)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        started = await client.post(
+            "/v1/plans",
+            json=start_payload(
+                idea_id=72,
+                description="Choose? a material platform architecture.",
+            ),
+        )
+        pending = started.json()
+        resumed = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json={
+                "event": {
+                    "idempotency_key": "resume:critique-rejected:0001",
+                    "trace_id": str(uuid4()),
+                },
+                "interrupt_id": pending["interrupt"]["interrupt_id"],
+                "comment_id": 9072,
+                "comment_created_at": after_timestamp(
+                    pending["interrupt"]["created_at"]
+                ),
+                "answer": "Use option 1.",
+            },
+        )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "failed"
+    assert model.critique_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_resume_continues_from_checkpointed_critique_repair() -> None:
+    class FailFinalCritiqueOnce(DeterministicPlanningModel):
+        critique_calls = 0
+        revision_calls = 0
+        relation_calls = 0
+
+        async def generate(self, stage, schema, payload):
+            if schema is DecompositionDraft and stage == "revise_decomposition":
+                self.revision_calls += 1
+            if schema is RelationDraft:
+                self.relation_calls += 1
+            if schema is DecompositionCritique:
+                self.critique_calls += 1
+                if self.critique_calls == 1:
+                    return DecompositionCritique(
+                        acceptable=False,
+                        findings=("Revise the story boundary.",),
+                    )
+                if self.critique_calls == 2:
+                    raise RuntimeError("final critique timed out")
+            return await super().generate(stage, schema, payload)
+
+    model = FailFinalCritiqueOnce()
+    repository = InMemoryIdempotencyRepository()
+    service, saver, _, _ = make_service(idempotency=repository, model=model)
+    app = create_app(service, internal_token=INTERNAL_TOKEN)
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        started = await client.post(
+            "/v1/plans",
+            json=start_payload(
+                idea_id=73,
+                description="Choose? a material platform architecture.",
+            ),
+        )
+        pending = started.json()
+        resume = {
+            "event": {
+                "idempotency_key": "resume:critique-checkpoint:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending["interrupt"]["interrupt_id"],
+            "comment_id": 9073,
+            "comment_created_at": after_timestamp(
+                pending["interrupt"]["created_at"]
+            ),
+            "answer": "Use option 1.",
+        }
+        failed = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json=resume,
+        )
+
+    assert failed.status_code == 500
+    repository.expire_for_test(resume["event"]["idempotency_key"])
+    restarted, _, _, _ = make_service(
+        checkpointer=saver,
+        idempotency=repository,
+        model=model,
+    )
+    restarted_app = create_app(restarted, internal_token=INTERNAL_TOKEN)
+    async with AsyncClient(
+        transport=ASGITransport(app=restarted_app),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        recovered = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json=resume,
+        )
+
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "artifacts_ready"
+    assert model.critique_calls == 3
+    assert model.revision_calls == 1
+    assert model.relation_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_shared_checkpointer_survives_service_restart() -> None:
     service, saver, repository, _ = make_service()
     request = StartPlanRequest.model_validate(
@@ -692,8 +907,10 @@ async def test_independent_critic_rejects_overbroad_story() -> None:
             return await super().generate(stage, schema, payload)
 
     service, _, _, _ = make_service(model=OverbroadCritic())
-    with pytest.raises(ValueError, match="overbroad"):
-        await service.start(StartPlanRequest.model_validate(start_payload(idea_id=56)))
+    response, _ = await service.start(
+        StartPlanRequest.model_validate(start_payload(idea_id=56))
+    )
+    assert response.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -874,7 +1091,7 @@ async def test_persisted_questions_are_sanitized_before_interrupt() -> None:
 
 
 @pytest.mark.asyncio
-async def test_critic_findings_and_checkpointed_errors_are_sanitized() -> None:
+async def test_critic_findings_and_terminal_failure_are_sanitized() -> None:
     secret = "token=critic-visible-secret"
 
     class PersistedFindingModel(DeterministicPlanningModel):
@@ -902,9 +1119,8 @@ async def test_critic_findings_and_checkpointed_errors_are_sanitized() -> None:
 
     failed_service, _, _, failed_graph = make_service(model=FailedFindingModel())
     request = StartPlanRequest.model_validate(start_payload(idea_id=63))
-    with pytest.raises(ValueError) as raised:
-        await failed_service.start(request)
-    assert secret not in str(raised.value)
+    failed, _ = await failed_service.start(request)
+    assert failed.status == "failed"
     failed_snapshot = await failed_graph.aget_state(
         {"configurable": {"thread_id": "openproject:63:planning:1"}}
     )
