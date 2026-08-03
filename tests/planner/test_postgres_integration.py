@@ -373,6 +373,118 @@ async def test_postgres_claim_conflict_expiry_recovery_and_token_fencing() -> No
 @pytest.mark.postgres
 @pytest.mark.asyncio
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+async def test_postgres_terminal_resume_abandonment_is_a_durable_tombstone() -> None:
+    assert DATABASE_URL is not None
+    await migrate(DATABASE_URL)
+    pool = postgres_pool(DATABASE_URL)
+    await pool.open()
+    key = f"postgres:abandon:{uuid4().hex}"
+    fresh_key = f"postgres:fresh:{uuid4().hex}"
+    thread_id = f"openproject:{int(uuid4().hex[:8], 16)}:planning:1"
+    binding = ResumeBinding.model_validate(
+        {
+            "interrupt_id": "interrupt-terminal",
+            "comment_id": 88,
+            "comment_created_at": "2026-08-03T01:42:05Z",
+        }
+    )
+    try:
+        repository = PostgresIdempotencyRepository(pool)
+        claim = await repository.claim(
+            kind="resume",
+            key=key,
+            body_hash="a" * 64,
+            thread_id=thread_id,
+            resume_binding=binding,
+        )
+        assert isinstance(claim, IdempotencyClaim)
+        with pytest.raises(IdempotencyInProgress):
+            await repository.abandon_resume(
+                key=key,
+                thread_id=thread_id,
+                binding=binding,
+                operator="pilot-operator",
+                reason="terminal delivery",
+            )
+        async with pool.connection() as connection:
+            await connection.execute(
+                """
+                UPDATE planner_idempotency
+                SET lease_expires_at=now() - interval '1 second'
+                WHERE idempotency_key=%s
+                """,
+                (key,),
+            )
+        await repository.abandon_resume(
+            key=key,
+            thread_id=thread_id,
+            binding=binding,
+            operator="pilot-operator",
+            reason="terminal delivery",
+        )
+        with pytest.raises(IdempotencyConflict, match="attribution"):
+            await repository.abandon_resume(
+                key=key,
+                thread_id=thread_id,
+                binding=binding,
+                operator="different-operator",
+                reason="different reason",
+            )
+        await repository.abandon_resume(
+            key=key,
+            thread_id=thread_id,
+            binding=binding,
+            operator="pilot-operator",
+            reason="terminal delivery",
+        )
+        with pytest.raises(IdempotencyConflict, match="terminally abandoned"):
+            await repository.claim(
+                kind="resume",
+                key=key,
+                body_hash="a" * 64,
+                thread_id=thread_id,
+                resume_binding=binding,
+            )
+        fresh_binding = ResumeBinding.model_validate(
+            {
+                "interrupt_id": "interrupt-terminal",
+                "comment_id": 89,
+                "comment_created_at": "2026-08-03T01:43:05Z",
+            }
+        )
+        fresh = await repository.claim(
+            kind="resume",
+            key=fresh_key,
+            body_hash="b" * 64,
+            thread_id=thread_id,
+            resume_binding=fresh_binding,
+        )
+        assert isinstance(fresh, IdempotencyClaim)
+        async with pool.connection() as connection:
+            row = await (
+                await connection.execute(
+                    """
+                    SELECT state,claim_token,abandoned_at IS NOT NULL AS abandoned,
+                           abandoned_by,abandonment_reason
+                    FROM planner_idempotency WHERE idempotency_key=%s
+                    """,
+                    (key,),
+                )
+            ).fetchone()
+        assert row == {
+            "state": "abandoned",
+            "claim_token": "",
+            "abandoned": True,
+            "abandoned_by": "pilot-operator",
+            "abandonment_reason": "terminal delivery",
+        }
+    finally:
+        await pool.close()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
 async def test_postgres_v1_rows_migrate_to_completed_v2_replays() -> None:
     assert DATABASE_URL is not None
     schema = f"planner_test_{uuid4().hex}"
@@ -525,7 +637,7 @@ async def test_postgres_v1_rows_migrate_to_completed_v2_replays() -> None:
             id="wrong-planner-primary-key",
         ),
         pytest.param(
-            ("DELETE FROM planner_schema_migrations WHERE marker = 'planner-idempotency-v2'",),
+            ("DELETE FROM planner_schema_migrations WHERE marker = 'planner-idempotency-v3'",),
             id="missing-required-planner-marker",
         ),
     ),

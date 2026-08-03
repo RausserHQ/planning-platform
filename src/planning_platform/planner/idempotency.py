@@ -62,6 +62,16 @@ class IdempotencyRepository(Protocol):
 
     async def renew(self, claim: IdempotencyClaim) -> datetime: ...
 
+    async def abandon_resume(
+        self,
+        *,
+        key: str,
+        thread_id: str,
+        binding: ResumeBinding,
+        operator: str,
+        reason: str,
+    ) -> None: ...
+
     async def ready(self) -> bool: ...
 
 
@@ -70,10 +80,12 @@ class _MemoryRecord:
     kind: Literal["start", "resume"]
     body_hash: str
     thread_id: str
-    state: Literal["in_progress", "completed"]
+    state: Literal["in_progress", "completed", "abandoned"]
     token: str
     lease_expires_at: datetime
     response: dict[str, Any] | None = None
+    abandoned_by: str | None = None
+    abandonment_reason: str | None = None
 
 
 class InMemoryIdempotencyRepository:
@@ -110,6 +122,8 @@ class InMemoryIdempotencyRepository:
                 if existing.state == "completed":
                     assert existing.response is not None
                     return IdempotentReplay(existing.response)
+                if existing.state == "abandoned":
+                    raise IdempotencyConflict("idempotency claim was terminally abandoned")
                 if existing.lease_expires_at > now:
                     raise IdempotencyInProgress(existing.lease_expires_at)
                 token = secrets.token_hex(16)
@@ -174,6 +188,45 @@ class InMemoryIdempotencyRepository:
             record.lease_expires_at = self._clock() + self._lease
             return record.lease_expires_at
 
+    async def abandon_resume(
+        self,
+        *,
+        key: str,
+        thread_id: str,
+        binding: ResumeBinding,
+        operator: str,
+        reason: str,
+    ) -> None:
+        normalized_operator = operator.strip()
+        normalized_reason = reason.strip()
+        if not normalized_operator or not normalized_reason:
+            raise ValueError("terminal resume abandonment requires an operator and reason")
+        async with self._lock:
+            record = self._records.get(key)
+            if record is None or record.kind != "resume" or record.thread_id != thread_id:
+                raise IdempotencyConflict("resume claim does not match the requested thread")
+            existing = self._resume_bindings.get((thread_id, binding.comment_id))
+            if existing is None or existing[0] != record.body_hash or existing[1] != binding:
+                raise IdempotencyConflict("resume claim does not match the requested binding")
+            if record.state == "completed":
+                raise IdempotencyConflict("completed resume cannot be abandoned")
+            if record.state == "abandoned":
+                if (
+                    record.abandoned_by != normalized_operator
+                    or record.abandonment_reason != normalized_reason
+                ):
+                    raise IdempotencyConflict(
+                        "abandonment attribution conflicts with durable claim"
+                    )
+                return
+            if record.lease_expires_at > self._clock():
+                raise IdempotencyInProgress(record.lease_expires_at)
+            record.state = "abandoned"
+            record.token = ""
+            record.lease_expires_at = self._clock()
+            record.abandoned_by = normalized_operator
+            record.abandonment_reason = normalized_reason
+
     def expire_for_test(self, key: str) -> None:
         """Expire a lease without sleeping; intended for deterministic recovery tests."""
         self._records[key].lease_expires_at = self._clock() - timedelta(seconds=1)
@@ -192,7 +245,7 @@ class InMemoryIdempotencyRepository:
 
 
 class PostgresIdempotencyRepository:
-    MIGRATION_MARKER = "planner-idempotency-v2"
+    MIGRATION_MARKER = "planner-idempotency-v3"
     CHECKPOINT_MIGRATIONS = tuple(range(10))
     REQUIRED_COLUMN_SPECS: ClassVar[dict[tuple[str, str], tuple[int, str, bool, str | None]]] = {
         ("checkpoint_migrations", "v"): (1, "int4", False, None),
@@ -240,6 +293,9 @@ class PostgresIdempotencyRepository:
         ),
         ("planner_idempotency", "created_at"): (9, "timestamptz", False, "now()"),
         ("planner_idempotency", "updated_at"): (10, "timestamptz", False, "now()"),
+        ("planner_idempotency", "abandoned_at"): (11, "timestamptz", True, None),
+        ("planner_idempotency", "abandoned_by"): (12, "text", True, None),
+        ("planner_idempotency", "abandonment_reason"): (13, "text", True, None),
         ("planner_resume_bindings", "thread_id"): (1, "text", False, None),
         ("planner_resume_bindings", "comment_id"): (2, "int8", False, None),
         ("planner_resume_bindings", "request_sha256"): (3, "text", False, None),
@@ -298,7 +354,10 @@ class PostgresIdempotencyRepository:
                   claim_token text NOT NULL DEFAULT '',
                   lease_expires_at timestamptz NOT NULL DEFAULT now(),
                   created_at timestamptz NOT NULL DEFAULT now(),
-                  updated_at timestamptz NOT NULL DEFAULT now()
+                  updated_at timestamptz NOT NULL DEFAULT now(),
+                  abandoned_at timestamptz,
+                  abandoned_by text,
+                  abandonment_reason text
                 )
                 """
             )
@@ -335,6 +394,14 @@ class PostgresIdempotencyRepository:
                 """
                 ALTER TABLE planner_idempotency
                 ADD COLUMN IF NOT EXISTS updated_at timestamptz
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE planner_idempotency
+                  ADD COLUMN IF NOT EXISTS abandoned_at timestamptz,
+                  ADD COLUMN IF NOT EXISTS abandoned_by text,
+                  ADD COLUMN IF NOT EXISTS abandonment_reason text
                 """
             )
             await connection.execute(
@@ -397,7 +464,10 @@ class PostgresIdempotencyRepository:
               claim_token text NOT NULL DEFAULT '',
               lease_expires_at timestamptz NOT NULL DEFAULT now(),
               created_at timestamptz NOT NULL DEFAULT now(),
-              updated_at timestamptz NOT NULL DEFAULT now()
+              updated_at timestamptz NOT NULL DEFAULT now(),
+              abandoned_at timestamptz,
+              abandoned_by text,
+              abandonment_reason text
             )
             """
         )
@@ -405,10 +475,12 @@ class PostgresIdempotencyRepository:
             """
             INSERT INTO planner_idempotency_v2_layout(
               idempotency_key, operation_kind, request_sha256, thread_id,
-              response, state, claim_token, lease_expires_at, created_at, updated_at
+              response, state, claim_token, lease_expires_at, created_at, updated_at,
+              abandoned_at, abandoned_by, abandonment_reason
             )
             SELECT idempotency_key, operation_kind, request_sha256, thread_id,
-                   response, state, claim_token, lease_expires_at, created_at, updated_at
+                   response, state, claim_token, lease_expires_at, created_at, updated_at,
+                   abandoned_at, abandoned_by, abandonment_reason
             FROM planner_idempotency
             """
         )
@@ -445,6 +517,8 @@ class PostgresIdempotencyRepository:
                 _validate_row_identity(row, kind, body_hash, thread_id)
                 if _column(row, 3, "state") == "completed":
                     return IdempotentReplay(dict(_column(row, 6, "response")))
+                if _column(row, 3, "state") == "abandoned":
+                    raise IdempotencyConflict("idempotency claim was terminally abandoned")
                 lease_expires = _datetime_column(row, 5, "lease_expires_at")
                 if lease_expires > datetime.now(UTC):
                     raise IdempotencyInProgress(lease_expires)
@@ -575,6 +649,91 @@ class PostgresIdempotencyRepository:
             if row is None:
                 raise IdempotencyConflict("idempotency claim was lost during renewal")
             return _datetime_column(row, 0, "lease_expires_at")
+
+    async def abandon_resume(
+        self,
+        *,
+        key: str,
+        thread_id: str,
+        binding: ResumeBinding,
+        operator: str,
+        reason: str,
+    ) -> None:
+        normalized_operator = operator.strip()
+        normalized_reason = reason.strip()
+        if not normalized_operator or len(operator) > 255:
+            raise ValueError("terminal resume abandonment operator is required")
+        if not normalized_reason or len(reason) > 1_024:
+            raise ValueError("terminal resume abandonment reason is required")
+        async with self._pool.connection() as connection, connection.transaction():
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 1::bigint))",
+                (thread_id,),
+            )
+            cursor = await connection.execute(
+                """
+                SELECT operation_kind, request_sha256, thread_id, state,
+                       lease_expires_at, abandoned_by, abandonment_reason
+                FROM planner_idempotency
+                WHERE idempotency_key = %s
+                FOR UPDATE
+                """,
+                (key,),
+            )
+            row = await cursor.fetchone()
+            if (
+                row is None
+                or _column(row, 0, "operation_kind") != "resume"
+                or _column(row, 2, "thread_id") != thread_id
+            ):
+                raise IdempotencyConflict("resume claim does not match the requested thread")
+            cursor = await connection.execute(
+                """
+                SELECT request_sha256, interrupt_id, comment_created_at
+                FROM planner_resume_bindings
+                WHERE thread_id = %s AND comment_id = %s
+                """,
+                (thread_id, binding.comment_id),
+            )
+            resume_row = await cursor.fetchone()
+            if (
+                resume_row is None
+                or _column(resume_row, 0, "request_sha256")
+                != _column(row, 1, "request_sha256")
+                or _column(resume_row, 1, "interrupt_id") != binding.interrupt_id
+                or _column(resume_row, 2, "comment_created_at")
+                != binding.comment_created_at
+            ):
+                raise IdempotencyConflict("resume claim does not match the requested binding")
+            state = _column(row, 3, "state")
+            if state == "completed":
+                raise IdempotencyConflict("completed resume cannot be abandoned")
+            if state == "abandoned":
+                if (
+                    _column(row, 5, "abandoned_by") != normalized_operator
+                    or _column(row, 6, "abandonment_reason") != normalized_reason
+                ):
+                    raise IdempotencyConflict(
+                        "abandonment attribution conflicts with durable claim"
+                    )
+                return
+            lease_expires = _datetime_column(row, 4, "lease_expires_at")
+            if lease_expires > datetime.now(UTC):
+                raise IdempotencyInProgress(lease_expires)
+            cursor = await connection.execute(
+                """
+                UPDATE planner_idempotency
+                SET state = 'abandoned', response = NULL, claim_token = '',
+                    lease_expires_at = now(), updated_at = now(),
+                    abandoned_at = now(), abandoned_by = %s,
+                    abandonment_reason = %s
+                WHERE idempotency_key = %s AND state = 'in_progress'
+                RETURNING idempotency_key
+                """,
+                (normalized_operator, normalized_reason, key),
+            )
+            if await cursor.fetchone() is None:
+                raise IdempotencyConflict("resume claim could not be abandoned")
 
     async def _assert_resume_binding(
         self,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "planning-platform"
-version = "0.1.21"
+version = "0.1.22"
 description = "Open-source Idea-to-Tickets planning, publication, and reconciliation"
 readme = "README.md"
 license = { file = "LICENSE" }

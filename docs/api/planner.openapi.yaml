@@ -127,6 +127,35 @@ paths:
           description: Comment is stale, already bound, mismatched, or currently in progress
         "422":
           description: Thread ID, request, or date is invalid
+  /v1/plans/{thread_id}/abandon-terminal-resume:
+    post:
+      operationId: abandonTerminalResume
+      summary: Abandon an expired resume owned by one terminal delivery
+      security:
+        - InternalToken: []
+      parameters:
+        - $ref: "#/components/parameters/ThreadId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AbandonTerminalResumeRequest"
+      responses:
+        "200":
+          description: Exact pre-resume interrupt restored and old claim tombstoned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanResponse"
+        "401":
+          description: Internal authentication failed
+        "404":
+          description: Thread not found
+        "409":
+          description: Terminal resume cannot be safely abandoned
+        "422":
+          description: Thread ID or request is invalid
 components:
   securitySchemes:
     InternalToken:
@@ -595,6 +624,39 @@ components:
           type: string
           minLength: 1
           maxLength: 65536
+    AbandonTerminalResumeRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - idempotency_key
+        - interrupt_id
+        - comment_id
+        - comment_created_at
+        - operator
+        - reason
+      properties:
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 255
+        interrupt_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+        comment_id:
+          type: integer
+          minimum: 1
+        comment_created_at:
+          type: string
+          format: date-time
+        operator:
+          type: string
+          minLength: 1
+          maxLength: 255
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1024
     ArtifactManifestEntry:
       type: object
       additionalProperties: false

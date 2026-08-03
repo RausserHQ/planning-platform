@@ -8,6 +8,7 @@ import yaml  # type: ignore[import-untyped]
 from planning_platform.planner.api import create_app
 
 CORE_SCHEMAS = {
+    "AbandonTerminalResumeRequest",
     "AcceptanceCriterion",
     "AgentEligibility",
     "ArtifactBundle",

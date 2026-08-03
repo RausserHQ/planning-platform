@@ -29,6 +29,7 @@ from planning_platform.openproject_adapter import (
     OpenProjectPublicationError,
 )
 from planning_platform.planner.models import (
+    AbandonTerminalResumeRequest,
     IdeaSnapshot,
     OpenProjectSnapshotInput,
     PlannerEvent,
@@ -236,6 +237,120 @@ class LifecycleService:
         self._planning_thread_stale_after = planning_thread_stale_after
         self._publication_journal_factory = publication_journal_factory or (
             lambda: PostgresPublicationJournal(self._publication_database_url)
+        )
+
+    async def abandon_terminal_resume(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        thread_id: str,
+        idempotency_key: str,
+        operator: str,
+        reason: str,
+    ) -> LifecycleOutcome:
+        if not operator.strip() or len(operator) > 255:
+            raise LifecycleEventRejected("terminal resume abandonment operator is required")
+        if not reason.strip() or len(reason) > 1_024:
+            raise LifecycleEventRejected("terminal resume abandonment reason is required")
+        run = await run_sync_to_completion(self._store.get, plan_id, plan_version)
+        if run is None or run.thread_id != thread_id or run.state != "needs_input":
+            raise LifecycleEventRejected(
+                "terminal resume abandonment does not match a Needs Input lifecycle run"
+            )
+        delivery = await run_sync_to_completion(
+            self._store.terminal_delivery,
+            idempotency_key,
+        )
+        if (
+            delivery is None
+            or delivery.state != "dead_letter"
+            or delivery.lease_expires_at is not None
+            or delivery.claim_token is not None
+        ):
+            raise LifecycleEventRejected("resume delivery is not terminal and unfenced")
+        if run.pending_resume_ciphertext is None:
+            completed = await run_sync_to_completion(
+                self._store.completed_terminal_resume_abandonment,
+                plan_id=run.plan_id,
+                plan_version=run.plan_version,
+                thread_id=run.thread_id,
+                idempotency_key=idempotency_key,
+                operator=operator.strip(),
+                reason=reason.strip(),
+            )
+            if completed is None:
+                raise LifecycleEventRejected("lifecycle run has no pending resume to abandon")
+            response = await self._planner.get(run.thread_id)
+            if (
+                response.status != "needs_input"
+                or response.interrupt is None
+                or response.interrupt.interrupt_id != completed.interrupt_id
+                or response.artifact_manifest
+            ):
+                raise LifecycleEventRejected(
+                    "completed terminal resume abandonment no longer matches planner state"
+                )
+            return LifecycleOutcome(
+                action="terminal_resume_abandonment",
+                outcome="restored_interrupt",
+                plan_id=run.plan_id,
+                plan_version=run.plan_version,
+                work_package_id=run.idea_id,
+            )
+        try:
+            plaintext = self._recovery_cipher.open(
+                purpose="planner-resume",
+                binding=run.thread_id,
+                ciphertext=run.pending_resume_ciphertext,
+            )
+            pending = ResumePlanRequest.model_validate_json(plaintext)
+        except (RecoveryPayloadRejected, ValueError) as error:
+            raise LifecycleEventRejected(
+                "durable lifecycle run has an invalid pending resume"
+            ) from error
+        if pending.event.idempotency_key != idempotency_key:
+            raise LifecycleEventRejected(
+                "terminal delivery does not own the pending planner resume"
+            )
+
+        response = await self._planner.abandon_terminal_resume(
+            run.thread_id,
+            AbandonTerminalResumeRequest(
+                idempotency_key=idempotency_key,
+                interrupt_id=pending.interrupt_id,
+                comment_id=pending.comment_id,
+                comment_created_at=pending.comment_created_at,
+                operator=operator.strip(),
+                reason=reason.strip(),
+            ),
+        )
+        if (
+            response.thread_id != run.thread_id
+            or response.status != "needs_input"
+            or response.interrupt is None
+            or response.interrupt.interrupt_id != pending.interrupt_id
+            or response.artifact_manifest
+        ):
+            raise LifecycleEventRejected(
+                "planner did not restore the exact artifact-free interrupt"
+            )
+        await run_sync_to_completion(
+            self._store.complete_terminal_resume_abandonment,
+            run=run,
+            request_ciphertext=run.pending_resume_ciphertext,
+            idempotency_key=idempotency_key,
+            trace_id=str(pending.event.trace_id),
+            interrupt_id=pending.interrupt_id,
+            operator=operator.strip(),
+            reason=reason.strip(),
+        )
+        return LifecycleOutcome(
+            action="terminal_resume_abandonment",
+            outcome="restored_interrupt",
+            plan_id=run.plan_id,
+            plan_version=run.plan_version,
+            work_package_id=run.idea_id,
         )
 
     async def handle(self, event: EventEnvelope) -> LifecycleOutcome:

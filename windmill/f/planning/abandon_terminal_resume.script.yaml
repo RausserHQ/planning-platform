@@ -1,0 +1,36 @@
+summary: Abandon one terminal planner resume
+description: Restores the exact pre-resume interrupt and tombstones only the expired claim owned by one terminal dead-letter delivery. It never replays the delivery.
+kind: script
+lock: '!inline f/planning/abandon_terminal_resume.script.lock'
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    plan_id:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{2,63}$'
+    plan_version:
+      type: integer
+      minimum: 1
+    thread_id:
+      type: string
+      pattern: '^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$'
+    idempotency_key:
+      type: string
+      minLength: 8
+      maxLength: 255
+    operator:
+      type: string
+      minLength: 1
+      maxLength: 255
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 1024
+  required:
+    - plan_id
+    - plan_version
+    - thread_id
+    - idempotency_key
+    - operator
+    - reason

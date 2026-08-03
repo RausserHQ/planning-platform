@@ -28,7 +28,13 @@ from .model import (
     ChatOpenAIPlanningModel,
     validate_model_configuration,
 )
-from .models import ArtifactBundle, PlanResponse, ResumePlanRequest, StartPlanRequest
+from .models import (
+    AbandonTerminalResumeRequest,
+    ArtifactBundle,
+    PlanResponse,
+    ResumePlanRequest,
+    StartPlanRequest,
+)
 from .service import (
     ArtifactsNotReady,
     PlannerService,
@@ -276,6 +282,33 @@ def create_app(
         if not replayed:
             PLANS_RESUMED.inc()
         return result
+
+    @app.post(
+        "/v1/plans/{thread_id}/abandon-terminal-resume",
+        operation_id="abandonTerminalResume",
+        response_model=PlanResponse,
+        dependencies=[Depends(authenticate_internal)],
+        responses={
+            401: {"description": "Internal authentication failed"},
+            404: {"description": "Thread not found"},
+            409: {"description": "Terminal resume cannot be safely abandoned"},
+        },
+    )
+    async def abandon_terminal_resume(
+        body: AbandonTerminalResumeRequest,
+        request: Request,
+        thread_id: Annotated[str, Path(pattern=THREAD_PATTERN)],
+    ) -> PlanResponse | JSONResponse:
+        try:
+            return await planner(request).abandon_terminal_resume(thread_id, body)
+        except PlanNotFound:
+            return JSONResponse({"detail": "planning thread not found"}, status_code=404)
+        except ExecutionInProgress as error:
+            return execution_in_progress(error)
+        except IdempotencyInProgress as error:
+            return in_progress(error)
+        except (IdempotencyConflict, ResumeConflict) as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
 
     return app
 

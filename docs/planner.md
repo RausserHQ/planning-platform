@@ -56,12 +56,12 @@ PLANNER_DATABASE_URL=postgresql://... planning-planner-migrate
 
 The migration invokes LangGraph's `AsyncPostgresSaver.setup()` and creates the
 planner idempotency, resume-binding, and migration-marker tables. Readiness
-requires the planner v2 migration marker and the exact LangGraph checkpoint
+requires the planner v3 migration marker and the exact LangGraph checkpoint
 schema shipped by `langgraph-checkpoint-postgres` 3.1.1: the ordered migration
 set `v0..v9`, every column's order, PostgreSQL UDT type, nullability, and
 required default, plus the exact primary-key columns for all four checkpoint
 tables. The same exact attestation covers the three planner-owned migration,
-idempotency, and resume-binding tables and requires the planner v2 marker.
+idempotency, and resume-binding tables and requires the planner v3 marker.
 
 Idempotency uses short claim and finalize transactions. Model execution never
 runs inside a database transaction. A live claim is renewed at a fixed
@@ -74,6 +74,15 @@ A thread may have only one unfinished mutation: a different idempotency key
 fails closed, even after expiry, while only the owning key may recover.
 Cancellation stops and awaits graph execution before the execution connection
 is closed.
+
+An operator may abandon an expired resume only through the authenticated
+`POST /v1/plans/{thread_id}/abandon-terminal-resume` operation. The request is
+bound to the exact idempotency key, interrupt, comment, timestamp, operator,
+and reason. The operation refuses a live lease, completed resume, mismatched
+binding, terminal planner result, or any generated artifact. It tombstones the
+old idempotency key and forks a new latest checkpoint from the exact
+pre-resume interrupt; prior checkpoint history is retained. A later attempt to
+use the abandoned key always fails closed.
 
 Each pending interrupt stores its aware creation timestamp plus a concise
 model-derived explanation of why the answer changes the plan. A resume comment

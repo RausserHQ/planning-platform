@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal, cast
+from uuid import UUID
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -43,6 +44,20 @@ class PlanRun:
     approval_evidence_sha256: str | None = None
     backlog_blob_sha1: str | None = None
     backlog_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class TerminalDelivery:
+    idempotency_key: str
+    event_id: UUID
+    state: str
+    lease_expires_at: datetime | None
+    claim_token: UUID | None
+
+
+@dataclass(frozen=True)
+class CompletedTerminalResumeAbandonment:
+    interrupt_id: str
 
 
 @dataclass(frozen=True)
@@ -1100,6 +1115,191 @@ class PostgresLifecycleStore:
                 (plan_id, plan_version),
             ).fetchone()
         return None if row is None else self._restore(row)
+
+    def terminal_delivery(self, idempotency_key: str) -> TerminalDelivery | None:
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT idempotency_key,event_id,state,lease_expires_at,claim_token
+                FROM {self._SCHEMA}.delivery_deduplications
+                WHERE idempotency_key=%s
+                """,
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return TerminalDelivery(
+            idempotency_key=str(row[0]),
+            event_id=UUID(str(row[1])),
+            state=str(row[2]),
+            lease_expires_at=row[3] if isinstance(row[3], datetime) else None,
+            claim_token=None if row[4] is None else UUID(str(row[4])),
+        )
+
+    def completed_terminal_resume_abandonment(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        thread_id: str,
+        idempotency_key: str,
+        operator: str,
+        reason: str,
+    ) -> CompletedTerminalResumeAbandonment | None:
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT audit.details->>'interrupt_id'
+                FROM {self._SCHEMA}.plan_runs AS run
+                JOIN {self._SCHEMA}.delivery_deduplications AS delivery
+                  ON delivery.idempotency_key=%s
+                JOIN {self._SCHEMA}.audit AS audit
+                  ON audit.event_id=delivery.event_id
+                 AND audit.action='terminal_resume_abandonment'
+                 AND audit.outcome='restored_interrupt'
+                WHERE run.plan_id=%s AND run.plan_version=%s AND run.thread_id=%s
+                  AND run.state='needs_input'
+                  AND run.pending_resume_ciphertext IS NULL
+                  AND run.planning_commit IS NULL
+                  AND run.pull_request_number IS NULL
+                  AND run.pull_request_url IS NULL
+                  AND delivery.state='dead_letter'
+                  AND delivery.lease_expires_at IS NULL
+                  AND delivery.claim_token IS NULL
+                  AND audit.details->>'idempotency_key'=%s
+                  AND audit.details->>'plan_id'=%s
+                  AND audit.details->>'plan_version'=%s
+                  AND audit.details->>'thread_id'=%s
+                  AND audit.details->>'operator'=%s
+                  AND audit.details->>'reason'=%s
+                """,
+                (
+                    idempotency_key,
+                    plan_id,
+                    plan_version,
+                    thread_id,
+                    idempotency_key,
+                    plan_id,
+                    str(plan_version),
+                    thread_id,
+                    operator,
+                    reason,
+                ),
+            ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            return None
+        return CompletedTerminalResumeAbandonment(interrupt_id=row[0])
+
+    def complete_terminal_resume_abandonment(
+        self,
+        *,
+        run: PlanRun,
+        request_ciphertext: str,
+        idempotency_key: str,
+        trace_id: str,
+        interrupt_id: str,
+        operator: str,
+        reason: str,
+    ) -> PlanRun:
+        with psycopg.connect(self._database_url) as connection, connection.transaction():
+            delivery = connection.execute(
+                f"""
+                SELECT event_id,state,lease_expires_at,claim_token
+                FROM {self._SCHEMA}.delivery_deduplications
+                WHERE idempotency_key=%s
+                FOR UPDATE
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if (
+                delivery is None
+                or str(delivery[1]) != "dead_letter"
+                or delivery[2] is not None
+                or delivery[3] is not None
+            ):
+                raise LifecycleStoreMismatch(
+                    "terminal resume delivery is not dead-lettered and unfenced"
+                )
+            event_id = str(delivery[0])
+            row = connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.plan_runs
+                SET pending_resume_ciphertext=NULL, updated_at=now()
+                WHERE plan_id=%s AND plan_version=%s AND thread_id=%s
+                  AND state='needs_input'
+                  AND pending_resume_ciphertext=%s
+                  AND planning_commit IS NULL
+                  AND pull_request_number IS NULL
+                  AND pull_request_url IS NULL
+                  AND approved_commit IS NULL
+                  AND approval_evidence_sha256 IS NULL
+                  AND backlog_blob_sha1 IS NULL
+                  AND backlog_sha256 IS NULL
+                RETURNING {self._SELECT}
+                """,
+                (
+                    run.plan_id,
+                    run.plan_version,
+                    run.thread_id,
+                    request_ciphertext,
+                ),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    f"""
+                    SELECT {self._SELECT}
+                    FROM {self._SCHEMA}.plan_runs
+                    WHERE plan_id=%s AND plan_version=%s AND thread_id=%s
+                      AND state='needs_input'
+                      AND pending_resume_ciphertext IS NULL
+                    """,
+                    (run.plan_id, run.plan_version, run.thread_id),
+                ).fetchone()
+                audited = connection.execute(
+                    f"""
+                    SELECT 1 FROM {self._SCHEMA}.audit
+                    WHERE event_id=%s AND action='terminal_resume_abandonment'
+                      AND outcome='restored_interrupt'
+                      AND details->>'idempotency_key'=%s
+                      AND details->>'operator'=%s
+                      AND details->>'reason'=%s
+                      AND details->>'plan_id'=%s
+                      AND details->>'plan_version'=%s
+                      AND details->>'thread_id'=%s
+                      AND details->>'interrupt_id'=%s
+                    """,
+                    (
+                        event_id,
+                        idempotency_key,
+                        operator,
+                        reason,
+                        run.plan_id,
+                        str(run.plan_version),
+                        run.thread_id,
+                        interrupt_id,
+                    ),
+                ).fetchone()
+                if row is None or audited is None:
+                    raise LifecycleStoreMismatch(
+                        "terminal resume abandonment conflicts with durable lifecycle state"
+                    )
+            self.audit(
+                event_id=event_id,
+                trace_id=trace_id,
+                action="terminal_resume_abandonment",
+                outcome="restored_interrupt",
+                details={
+                    "idempotency_key": idempotency_key,
+                    "operator": operator,
+                    "reason": reason,
+                    "plan_id": run.plan_id,
+                    "plan_version": run.plan_version,
+                    "thread_id": run.thread_id,
+                    "interrupt_id": interrupt_id,
+                },
+                connection=connection,
+            )
+        return self._restore(row)
 
     def stale_thread_count(self, cutoff: datetime) -> int:
         """Count stale latest nonterminal planning threads without updating them."""

@@ -716,6 +716,111 @@ async def test_reclaimed_resume_continues_from_checkpointed_critique_repair() ->
 
 
 @pytest.mark.asyncio
+async def test_abandon_terminal_resume_restores_exact_interrupt_and_blocks_old_event() -> None:
+    class FailAfterConsumingResumeOnce(DeterministicPlanningModel):
+        failed = False
+
+        async def generate(self, stage, schema, payload):
+            if stage == "generate_architecture" and not self.failed:
+                self.failed = True
+                raise RuntimeError("planner dependency timed out")
+            return await super().generate(stage, schema, payload)
+
+    model = FailAfterConsumingResumeOnce()
+    repository = InMemoryIdempotencyRepository()
+    service, _, _, _ = make_service(idempotency=repository, model=model)
+    app = create_app(service, internal_token=INTERNAL_TOKEN)
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers=AUTH_HEADERS,
+    ) as client:
+        started = await client.post(
+            "/v1/plans",
+            json=start_payload(
+                idea_id=81,
+                description="Choose? a material platform architecture.",
+            ),
+        )
+        pending = started.json()
+        old_resume = {
+            "event": {
+                "idempotency_key": "resume:terminal-delivery:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending["interrupt"]["interrupt_id"],
+            "comment_id": 9081,
+            "comment_created_at": after_timestamp(
+                pending["interrupt"]["created_at"]
+            ),
+            "answer": "Use the old answer.",
+        }
+        failed = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json=old_resume,
+        )
+        assert failed.status_code == 500
+        repository.expire_for_test(old_resume["event"]["idempotency_key"])
+
+        corrected = await client.post(
+            f"/v1/plans/{pending['thread_id']}/abandon-terminal-resume",
+            json={
+                "idempotency_key": old_resume["event"]["idempotency_key"],
+                "interrupt_id": old_resume["interrupt_id"],
+                "comment_id": old_resume["comment_id"],
+                "comment_created_at": old_resume["comment_created_at"],
+                "operator": "pilot-operator",
+                "reason": "the owning delivery is terminal dead-letter",
+            },
+        )
+
+        assert corrected.status_code == 200
+        restored = corrected.json()
+        assert restored["status"] == "needs_input"
+        assert restored["interrupt"] == pending["interrupt"]
+        assert restored["artifact_manifest"] == []
+        conflicting_correction = await client.post(
+            f"/v1/plans/{pending['thread_id']}/abandon-terminal-resume",
+            json={
+                "idempotency_key": old_resume["event"]["idempotency_key"],
+                "interrupt_id": old_resume["interrupt_id"],
+                "comment_id": old_resume["comment_id"],
+                "comment_created_at": old_resume["comment_created_at"],
+                "operator": "different-operator",
+                "reason": "different reason",
+            },
+        )
+        assert conflicting_correction.status_code == 409
+        assert (
+            await client.post(
+                f"/v1/plans/{pending['thread_id']}/resume",
+                json=old_resume,
+            )
+        ).status_code == 409
+
+        fresh_resume = {
+            "event": {
+                "idempotency_key": "resume:fresh-delivery:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending["interrupt"]["interrupt_id"],
+            "comment_id": 9082,
+            "comment_created_at": after_timestamp(
+                old_resume["comment_created_at"],
+                seconds=1,
+            ),
+            "answer": "Use the fresh answer.",
+        }
+        resumed = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume",
+            json=fresh_resume,
+        )
+
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "artifacts_ready"
+
+
+@pytest.mark.asyncio
 async def test_shared_checkpointer_survives_service_restart() -> None:
     service, saver, repository, _ = make_service()
     request = StartPlanRequest.model_validate(
