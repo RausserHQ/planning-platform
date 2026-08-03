@@ -583,6 +583,21 @@ class LifecycleService:
             )
 
         latest = await run_sync_to_completion(self._store.latest_for_idea, idea_id)
+        if (
+            event.actor.kind == "service"
+            and latest is not None
+            and latest.state not in {"published", "failed"}
+        ):
+            start_request = self._recover_start_request(latest)
+            if start_request.event.idempotency_key != event.idempotency_key:
+                return await self._outcome(
+                    event,
+                    "ignore_service_status_echo",
+                    "ignored_active_run",
+                    plan_id=latest.plan_id,
+                    plan_version=latest.plan_version,
+                    work_package_id=idea_id,
+                )
         latest_published = (
             None
             if latest is None
@@ -605,17 +620,7 @@ class LifecycleService:
             try:
                 response = await self._planner.get(latest.thread_id)
             except PlannerThreadNotFound:
-                try:
-                    plaintext = self._recovery_cipher.open(
-                        purpose="planner-start",
-                        binding=latest.thread_id,
-                        ciphertext=latest.start_request_ciphertext,
-                    )
-                    request = StartPlanRequest.model_validate_json(plaintext)
-                except (RecoveryPayloadRejected, ValueError) as error:
-                    raise LifecycleEventRejected(
-                        "durable lifecycle run has no recoverable planner request"
-                    ) from error
+                request = self._recover_start_request(latest)
                 response = await self._planner.start(request)
             return await self._handle_planner_response(event, latest, response)
 
