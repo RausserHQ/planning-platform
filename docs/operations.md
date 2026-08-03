@@ -181,7 +181,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.19` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.20` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits

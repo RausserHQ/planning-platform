@@ -637,12 +637,12 @@ def test_recovery_payload_is_authenticated_bound_and_not_plaintext() -> None:
         )
 
 
-def _work_package_event():
+def _work_package_event(*, delivery_id: str = "crash-start"):
     now = datetime(2026, 7, 30, 19, 1, tzinfo=UTC)
     return envelope_for_delivery(
         event_type="openproject.work_package_changed",
         source="windmill",
-        delivery_id="crash-start",
+        delivery_id=delivery_id,
         occurred_at=now,
         received_at=now,
         actor=EventActor(kind="service", id="openproject"),
@@ -689,6 +689,35 @@ async def test_crash_after_run_insert_replays_the_exact_persisted_start_request(
     assert len(planner.starts) == 2
     assert planner.starts[0] == planner.starts[1]
     assert store.run is not None and store.run.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_service_authored_planning_status_echo_does_not_restart_active_run() -> None:
+    store = MemoryStore()
+    planner = CrashThenFailPlanner()
+    service = LifecycleService(
+        planner=planner,  # type: ignore[arg-type]
+        openproject=OpenProjectFake(),  # type: ignore[arg-type]
+        github=GitHubContextFake(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated"):
+        await service.handle(_work_package_event())
+    assert store.run is not None
+    active = replace(store.run, state="needs_input")
+    store.run = active
+
+    outcome = await service.handle(
+        _work_package_event(delivery_id="service-status-echo")
+    )
+
+    assert outcome.outcome == "ignored_active_run"
+    assert len(planner.starts) == 1
+    assert store.run == active
 
 
 class VersionedReplanStore(MemoryStore):
