@@ -361,6 +361,81 @@ def test_lifecycle_store_and_delivery_claim_are_concurrency_safe() -> None:
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_terminal_resume_abandonment_atomically_clears_and_audits_exact_delivery() -> None:
+    assert DATABASE_URL is not None
+    store = PostgresLifecycleStore(DATABASE_URL)
+    store.setup()
+    deduplicator = PostgresDeliveryDeduplicator(DATABASE_URL)
+    deduplicator.setup()
+    run = store.begin(_run(uuid4().hex))
+    run = store.set_state(run, "needs_input")
+    ciphertext = f"v1:{uuid4().hex}"
+    run = store.record_pending_resume(run, ciphertext)
+    event = _event(uuid4().hex)
+    claim = deduplicator.claim(event, now=datetime.now(UTC))
+    assert claim.claim_token is not None
+    deduplicator.dead_letter(
+        event,
+        claim_token=claim.claim_token,
+        reason="terminal test delivery",
+        now=datetime.now(UTC),
+    )
+
+    corrected = store.complete_terminal_resume_abandonment(
+        run=run,
+        request_ciphertext=ciphertext,
+        idempotency_key=event.idempotency_key,
+        trace_id=str(event.trace_id),
+        interrupt_id="interrupt-1",
+        operator="pilot-operator",
+        reason="terminal delivery cannot be replayed",
+    )
+    replayed = store.complete_terminal_resume_abandonment(
+        run=run,
+        request_ciphertext=ciphertext,
+        idempotency_key=event.idempotency_key,
+        trace_id=str(event.trace_id),
+        interrupt_id="interrupt-1",
+        operator="pilot-operator",
+        reason="terminal delivery cannot be replayed",
+    )
+
+    assert corrected.pending_resume_ciphertext is None
+    assert replayed == corrected
+    completed = store.completed_terminal_resume_abandonment(
+        plan_id=run.plan_id,
+        plan_version=run.plan_version,
+        thread_id=run.thread_id,
+        idempotency_key=event.idempotency_key,
+        operator="pilot-operator",
+        reason="terminal delivery cannot be replayed",
+    )
+    assert completed is not None and completed.interrupt_id == "interrupt-1"
+    assert (
+        store.completed_terminal_resume_abandonment(
+            plan_id=run.plan_id,
+            plan_version=run.plan_version,
+            thread_id=run.thread_id,
+            idempotency_key=event.idempotency_key,
+            operator="different-operator",
+            reason="different reason",
+        )
+        is None
+    )
+    assert store.terminal_delivery(event.idempotency_key) is not None
+    with psycopg.connect(DATABASE_URL) as connection:
+        audit_count = connection.execute(
+            """
+            SELECT count(*) FROM planning_lifecycle.audit
+            WHERE event_id=%s AND action='terminal_resume_abandonment'
+              AND outcome='restored_interrupt'
+            """,
+            (event.event_id,),
+        ).fetchone()
+    assert audit_count == (1,)
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
 def test_expired_delivery_owner_cannot_finalize_a_new_owner_claim() -> None:
     assert DATABASE_URL is not None
     deduplicator = PostgresDeliveryDeduplicator(

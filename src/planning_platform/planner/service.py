@@ -19,6 +19,7 @@ from .idempotency import (
     IdempotentReplay,
 )
 from .models import (
+    AbandonTerminalResumeRequest,
     ArtifactBundle,
     ArtifactContent,
     ArtifactManifestEntry,
@@ -171,6 +172,71 @@ class PlannerService:
             )
             await self._idempotency.finalize(claim, response.model_dump(mode="json"))
             return response, claim.recovered
+
+    async def abandon_terminal_resume(
+        self,
+        thread_id: str,
+        request: AbandonTerminalResumeRequest,
+    ) -> PlanResponse:
+        binding = ResumeBinding(
+            interrupt_id=request.interrupt_id,
+            comment_id=request.comment_id,
+            comment_created_at=request.comment_created_at,
+        )
+        expected = binding.model_dump(mode="json")
+        async with self._execution_guard.execution(thread_id) as graph:
+            state = await self._state(graph, thread_id)
+            pending = state.get("pending_interrupt")
+            if isinstance(pending, dict) and pending.get("interrupt_id") == request.interrupt_id:
+                await self._idempotency.abandon_resume(
+                    key=request.idempotency_key,
+                    thread_id=thread_id,
+                    binding=binding,
+                    operator=request.operator,
+                    reason=request.reason,
+                )
+                return self._response_from_state(thread_id, state)
+            if state.get("consumed_resume") != expected:
+                raise ResumeConflict("thread did not consume the requested resume binding")
+            if state.get("artifact_manifest") or state.get("artifacts"):
+                raise ResumeConflict("resume produced artifacts and cannot be abandoned")
+            if state.get("status") in {"artifacts_ready", "failed"}:
+                raise ResumeConflict("terminal planner state cannot be abandoned")
+
+            target = None
+            config = {"configurable": {"thread_id": thread_id}}
+            async for snapshot in graph.aget_state_history(config):
+                candidate = snapshot.values.get("pending_interrupt")
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("interrupt_id") == request.interrupt_id
+                    and not snapshot.values.get("consumed_resume")
+                ):
+                    target = snapshot
+                    break
+            if target is None:
+                raise ResumeConflict("pre-resume interrupt checkpoint was not found")
+
+            await self._idempotency.abandon_resume(
+                key=request.idempotency_key,
+                thread_id=thread_id,
+                binding=binding,
+                operator=request.operator,
+                reason=request.reason,
+            )
+            await graph.aupdate_state(
+                target.config,
+                dict(target.values),
+                as_node="identify_consequential_questions",
+            )
+            restored = await self._state(graph, thread_id)
+            restored_pending = restored.get("pending_interrupt")
+            if (
+                not isinstance(restored_pending, dict)
+                or restored_pending.get("interrupt_id") != request.interrupt_id
+            ):
+                raise RuntimeError("terminal resume abandonment did not restore the interrupt")
+            return self._response_from_state(thread_id, restored)
 
     def _validate_resume_state(
         self,

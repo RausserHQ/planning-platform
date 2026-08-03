@@ -107,6 +107,16 @@ outcome. Do not use this flow to approve, publish, or repair a plan.
   operator identity, and a written reason. Recovery is audited and rotates the
   claim token. A failed recovery atomically returns the delivery to
   `dead_letter`, so a later authorized attempt remains possible.
+- When a terminal comment delivery left `pending_resume_ciphertext` and an
+  expired planner claim after consuming the interrupt, use the operator-only
+  `abandon_terminal_resume` Windmill script. Supply the exact plan, thread,
+  planner idempotency key, operator, and reason. The operation never accepts or
+  replays an event payload. It proceeds only when the delivery is dead-lettered
+  and unfenced, the sealed request belongs to that delivery, the planner has no
+  artifact result, and the exact pre-resume interrupt checkpoint exists. It
+  tombstones the old planner claim, restores that interrupt through the
+  application graph, and atomically clears and audits only the matching
+  lifecycle crash marker. Repeating the operation is idempotent.
 - Publication conflicts move the Idea to `Blocked`, post the exact safe
   conflict, and perform no overwrite. Regenerate against a fresh snapshot.
 - The v5 publication migration fails closed when a fully applied pre-target
@@ -181,7 +191,7 @@ validation.
 
 ## Image release
 
-Only the exact `v0.1.21` Git tag starts the image workflow. The workflow builds
+Only the exact `v0.1.22` Git tag starts the image workflow. The workflow builds
 runtime dependencies from the committed `uv.lock` with hash enforcement,
 extends the official Windmill CE image pinned to its exact linux/amd64 digest,
 verifies its version, source revision, and CE build identity, emits

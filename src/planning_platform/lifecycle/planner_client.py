@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from planning_platform.planner.models import (
+    AbandonTerminalResumeRequest,
     ArtifactBundle,
     PlanResponse,
     ResumePlanRequest,
@@ -61,12 +62,28 @@ class PlannerClient:
             await self._request("POST", f"/v1/plans/{thread_id}/resume", request)
         )
 
+    async def abandon_terminal_resume(
+        self,
+        thread_id: str,
+        request: AbandonTerminalResumeRequest,
+    ) -> PlanResponse:
+        return PlanResponse.model_validate(
+            await self._request(
+                "POST",
+                f"/v1/plans/{thread_id}/abandon-terminal-resume",
+                request,
+            )
+        )
+
     async def artifacts(self, thread_id: str) -> ArtifactBundle:
         response = await self._request("GET", f"/v1/plans/{thread_id}/artifacts")
         return ArtifactBundle.model_validate(response)
 
     async def _request(
-        self, method: str, path: str, body: StartPlanRequest | ResumePlanRequest | None = None
+        self,
+        method: str,
+        path: str,
+        body: StartPlanRequest | ResumePlanRequest | AbandonTerminalResumeRequest | None = None,
     ) -> dict[str, Any]:
         response = await self._client.request(
             method,

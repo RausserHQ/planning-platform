@@ -14,12 +14,16 @@ from typing import Any
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from psycopg import pq
 
-EXPECTED_SCRIPT_COUNT = 12
-EXPECTED_ASYNC_BACKED_COUNT = 7
+EXPECTED_SCRIPT_COUNT = 13
+EXPECTED_ASYNC_BACKED_COUNT = 8
 REQUIRED_ARGUMENTS: dict[str, Any] = {
     "event": {},
+    "idempotency_key": "event:openproject:terminal:12345678",
     "operator": "release-smoke-test",
+    "plan_id": "idea-41",
+    "plan_version": 1,
     "reason": "verify synchronous Windmill entrypoint",
+    "thread_id": "openproject:41:planning:1",
 }
 
 

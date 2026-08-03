@@ -148,6 +148,15 @@ class ResumePlanRequest(StrictModel):
         return self
 
 
+class AbandonTerminalResumeRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=255)
+    interrupt_id: str = Field(min_length=1, max_length=255)
+    comment_id: int = Field(ge=1)
+    comment_created_at: AwareDatetime
+    operator: str = Field(min_length=1, max_length=255)
+    reason: str = Field(min_length=1, max_length=1_024)
+
+
 class ArtifactManifestEntry(StrictModel):
     path: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

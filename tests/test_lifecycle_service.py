@@ -1319,6 +1319,168 @@ async def test_service_comment_cannot_replay_a_pending_human_resume() -> None:
     assert store.run.pending_resume_ciphertext == ciphertext
 
 
+@pytest.mark.asyncio
+async def test_terminal_delivery_abandonment_clears_only_matching_pending_resume() -> None:
+    pending_request = ResumePlanRequest.model_validate(
+        {
+            "event": {
+                "idempotency_key": "event:openproject:terminal:12345678",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": "interrupt-1",
+            "comment_id": 88,
+            "comment_created_at": "2026-08-03T01:42:05Z",
+            "answer": "Do not expose this answer in correction output.",
+        }
+    )
+    ciphertext = _cipher().seal(
+        purpose="planner-resume",
+        binding="openproject:41:planning:1",
+        plaintext=pending_request.model_dump_json(),
+    )
+    run = PlanRun(
+        idea_id=41,
+        plan_id="idea-41",
+        plan_version=1,
+        thread_id="openproject:41:planning:1",
+        repository="RausserHQ/planning-platform",
+        base_branch="a" * 40,
+        artifact_prefix="planning/idea-41/v1",
+        backlog_path="planning/idea-41/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag='"snapshot-1"',
+        state="needs_input",
+        pending_resume_ciphertext=ciphertext,
+    )
+
+    class CorrectionStore(MemoryStore):
+        def terminal_delivery(self, idempotency_key: str):
+            if idempotency_key != pending_request.event.idempotency_key:
+                return None
+            return SimpleNamespace(
+                idempotency_key=idempotency_key,
+                event_id=uuid4(),
+                state="dead_letter",
+                lease_expires_at=None,
+                claim_token=None,
+            )
+
+        def complete_terminal_resume_abandonment(self, **values: Any) -> PlanRun:
+            assert values["run"] == self.run
+            assert values["request_ciphertext"] == ciphertext
+            assert values["idempotency_key"] == pending_request.event.idempotency_key
+            assert values["operator"] == "pilot-operator"
+            assert values["reason"] == "terminal delivery cannot be replayed"
+            assert self.run is not None
+            self.run = replace(self.run, pending_resume_ciphertext=None)
+            self.audit_rows.append(("terminal_resume_abandonment", "restored_interrupt"))
+            return self.run
+
+        def completed_terminal_resume_abandonment(self, **values: Any):
+            if (
+                self.run is not None
+                and self.run.pending_resume_ciphertext is None
+                and values["idempotency_key"] == pending_request.event.idempotency_key
+                and values["operator"] == "pilot-operator"
+                and values["reason"] == "terminal delivery cannot be replayed"
+            ):
+                return SimpleNamespace(interrupt_id=pending_request.interrupt_id)
+            return None
+
+    def restored_response() -> PlanResponse:
+        return PlanResponse.model_validate(
+            {
+                "thread_id": run.thread_id,
+                "status": "needs_input",
+                "trace_id": str(pending_request.event.trace_id),
+                "interrupt": {
+                    "interrupt_id": pending_request.interrupt_id,
+                    "questions": ["Choose the bounded implementation option."],
+                    "impact": "The answer changes the implementation boundary.",
+                    "created_at": "2026-08-02T02:50:19Z",
+                },
+                "artifact_manifest": [],
+            }
+        )
+
+    class CorrectionPlanner:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def abandon_terminal_resume(self, thread_id: str, request: Any) -> PlanResponse:
+            self.requests.append(request)
+            assert thread_id == run.thread_id
+            return restored_response()
+
+        async def get(self, thread_id: str) -> PlanResponse:
+            assert thread_id == run.thread_id
+            return restored_response()
+
+    store = CorrectionStore(run)
+    planner = CorrectionPlanner()
+    service = LifecycleService(
+        planner=planner,  # type: ignore[arg-type]
+        openproject=OpenProjectFake(),  # type: ignore[arg-type]
+        github=object(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+
+    with pytest.raises(LifecycleEventRejected, match="terminal and unfenced"):
+        await service.abandon_terminal_resume(
+            plan_id="idea-41",
+            plan_version=1,
+            thread_id="openproject:41:planning:1",
+            idempotency_key="event:openproject:unrelated:12345678",
+            operator="pilot-operator",
+            reason="terminal delivery cannot be replayed",
+        )
+    assert planner.requests == []
+
+    outcome = await service.abandon_terminal_resume(
+        plan_id="idea-41",
+        plan_version=1,
+        thread_id="openproject:41:planning:1",
+        idempotency_key=pending_request.event.idempotency_key,
+        operator="pilot-operator",
+        reason="terminal delivery cannot be replayed",
+    )
+
+    assert outcome.outcome == "restored_interrupt"
+    assert outcome.plan_id == "idea-41"
+    assert len(planner.requests) == 1
+    assert planner.requests[0].comment_id == 88
+    assert not hasattr(planner.requests[0], "answer")
+    assert store.run is not None
+    assert store.run.state == "needs_input"
+    assert store.run.pending_resume_ciphertext is None
+    assert store.audit_rows[-1] == (
+        "terminal_resume_abandonment",
+        "restored_interrupt",
+    )
+    replayed = await service.abandon_terminal_resume(
+        plan_id="idea-41",
+        plan_version=1,
+        thread_id="openproject:41:planning:1",
+        idempotency_key=pending_request.event.idempotency_key,
+        operator="pilot-operator",
+        reason="terminal delivery cannot be replayed",
+    )
+    assert replayed == outcome
+    assert len(planner.requests) == 1
+    with pytest.raises(LifecycleEventRejected, match="no pending resume"):
+        await service.abandon_terminal_resume(
+            plan_id="idea-41",
+            plan_version=1,
+            thread_id="openproject:41:planning:1",
+            idempotency_key=pending_request.event.idempotency_key,
+            operator="different-operator",
+            reason="different reason",
+        )
+
+
 def _implementation_pr_event(
     *,
     delivery: str,
