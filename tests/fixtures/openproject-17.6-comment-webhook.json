@@ -1,0 +1,29 @@
+{
+  "action": "work_package_comment:comment",
+  "activity": {
+    "_type": "Activity::Comment",
+    "id": 901,
+    "comment": {
+      "format": "markdown",
+      "raw": "Use the selected bounded option.",
+      "html": "<p>Use the selected bounded option.</p>"
+    },
+    "details": [],
+    "version": 7,
+    "internal": false,
+    "createdAt": "2026-07-30T18:59:00Z",
+    "updatedAt": "2026-07-30T18:59:00Z",
+    "_links": {
+      "self": {
+        "href": "/api/v3/activities/901"
+      },
+      "workPackage": {
+        "href": "/api/v3/work_packages/42",
+        "title": "Sanitized planning idea"
+      },
+      "user": {
+        "href": "/api/v3/users/8"
+      }
+    }
+  }
+}

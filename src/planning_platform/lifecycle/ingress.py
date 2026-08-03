@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Collection
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +17,13 @@ from .models import (
     envelope_for_delivery,
 )
 from .webhooks import WebhookRejected, verified_webhook_envelope
+
+OPENPROJECT_COMMENT_ACTIONS = frozenset(
+    {"work_package_comment:comment", "work_package_comment:internal_comment"}
+)
+OPENPROJECT_WORK_PACKAGE_ACTIONS = frozenset(
+    {"work_package:created", "work_package:updated"}
+)
 
 
 def _timestamp(value: object, label: str) -> datetime:
@@ -51,6 +59,49 @@ def _raw_event(event: dict[str, Any]) -> tuple[bytes, dict[str, str], dict[str, 
     if body is not None and body != parsed:
         raise WebhookRejected("Windmill parsed body differs from the signed raw body")
     return raw.encode("utf-8"), headers, parsed
+
+
+def _openproject_linked_id(
+    resource: dict[str, Any], relation: str, collection: str
+) -> int:
+    links = resource.get("_links")
+    link = links.get(relation) if isinstance(links, dict) else None
+    href = link.get("href") if isinstance(link, dict) else None
+    match = (
+        re.fullmatch(rf"/api/v3/{re.escape(collection)}/([1-9][0-9]*)/?", href)
+        if isinstance(href, str)
+        else None
+    )
+    if match is None:
+        raise WebhookRejected(f"OpenProject {relation} link is absent or malformed")
+    return int(match.group(1))
+
+
+def _openproject_actor_id(
+    payload: dict[str, Any], resource: dict[str, Any], *, is_comment: bool
+) -> str:
+    actor = payload.get("actor")
+    actor_value = actor.get("id") if isinstance(actor, dict) else None
+    top_level_actor_id = (
+        str(actor_value)
+        if (
+            (type(actor_value) is int and actor_value > 0)
+            or (
+                isinstance(actor_value, str)
+                and re.fullmatch(r"[1-9][0-9]*", actor_value) is not None
+            )
+        )
+        else None
+    )
+    if not is_comment:
+        if top_level_actor_id is None:
+            raise WebhookRejected("OpenProject webhook actor identity is absent")
+        return top_level_actor_id
+
+    linked_actor_id = str(_openproject_linked_id(resource, "user", "users"))
+    if top_level_actor_id is not None and top_level_actor_id != linked_actor_id:
+        raise WebhookRejected("OpenProject comment actor identities disagree")
+    return linked_actor_id
 
 
 def github_envelope(
@@ -111,30 +162,33 @@ def openproject_envelope(
     action = payload.get("action")
     if not isinstance(action, str):
         raise WebhookRejected("OpenProject webhook action is absent")
-    is_comment = action.startswith("work_package_comment:")
-    key = "work_package_comment" if is_comment else "work_package"
+    if action in OPENPROJECT_COMMENT_ACTIONS:
+        is_comment = True
+        key = "activity"
+    elif action in OPENPROJECT_WORK_PACKAGE_ACTIONS:
+        is_comment = False
+        key = "work_package"
+    else:
+        raise WebhookRejected("unsupported OpenProject webhook event")
     resource = payload.get(key)
     if not isinstance(resource, dict):
         raise WebhookRejected("OpenProject webhook resource is absent")
+    expected_type = "Activity::Comment" if is_comment else "WorkPackage"
+    if resource.get("_type") != expected_type:
+        raise WebhookRejected("OpenProject webhook resource type is invalid")
+    if is_comment and resource.get("internal") is not action.endswith(":internal_comment"):
+        raise WebhookRejected("OpenProject comment visibility does not match its action")
     occurred = _timestamp(
         resource.get("updatedAt") or resource.get("createdAt"),
         "OpenProject resource timestamp",
     )
     delivery = headers.get("x-openproject-delivery") or hashlib.sha256(raw).hexdigest()
-    actor = payload.get("actor")
-    actor_value = actor.get("id") if isinstance(actor, dict) else None
-    if not isinstance(actor_value, (int, str)) or not str(actor_value):
-        raise WebhookRejected("OpenProject webhook actor identity is absent")
-    actor_id = str(actor_value)
+    actor_id = _openproject_actor_id(payload, resource, is_comment=is_comment)
     idea_id: int | None = None
     if not is_comment and type(resource.get("id")) is int:
         idea_id = resource["id"]
     if is_comment:
-        links = resource.get("_links")
-        work_package = links.get("workPackage") if isinstance(links, dict) else None
-        href = work_package.get("href") if isinstance(work_package, dict) else None
-        if isinstance(href, str) and href.rstrip("/").rsplit("/", 1)[-1].isdigit():
-            idea_id = int(href.rstrip("/").rsplit("/", 1)[-1])
+        idea_id = _openproject_linked_id(resource, "workPackage", "work_packages")
     return verified_webhook_envelope(
         source="openproject",
         event_type=(

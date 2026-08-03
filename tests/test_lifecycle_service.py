@@ -1193,7 +1193,7 @@ async def test_crash_after_resume_replays_the_persisted_idempotent_resume() -> N
         subject=EventSubject(idea_id=42),
         signature=VerifiedSignature(verified=True, algorithm="internal"),
         payload={
-            "work_package_comment": {
+            "activity": {
                 "id": 19,
                 "createdAt": "2026-07-30T19:00:00Z",
                 "comment": {"raw": "Use the bounded migration."},
@@ -1266,7 +1266,7 @@ async def test_service_comment_cannot_replay_a_pending_human_resume() -> None:
         subject=EventSubject(idea_id=42),
         signature=VerifiedSignature(verified=True, algorithm="internal"),
         payload={
-            "work_package_comment": {
+            "activity": {
                 "id": 20,
                 "createdAt": "2026-07-30T19:01:00Z",
                 "comment": {
