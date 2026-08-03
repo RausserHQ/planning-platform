@@ -56,6 +56,7 @@ class PlannerState(TypedDict, total=False):
     decomposition: dict[str, Any]
     relation_draft: dict[str, Any]
     critique: dict[str, Any]
+    critique_attempts: int
     backlog: dict[str, Any]
     artifacts: dict[str, str]
     artifact_manifest: list[dict[str, Any]]
@@ -119,6 +120,7 @@ def _model_payload(state: PlannerState) -> dict[str, Any]:
         "requirements_draft": state.get("requirements_draft", {}),
         "decomposition": state.get("decomposition", {}),
         "relation_draft": state.get("relation_draft", {}),
+        "critique": state.get("critique", {}),
         "replan": state.get("replan"),
     }
 
@@ -264,10 +266,26 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
             "critique_decomposition", DecompositionCritique, _model_payload(state)
         )
         critique = cast(dict[str, Any], _sanitize_value(result.model_dump(mode="json")))
-        if not critique["acceptable"]:
-            findings = tuple(str(finding) for finding in critique["findings"])
-            raise ValueError(f"decomposition critique failed: {findings}")
-        return {"critique": critique}
+        if critique["acceptable"]:
+            return {"critique": critique}
+        attempts = int(state.get("critique_attempts", 0)) + 1
+        return {
+            "critique": critique,
+            "critique_attempts": attempts,
+            **({"status": "failed"} if attempts >= 2 else {}),
+        }
+
+    async def revise_decomposition(state: PlannerState) -> dict[str, Any]:
+        revised = await model.generate(
+            "revise_decomposition", DecompositionDraft, _model_payload(state)
+        )
+        decomposition = cast(
+            dict[str, Any], _sanitize_value(revised.model_dump(mode="json"))
+        )
+        return {
+            "decomposition": decomposition,
+            "relation_draft": {},
+        }
 
     async def validate_backlog(state: PlannerState) -> dict[str, Any]:
         declared_requirements = set(state["requirements_draft"]["requirements"])
@@ -360,8 +378,26 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
     )
     for name, function in stages:
         builder.add_node(name, function)
+    builder.add_node("revise_decomposition", revise_decomposition)
     builder.add_edge(START, stages[0][0])
     for (source, _), (target, _) in pairwise(stages):
-        builder.add_edge(source, target)
+        if source != "critique_decomposition":
+            builder.add_edge(source, target)
+    builder.add_conditional_edges(
+        "critique_decomposition",
+        lambda state: (
+            "failed"
+            if state.get("status") == "failed"
+            else "accepted"
+            if state.get("critique", {}).get("acceptable")
+            else "revise"
+        ),
+        {
+            "failed": END,
+            "accepted": "validate_backlog",
+            "revise": "revise_decomposition",
+        },
+    )
+    builder.add_edge("revise_decomposition", "infer_typed_relations")
     builder.add_edge(stages[-1][0], END)
     return builder.compile(checkpointer=checkpointer)

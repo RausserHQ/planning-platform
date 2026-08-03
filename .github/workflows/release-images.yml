@@ -3,7 +3,7 @@ name: Build planning platform images
 on:
   push:
     tags:
-      - v0.1.20
+      - v0.1.21
 
 permissions:
   contents: read
@@ -18,7 +18,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   PLANNER_IMAGE: ghcr.io/rausserhq/planning-platform/planner
-  PLANNER_TAG: v0.1.20
+  PLANNER_TAG: v0.1.21
   WINDMILL_IMAGE: ghcr.io/rausserhq/planning-platform/windmill
   WINDMILL_TAG: v1.775.2-planning.21
   WINDMILL_BASE: ghcr.io/windmill-labs/windmill:1.775.2@sha256:ef39329523f4806e5cd5169ffa7af2618f39439bcf659115e8bb804c592d7132
@@ -51,7 +51,7 @@ jobs:
           push: true
           tags: ${{ env.PLANNER_IMAGE }}:${{ env.PLANNER_TAG }}
           build-args: |
-            PLANNING_PLATFORM_VERSION=0.1.20
+            PLANNING_PLATFORM_VERSION=0.1.21
           provenance: mode=max
           sbom: true
           cache-from: type=gha,scope=planning-platform-planner
@@ -136,7 +136,7 @@ jobs:
           tags: ${{ env.WINDMILL_IMAGE }}:${{ env.WINDMILL_TAG }}
           build-args: |
             WINDMILL_BASE=${{ env.WINDMILL_BASE }}
-            PLANNING_PLATFORM_VERSION=0.1.20
+            PLANNING_PLATFORM_VERSION=0.1.21
             NPM_VERSION=11.19.0
           provenance: mode=max
           sbom: true
@@ -162,7 +162,7 @@ jobs:
           docker pull --platform linux/amd64 "${image}"
           test "$(docker image inspect --format '{{.Config.User}}' "${image}")" = "1000:1000"
           docker run --rm --platform linux/amd64 --entrypoint python3 "${image}" -c \
-            'from importlib.metadata import version; from pathlib import Path; root = Path("/opt/planning-platform-workspace"); files = [path for path in root.rglob("*") if path.is_file()]; assert version("planning-platform") == "0.1.20"; assert len(files) == 58; assert (root / "wmill.yaml").is_file(); assert (root / "f/planning/github_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/openproject_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/alertmanager_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/nightly_reconciliation.schedule.yaml").is_file(); assert (root / "f/planning/convergence_check.flow/flow.yaml").is_file(); assert (root / "f/planning/replan_affected_subgraph.flow/flow.yaml").is_file(); assert (root / "f/planning/replan_event.py").is_file(); assert (root / "f/planning/replan_affected_subgraph.py").is_file()'
+            'from importlib.metadata import version; from pathlib import Path; root = Path("/opt/planning-platform-workspace"); files = [path for path in root.rglob("*") if path.is_file()]; assert version("planning-platform") == "0.1.21"; assert len(files) == 58; assert (root / "wmill.yaml").is_file(); assert (root / "f/planning/github_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/openproject_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/alertmanager_webhook.http_trigger.yaml").is_file(); assert (root / "f/planning/nightly_reconciliation.schedule.yaml").is_file(); assert (root / "f/planning/convergence_check.flow/flow.yaml").is_file(); assert (root / "f/planning/replan_affected_subgraph.flow/flow.yaml").is_file(); assert (root / "f/planning/replan_event.py").is_file(); assert (root / "f/planning/replan_affected_subgraph.py").is_file()'
           docker run --rm --platform linux/amd64 \
             --mount "type=bind,src=${GITHUB_WORKSPACE}/tests/verify_windmill_entrypoints.py,dst=/tmp/verify_windmill_entrypoints.py,readonly" \
             --entrypoint sh "${image}" -ec \
