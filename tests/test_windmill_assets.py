@@ -83,6 +83,21 @@ def test_windmill_workspace_has_every_versioned_flow_and_executable_script() -> 
             assert "return asyncio.run(_main_async(" in source_text, source
 
 
+def test_failed_critique_correction_preserves_the_exact_resume_timestamp() -> None:
+    metadata = _document(
+        PLANNING / "convert_failed_critique_to_interrupt.script.yaml"
+    )
+    timestamp = metadata["schema"]["properties"]["comment_created_at"]
+
+    assert timestamp == {
+        "type": "string",
+        "pattern": (
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+        ),
+    }
+
+
 def test_flow_modules_resolve_and_retries_use_supported_bounded_shape() -> None:
     for path in PLANNING.glob("*.flow/flow.yaml"):
         flow = _document(path)
