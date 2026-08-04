@@ -31,6 +31,7 @@ from .model import (
 from .models import (
     AbandonTerminalResumeRequest,
     ArtifactBundle,
+    ConvertFailedCritiqueRequest,
     PlanResponse,
     ResumePlanRequest,
     StartPlanRequest,
@@ -308,6 +309,33 @@ def create_app(
         except IdempotencyInProgress as error:
             return in_progress(error)
         except (IdempotencyConflict, ResumeConflict) as error:
+            return JSONResponse({"detail": str(error)}, status_code=409)
+
+    @app.post(
+        "/v1/plans/{thread_id}/convert-failed-critique-to-interrupt",
+        operation_id="convertFailedCritiqueToInterrupt",
+        response_model=PlanResponse,
+        dependencies=[Depends(authenticate_internal)],
+        responses={
+            401: {"description": "Internal authentication failed"},
+            404: {"description": "Thread not found"},
+            409: {"description": "Failed critique cannot be safely corrected"},
+        },
+    )
+    async def convert_failed_critique_to_interrupt(
+        body: ConvertFailedCritiqueRequest,
+        request: Request,
+        thread_id: Annotated[str, Path(pattern=THREAD_PATTERN)],
+    ) -> PlanResponse | JSONResponse:
+        try:
+            return await planner(request).convert_failed_critique_to_interrupt(
+                thread_id, body
+            )
+        except PlanNotFound:
+            return JSONResponse({"detail": "planning thread not found"}, status_code=404)
+        except ExecutionInProgress as error:
+            return execution_in_progress(error)
+        except (IdempotencyConflict, ResumeConflict, ValueError) as error:
             return JSONResponse({"detail": str(error)}, status_code=409)
 
     return app

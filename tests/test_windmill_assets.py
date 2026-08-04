@@ -27,6 +27,7 @@ REQUIRED_FLOWS = {
 }
 ASYNC_BACKED_SCRIPTS = {
     "abandon_terminal_resume",
+    "convert_failed_critique_to_interrupt",
     "convergence_check",
     "dead_letter",
     "lifecycle_job",
@@ -237,7 +238,7 @@ def test_release_image_contains_the_complete_workspace_snapshot() -> None:
         for path in ROOT.rglob("*")
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
     )
-    assert len(workspace_files) == 61
+    assert len(workspace_files) == 64
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text().splitlines()
     assert "!windmill/" in dockerignore

@@ -10,6 +10,7 @@ import httpx
 from planning_platform.planner.models import (
     AbandonTerminalResumeRequest,
     ArtifactBundle,
+    ConvertFailedCritiqueRequest,
     PlanResponse,
     ResumePlanRequest,
     StartPlanRequest,
@@ -79,11 +80,28 @@ class PlannerClient:
         response = await self._request("GET", f"/v1/plans/{thread_id}/artifacts")
         return ArtifactBundle.model_validate(response)
 
+    async def convert_failed_critique_to_interrupt(
+        self, thread_id: str, request: ConvertFailedCritiqueRequest
+    ) -> PlanResponse:
+        return PlanResponse.model_validate(
+            await self._request(
+                "POST",
+                f"/v1/plans/{thread_id}/convert-failed-critique-to-interrupt",
+                request,
+            )
+        )
+
     async def _request(
         self,
         method: str,
         path: str,
-        body: StartPlanRequest | ResumePlanRequest | AbandonTerminalResumeRequest | None = None,
+        body: (
+            StartPlanRequest
+            | ResumePlanRequest
+            | AbandonTerminalResumeRequest
+            | ConvertFailedCritiqueRequest
+            | None
+        ) = None,
     ) -> dict[str, Any]:
         response = await self._client.request(
             method,

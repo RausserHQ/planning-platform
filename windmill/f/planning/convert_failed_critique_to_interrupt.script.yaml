@@ -1,0 +1,49 @@
+summary: Convert one failed decomposition critique to human input
+description: Corrects one exact artifact-free exhausted critique using its completed resume binding. It never accepts an answer or replays the old delivery.
+kind: script
+lock: '!inline f/planning/convert_failed_critique_to_interrupt.script.lock'
+schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  properties:
+    plan_id:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{2,63}$'
+    plan_version:
+      type: integer
+      minimum: 1
+    thread_id:
+      type: string
+      pattern: '^openproject:[1-9][0-9]*:planning:[1-9][0-9]*$'
+    idempotency_key:
+      type: string
+      minLength: 8
+      maxLength: 255
+    interrupt_id:
+      type: string
+      minLength: 1
+      maxLength: 255
+    comment_id:
+      type: integer
+      minimum: 1
+    comment_created_at:
+      type: string
+      format: date-time
+    operator:
+      type: string
+      minLength: 1
+      maxLength: 255
+    reason:
+      type: string
+      minLength: 1
+      maxLength: 1024
+  required:
+    - plan_id
+    - plan_version
+    - thread_id
+    - idempotency_key
+    - interrupt_id
+    - comment_id
+    - comment_created_at
+    - operator
+    - reason

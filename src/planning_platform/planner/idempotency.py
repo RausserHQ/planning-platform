@@ -72,6 +72,10 @@ class IdempotencyRepository(Protocol):
         reason: str,
     ) -> None: ...
 
+    async def completed_resume_matches(
+        self, *, key: str, thread_id: str, binding: ResumeBinding
+    ) -> bool: ...
+
     async def ready(self) -> bool: ...
 
 
@@ -226,6 +230,22 @@ class InMemoryIdempotencyRepository:
             record.lease_expires_at = self._clock()
             record.abandoned_by = normalized_operator
             record.abandonment_reason = normalized_reason
+
+    async def completed_resume_matches(
+        self, *, key: str, thread_id: str, binding: ResumeBinding
+    ) -> bool:
+        async with self._lock:
+            record = self._records.get(key)
+            existing = self._resume_bindings.get((thread_id, binding.comment_id))
+            return bool(
+                record is not None
+                and record.kind == "resume"
+                and record.thread_id == thread_id
+                and record.state == "completed"
+                and existing is not None
+                and existing[0] == record.body_hash
+                and existing[1] == binding
+            )
 
     def expire_for_test(self, key: str) -> None:
         """Expire a lease without sleeping; intended for deterministic recovery tests."""
@@ -734,6 +754,35 @@ class PostgresIdempotencyRepository:
             )
             if await cursor.fetchone() is None:
                 raise IdempotencyConflict("resume claim could not be abandoned")
+
+    async def completed_resume_matches(
+        self, *, key: str, thread_id: str, binding: ResumeBinding
+    ) -> bool:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT 1
+                FROM planner_idempotency AS claim
+                JOIN planner_resume_bindings AS binding
+                  ON binding.thread_id=claim.thread_id
+                 AND binding.request_sha256=claim.request_sha256
+                WHERE claim.idempotency_key=%s
+                  AND claim.operation_kind='resume'
+                  AND claim.thread_id=%s
+                  AND claim.state='completed'
+                  AND binding.interrupt_id=%s
+                  AND binding.comment_id=%s
+                  AND binding.comment_created_at=%s
+                """,
+                (
+                    key,
+                    thread_id,
+                    binding.interrupt_id,
+                    binding.comment_id,
+                    binding.comment_created_at,
+                ),
+            )
+            return await cursor.fetchone() is not None
 
     async def _assert_resume_binding(
         self,

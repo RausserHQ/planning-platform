@@ -14,11 +14,14 @@ from typing import Any
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from psycopg import pq
 
-EXPECTED_SCRIPT_COUNT = 13
-EXPECTED_ASYNC_BACKED_COUNT = 8
+EXPECTED_SCRIPT_COUNT = 14
+EXPECTED_ASYNC_BACKED_COUNT = 9
 REQUIRED_ARGUMENTS: dict[str, Any] = {
     "event": {},
+    "comment_created_at": "2026-08-03T01:42:05Z",
+    "comment_id": 101,
     "idempotency_key": "event:openproject:terminal:12345678",
+    "interrupt_id": "996c7d3c03c759c3431427ec",
     "operator": "release-smoke-test",
     "plan_id": "idea-41",
     "plan_version": 1,

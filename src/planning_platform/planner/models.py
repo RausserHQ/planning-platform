@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +12,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from planning_platform.models import BacklogItem, BacklogPlan, StableNodeKey
 
 MAX_PLANNER_REQUEST_BYTES = 4 * 1024 * 1024
+MAX_INTERRUPT_ITEMS = 16
+InterruptText = Annotated[str, Field(min_length=1, max_length=2_048)]
 
 
 class StrictModel(BaseModel):
@@ -157,6 +159,21 @@ class AbandonTerminalResumeRequest(StrictModel):
     reason: str = Field(min_length=1, max_length=1_024)
 
 
+class ConvertFailedCritiqueRequest(StrictModel):
+    idempotency_key: str = Field(min_length=8, max_length=255)
+    interrupt_id: str = Field(min_length=1, max_length=255)
+    comment_id: int = Field(ge=1)
+    comment_created_at: AwareDatetime
+    operator: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,254}$")
+    reason: str = Field(min_length=1, max_length=1_024)
+
+    @model_validator(mode="after")
+    def reason_is_plain_text(self) -> ConvertFailedCritiqueRequest:
+        if any(value in self.reason for value in ("\r", "\n", "{", "}")):
+            raise ValueError("critique correction reason must be bounded plain text")
+        return self
+
+
 class ArtifactManifestEntry(StrictModel):
     path: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -165,7 +182,7 @@ class ArtifactManifestEntry(StrictModel):
 
 class PendingInterrupt(StrictModel):
     interrupt_id: str
-    questions: tuple[str, ...]
+    questions: tuple[InterruptText, ...] = Field(max_length=MAX_INTERRUPT_ITEMS)
     impact: str = Field(min_length=1, max_length=1_024)
     created_at: AwareDatetime
 
@@ -203,7 +220,7 @@ class CompactSpecification(StrictModel):
 
 
 class ConsequentialQuestions(StrictModel):
-    questions: tuple[str, ...] = ()
+    questions: tuple[InterruptText, ...] = Field(default=(), max_length=MAX_INTERRUPT_ITEMS)
     impact: str = Field(max_length=1_024)
 
 
@@ -228,7 +245,7 @@ class RelationDraft(StrictModel):
 
 class DecompositionCritique(StrictModel):
     acceptable: bool
-    findings: tuple[str, ...] = ()
+    findings: tuple[InterruptText, ...] = Field(default=(), max_length=MAX_INTERRUPT_ITEMS)
 
 
 class ResumeBinding(StrictModel):

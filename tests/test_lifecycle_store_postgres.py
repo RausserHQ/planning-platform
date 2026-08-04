@@ -208,9 +208,7 @@ def test_implementation_pr_mapping_is_immutable_monotonic_and_head_bound() -> No
     assert store.by_implementation_pull_request(repository, number) == bindings[0]
 
     with pytest.raises(LifecycleStoreMismatch, match="identity"):
-        store.bind_implementation_pull_request(
-            **{**values, "node_key": "retargeted-node"}
-        )
+        store.bind_implementation_pull_request(**{**values, "node_key": "retargeted-node"})
     assert (
         store.record_implementation_check_result(
             repository,
@@ -433,6 +431,92 @@ def test_terminal_resume_abandonment_atomically_clears_and_audits_exact_delivery
             (event.event_id,),
         ).fetchone()
     assert audit_count == (1,)
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
+def test_failed_critique_correction_is_exact_atomic_and_idempotent() -> None:
+    assert DATABASE_URL is not None
+    store = PostgresLifecycleStore(DATABASE_URL)
+    store.setup()
+    deduplicator = PostgresDeliveryDeduplicator(DATABASE_URL)
+    deduplicator.setup()
+    run = store.set_state(store.begin(_run(uuid4().hex)), "failed")
+    first_lock = store.acquire_critique_correction_lock(run.plan_id, run.plan_version)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        waiting = executor.submit(
+            store.acquire_critique_correction_lock,
+            run.plan_id,
+            run.plan_version,
+        )
+        time.sleep(0.05)
+        assert not waiting.done()
+        first_lock.release()
+        second_lock = waiting.result(timeout=1)
+    second_lock.release()
+    event = _event(uuid4().hex)
+    claim = deduplicator.claim(event, now=datetime.now(UTC))
+    assert claim.claim_token is not None
+    deduplicator.complete(
+        event,
+        claim_token=claim.claim_token,
+        now=datetime.now(UTC),
+    )
+    created_at = datetime.now(UTC)
+    values = {
+        "run": run,
+        "idempotency_key": event.idempotency_key,
+        "interrupt_id": "original-interrupt",
+        "comment_id": 101,
+        "comment_created_at": created_at,
+        "new_interrupt_id": "critique-corrected",
+        "operator": "pilot-operator",
+        "reason": "convert the exact exhausted critique",
+    }
+
+    corrected = store.complete_critique_correction(**values)
+    replayed = store.complete_critique_correction(**values)
+
+    assert corrected.state == "needs_input"
+    assert replayed == corrected
+    completed = store.completed_critique_correction(
+        plan_id=run.plan_id,
+        plan_version=run.plan_version,
+        thread_id=run.thread_id,
+        idempotency_key=event.idempotency_key,
+        interrupt_id="original-interrupt",
+        comment_id=101,
+        comment_created_at=created_at,
+        operator="pilot-operator",
+        reason="convert the exact exhausted critique",
+    )
+    assert completed is not None and completed.interrupt_id == "critique-corrected"
+    assert (
+        store.completed_critique_correction(
+            plan_id=run.plan_id,
+            plan_version=run.plan_version,
+            thread_id=run.thread_id,
+            idempotency_key=event.idempotency_key,
+            interrupt_id="original-interrupt",
+            comment_id=999,
+            comment_created_at=created_at,
+            operator="pilot-operator",
+            reason="convert the exact exhausted critique",
+        )
+        is None
+    )
+    delivery = store.terminal_delivery(event.idempotency_key)
+    assert delivery is not None and delivery.state == "completed"
+    with psycopg.connect(DATABASE_URL) as connection:
+        audit = connection.execute(
+            """
+            SELECT count(*), min(details->>'new_interrupt_id')
+            FROM planning_lifecycle.audit
+            WHERE event_id=%s AND action='failed_critique_correction'
+              AND outcome='needs_input'
+            """,
+            (event.event_id,),
+        ).fetchone()
+    assert audit == (1, "critique-corrected")
 
 
 @pytest.mark.skipif(not DATABASE_URL, reason="PLANNER_TEST_DATABASE_URL is not set")
