@@ -28,8 +28,10 @@ from planning_platform.openproject_adapter import (
     OpenProjectPublicationAdapter,
     OpenProjectPublicationError,
 )
+from planning_platform.planner.graph import sanitize_checkpoint_text
 from planning_platform.planner.models import (
     AbandonTerminalResumeRequest,
+    ConvertFailedCritiqueRequest,
     IdeaSnapshot,
     OpenProjectSnapshotInput,
     PlannerEvent,
@@ -53,7 +55,7 @@ from planning_platform.publisher import (
 from planning_platform.replan import effective_node_binding, validate_replan_candidate
 from planning_platform.validation import validate_plan
 
-from .concurrency import run_sync_to_completion
+from .concurrency import acquire_sync_owned, run_sync_to_completion
 from .planner_client import PlannerClient, PlannerThreadNotFound
 from .recovery import RecoveryCipher, RecoveryPayloadRejected
 from .store import (
@@ -73,15 +75,9 @@ _RELEVANT_REPOSITORIES_HEADING = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
-_MARKDOWN_FENCE = re.compile(
-    r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$"
-)
-_MARKDOWN_LIST_PREFIX = re.compile(
-    r"^(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)"
-)
-_MARKDOWN_CODE_SPAN = re.compile(
-    r"^(?P<fence>`+)(?P<value>.+)(?P=fence)$"
-)
+_MARKDOWN_FENCE = re.compile(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$")
+_MARKDOWN_LIST_PREFIX = re.compile(r"^(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)")
+_MARKDOWN_CODE_SPAN = re.compile(r"^(?P<fence>`+)(?P<value>.+)(?P=fence)$")
 _MARKDOWN_LINK = re.compile(
     r"^\[[^\]\r\n]+\]\([ \t]*"
     r"(?:<(?P<angle>https://github\.com/[^>\s]+)>|"
@@ -353,6 +349,178 @@ class LifecycleService:
             work_package_id=run.idea_id,
         )
 
+    async def convert_failed_critique_to_interrupt(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        thread_id: str,
+        idempotency_key: str,
+        interrupt_id: str,
+        comment_id: int,
+        comment_created_at: datetime,
+        operator: str,
+        reason: str,
+    ) -> LifecycleOutcome:
+        normalized_operator = operator.strip()
+        raw_reason = reason.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,254}", normalized_operator):
+            raise LifecycleEventRejected("critique correction operator is invalid")
+        if not raw_reason or len(raw_reason) > 1_024:
+            raise LifecycleEventRejected("critique correction reason is required")
+        normalized_reason = sanitize_checkpoint_text(raw_reason, limit=1_024)
+        correction_lock = await acquire_sync_owned(
+            self._store.acquire_critique_correction_lock,
+            lambda lock: lock.release(),
+            plan_id,
+            plan_version,
+        )
+        try:
+            return await self._convert_failed_critique_to_interrupt_locked(
+                plan_id=plan_id,
+                plan_version=plan_version,
+                thread_id=thread_id,
+                idempotency_key=idempotency_key,
+                interrupt_id=interrupt_id,
+                comment_id=comment_id,
+                comment_created_at=comment_created_at,
+                operator=normalized_operator,
+                reason=normalized_reason,
+            )
+        finally:
+            await run_sync_to_completion(correction_lock.release)
+
+    async def _convert_failed_critique_to_interrupt_locked(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        thread_id: str,
+        idempotency_key: str,
+        interrupt_id: str,
+        comment_id: int,
+        comment_created_at: datetime,
+        operator: str,
+        reason: str,
+    ) -> LifecycleOutcome:
+        run = await run_sync_to_completion(self._store.get, plan_id, plan_version)
+        if run is None or run.thread_id != thread_id:
+            raise LifecycleEventRejected("critique correction does not match the exact plan")
+        completed = await run_sync_to_completion(
+            self._store.completed_critique_correction,
+            plan_id=plan_id,
+            plan_version=plan_version,
+            thread_id=thread_id,
+            idempotency_key=idempotency_key,
+            interrupt_id=interrupt_id,
+            comment_id=comment_id,
+            comment_created_at=comment_created_at,
+            operator=operator,
+            reason=reason,
+        )
+        if completed is not None:
+            response = await self._planner.get(thread_id)
+            if (
+                response.status != "needs_input"
+                or response.interrupt is None
+                or response.interrupt.interrupt_id != completed.interrupt_id
+                or response.artifact_manifest
+            ):
+                raise LifecycleEventRejected(
+                    "completed critique correction no longer matches planner state"
+                )
+            await self._ensure_interrupt_side_effects(run, response)
+            return LifecycleOutcome(
+                action="failed_critique_correction",
+                outcome="needs_input",
+                plan_id=plan_id,
+                plan_version=plan_version,
+                work_package_id=run.idea_id,
+            )
+        if (
+            run.state != "failed"
+            or run.pending_resume_ciphertext is not None
+            or any(
+                value is not None
+                for value in (
+                    run.planning_commit,
+                    run.pull_request_number,
+                    run.pull_request_url,
+                    run.approved_commit,
+                    run.approval_evidence_sha256,
+                    run.backlog_blob_sha1,
+                    run.backlog_sha256,
+                )
+            )
+        ):
+            raise LifecycleEventRejected("lifecycle run is not an artifact-free failure")
+        delivery = await run_sync_to_completion(self._store.terminal_delivery, idempotency_key)
+        if (
+            delivery is None
+            or delivery.state != "completed"
+            or delivery.lease_expires_at is not None
+            or delivery.claim_token is not None
+        ):
+            raise LifecycleEventRejected("critique resume delivery is not completed")
+        response = await self._planner.convert_failed_critique_to_interrupt(
+            thread_id,
+            ConvertFailedCritiqueRequest(
+                idempotency_key=idempotency_key,
+                interrupt_id=interrupt_id,
+                comment_id=comment_id,
+                comment_created_at=comment_created_at,
+                operator=operator,
+                reason=reason,
+            ),
+        )
+        if (
+            response.thread_id != thread_id
+            or response.status != "needs_input"
+            or response.interrupt is None
+            or response.artifact_manifest
+        ):
+            raise LifecycleEventRejected("planner did not produce an artifact-free interrupt")
+        corrected = await run_sync_to_completion(
+            self._store.complete_critique_correction,
+            run=run,
+            idempotency_key=idempotency_key,
+            interrupt_id=interrupt_id,
+            comment_id=comment_id,
+            comment_created_at=comment_created_at,
+            new_interrupt_id=response.interrupt.interrupt_id,
+            operator=operator,
+            reason=reason,
+        )
+        await self._ensure_interrupt_side_effects(corrected, response)
+        return LifecycleOutcome(
+            action="failed_critique_correction",
+            outcome="needs_input",
+            plan_id=plan_id,
+            plan_version=plan_version,
+            work_package_id=run.idea_id,
+        )
+
+    async def _ensure_interrupt_side_effects(self, run: PlanRun, response: PlanResponse) -> None:
+        if response.interrupt is None:
+            raise LifecycleEventRejected("planner Needs Input result has no interrupt")
+        question = "\n".join(f"- {value}" for value in response.interrupt.questions)
+        body = (
+            "## Planning input required\n\n"
+            f"{question}\n\n"
+            f"**Why this affects the plan:** {response.interrupt.impact}"
+        )
+        await run_sync_to_completion(
+            self._openproject.ensure_comment,
+            run.idea_id,
+            body,
+            idempotency_key=f"interrupt:{run.thread_id}:{response.interrupt.interrupt_id}",
+        )
+        await run_sync_to_completion(
+            self._openproject.set_lifecycle_state,
+            run.idea_id,
+            status="Needs Input",
+        )
+
     async def handle(self, event: EventEnvelope) -> LifecycleOutcome:
         if not event.signature.verified:
             raise LifecycleEventRejected("lifecycle service requires a verified event")
@@ -511,9 +679,7 @@ class LifecycleService:
                 or latest.idea_id != base.idea_id
                 or latest.plan_version <= base.plan_version
             ):
-                raise LifecycleEventRejected(
-                    "partial replan has an invalid successor history"
-                )
+                raise LifecycleEventRejected("partial replan has an invalid successor history")
             previous = self._recover_replan_request(latest)
             expected_event = PlannerEvent(
                 idempotency_key=event.idempotency_key,
@@ -681,9 +847,7 @@ class LifecycleService:
     def _recover_replan_request(self, run: PlanRun) -> StartPlanRequest:
         request = self._recover_start_request(run)
         if request.replan is None:
-            raise LifecycleEventRejected(
-                "bounded replan successor has no partial-replan binding"
-            )
+            raise LifecycleEventRejected("bounded replan successor has no partial-replan binding")
         return request
 
     async def _work_package_changed(self, event: EventEnvelope) -> LifecycleOutcome:
@@ -920,23 +1084,7 @@ class LifecycleService:
         if response.status == "needs_input":
             if response.interrupt is None:
                 raise LifecycleEventRejected("planner Needs Input result has no interrupt")
-            question = "\n".join(f"- {value}" for value in response.interrupt.questions)
-            body = (
-                "## Planning input required\n\n"
-                f"{question}\n\n"
-                f"**Why this affects the plan:** {response.interrupt.impact}"
-            )
-            await run_sync_to_completion(
-                self._openproject.ensure_comment,
-                run.idea_id,
-                body,
-                idempotency_key=f"interrupt:{run.thread_id}:{response.interrupt.interrupt_id}",
-            )
-            await run_sync_to_completion(
-                self._openproject.set_lifecycle_state,
-                run.idea_id,
-                status="Needs Input",
-            )
+            await self._ensure_interrupt_side_effects(run, response)
             await run_sync_to_completion(self._store.set_state, run, "needs_input")
             return await self._outcome(
                 event,
@@ -1331,9 +1479,7 @@ class LifecycleService:
                 identity[0],
             )
             active_plan = None if active is None else await self._published_plan(active)
-            active_item = (
-                None if active_plan is None else active_plan.by_key.get(identity[1])
-            )
+            active_item = None if active_plan is None else active_plan.by_key.get(identity[1])
             expected_version = None
             expected_hash = None
             if (
@@ -1421,9 +1567,7 @@ class LifecycleService:
             blob_sha=run.backlog_blob_sha1,
             content_sha256=run.backlog_sha256,
         )
-        artifact = load_artifact_bytes(
-            await self._github.read_immutable_artifact(binding)
-        )
+        artifact = load_artifact_bytes(await self._github.read_immutable_artifact(binding))
         if (
             artifact.plan.plan.id != run.plan_id
             or artifact.plan.plan.version != run.plan_version
@@ -1902,10 +2046,7 @@ class LifecycleService:
         lines = _visible_markdown_lines(description)
         sections: list[str] = []
         for index, line in enumerate(lines):
-            if (
-                line is None
-                or _RELEVANT_REPOSITORIES_HEADING.fullmatch(line) is None
-            ):
+            if line is None or _RELEVANT_REPOSITORIES_HEADING.fullmatch(line) is None:
                 continue
             end = next(
                 (
@@ -1917,9 +2058,7 @@ class LifecycleService:
             )
             sections.append(
                 "\n".join(
-                    candidate
-                    for candidate in lines[index + 1 : end]
-                    if candidate is not None
+                    candidate for candidate in lines[index + 1 : end] if candidate is not None
                 )
             )
         if len(sections) != 1:

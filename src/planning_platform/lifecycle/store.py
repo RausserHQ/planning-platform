@@ -61,6 +61,23 @@ class CompletedTerminalResumeAbandonment:
 
 
 @dataclass(frozen=True)
+class CompletedCritiqueCorrection:
+    interrupt_id: str
+
+
+@dataclass
+class CritiqueCorrectionLock:
+    """Session-scoped PostgreSQL advisory lock for one correction's side effects."""
+
+    connection: psycopg.Connection[Any] | None
+
+    def release(self) -> None:
+        connection, self.connection = self.connection, None
+        if connection is not None:
+            connection.close()
+
+
+@dataclass(frozen=True)
 class ImplementationPrAssociation:
     repository: str
     pull_request_number: int
@@ -224,9 +241,7 @@ class PostgresLifecycleStore:
             ),
         }
     )
-    _REQUIRED_NAMED_CHECKS: ClassVar[
-        frozenset[tuple[str, str, tuple[str, ...], bool]]
-    ] = frozenset(
+    _REQUIRED_NAMED_CHECKS: ClassVar[frozenset[tuple[str, str, tuple[str, ...], bool]]] = frozenset(
         {
             (
                 "plan_runs",
@@ -308,9 +323,7 @@ class PostgresLifecycleStore:
             ),
         }
     )
-    _REQUIRED_NAMED_CHECK_DEFINITIONS: ClassVar[
-        dict[tuple[str, str], str]
-    ] = {
+    _REQUIRED_NAMED_CHECK_DEFINITIONS: ClassVar[dict[tuple[str, str], str]] = {
         (
             "plan_runs",
             "plan_runs_approval_evidence_sha256_format",
@@ -353,10 +366,7 @@ class PostgresLifecycleStore:
         (
             "implementation_pr_associations",
             "implementation_pr_merge_sha_format",
-        ): (
-            "CHECK (((merged_commit IS NULL) OR "
-            "(merged_commit ~ '^[0-9a-f]{40}$'::text)))"
-        ),
+        ): ("CHECK (((merged_commit IS NULL) OR (merged_commit ~ '^[0-9a-f]{40}$'::text)))"),
         (
             "implementation_pr_associations",
             "implementation_pr_success_sha_format",
@@ -367,17 +377,11 @@ class PostgresLifecycleStore:
         (
             "implementation_pr_associations",
             "implementation_pr_success_current_head",
-        ): (
-            "CHECK (((successful_check_sha IS NULL) OR "
-            "(successful_check_sha = head_sha)))"
-        ),
+        ): ("CHECK (((successful_check_sha IS NULL) OR (successful_check_sha = head_sha)))"),
         (
             "implementation_pr_associations",
             "implementation_pr_merge_is_closed",
-        ): (
-            "CHECK (((merged_commit IS NULL) OR "
-            "(pull_request_state = 'closed'::text)))"
-        ),
+        ): ("CHECK (((merged_commit IS NULL) OR (pull_request_state = 'closed'::text)))"),
     }
     _STATES = (
         "planning",
@@ -638,10 +642,7 @@ class PostgresLifecycleStore:
                 (
                     "implementation_pr_associations",
                     "implementation_pr_success_sha_format",
-                    (
-                        "successful_check_sha IS NULL OR "
-                        "successful_check_sha ~ '^[0-9a-f]{40}$'"
-                    ),
+                    ("successful_check_sha IS NULL OR successful_check_sha ~ '^[0-9a-f]{40}$'"),
                 ),
                 (
                     "implementation_pr_associations",
@@ -809,8 +810,7 @@ class PostgresLifecycleStore:
             for row in named_check_rows
         }
         named_check_definitions = {
-            (str(row[0]), str(row[1])): " ".join(str(row[4]).split())
-            for row in named_check_rows
+            (str(row[0]), str(row[1])): " ".join(str(row[4]).split()) for row in named_check_rows
         }
         indexes = {
             str(row[0]): (
@@ -1301,6 +1301,164 @@ class PostgresLifecycleStore:
             )
         return self._restore(row)
 
+    def acquire_critique_correction_lock(
+        self, plan_id: str, plan_version: int
+    ) -> CritiqueCorrectionLock:
+        if not plan_id or plan_version <= 0:
+            raise ValueError("critique correction plan identity is required")
+        connection = psycopg.connect(self._database_url, autocommit=True)
+        try:
+            connection.execute(
+                "SELECT pg_advisory_lock(hashtextextended(%s, 1176))",
+                (f"failed-critique-correction:{plan_id}:v{plan_version}",),
+            )
+        except BaseException:
+            connection.close()
+            raise
+        return CritiqueCorrectionLock(connection)
+
+    def completed_critique_correction(
+        self,
+        *,
+        plan_id: str,
+        plan_version: int,
+        thread_id: str,
+        idempotency_key: str,
+        interrupt_id: str,
+        comment_id: int,
+        comment_created_at: datetime,
+        operator: str,
+        reason: str,
+    ) -> CompletedCritiqueCorrection | None:
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                f"""
+                SELECT audit.details->>'new_interrupt_id'
+                FROM {self._SCHEMA}.plan_runs AS run
+                JOIN {self._SCHEMA}.delivery_deduplications AS delivery
+                  ON delivery.idempotency_key=%s
+                JOIN {self._SCHEMA}.audit AS audit
+                  ON audit.event_id=delivery.event_id
+                 AND audit.action='failed_critique_correction'
+                 AND audit.outcome='needs_input'
+                WHERE run.plan_id=%s AND run.plan_version=%s AND run.thread_id=%s
+                  AND run.state='needs_input'
+                  AND run.pending_resume_ciphertext IS NULL
+                  AND run.planning_commit IS NULL AND run.pull_request_number IS NULL
+                  AND run.pull_request_url IS NULL AND run.approved_commit IS NULL
+                  AND run.approval_evidence_sha256 IS NULL
+                  AND run.backlog_blob_sha1 IS NULL AND run.backlog_sha256 IS NULL
+                  AND delivery.state='completed'
+                  AND delivery.lease_expires_at IS NULL
+                  AND delivery.claim_token IS NULL
+                  AND audit.details @> %s
+                """,
+                (
+                    idempotency_key,
+                    plan_id,
+                    plan_version,
+                    thread_id,
+                    Jsonb(
+                        {
+                            "plan_id": plan_id,
+                            "plan_version": plan_version,
+                            "thread_id": thread_id,
+                            "idempotency_key": idempotency_key,
+                            "interrupt_id": interrupt_id,
+                            "comment_id": comment_id,
+                            "comment_created_at": comment_created_at.isoformat(),
+                            "operator": operator,
+                            "reason": reason,
+                        }
+                    ),
+                ),
+            ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            return None
+        return CompletedCritiqueCorrection(interrupt_id=row[0])
+
+    def complete_critique_correction(
+        self,
+        *,
+        run: PlanRun,
+        idempotency_key: str,
+        interrupt_id: str,
+        comment_id: int,
+        comment_created_at: datetime,
+        new_interrupt_id: str,
+        operator: str,
+        reason: str,
+    ) -> PlanRun:
+        details = {
+            "plan_id": run.plan_id,
+            "plan_version": run.plan_version,
+            "thread_id": run.thread_id,
+            "idempotency_key": idempotency_key,
+            "interrupt_id": interrupt_id,
+            "comment_id": comment_id,
+            "comment_created_at": comment_created_at.isoformat(),
+            "new_interrupt_id": new_interrupt_id,
+            "operator": operator,
+            "reason": reason,
+        }
+        with psycopg.connect(self._database_url) as connection, connection.transaction():
+            delivery = connection.execute(
+                f"""
+                SELECT event_id,state,lease_expires_at,claim_token
+                FROM {self._SCHEMA}.delivery_deduplications
+                WHERE idempotency_key=%s FOR UPDATE
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if (
+                delivery is None
+                or str(delivery[1]) != "completed"
+                or delivery[2] is not None
+                or delivery[3] is not None
+            ):
+                raise LifecycleStoreMismatch("critique correction delivery is not completed")
+            event_id = str(delivery[0])
+            row = connection.execute(
+                f"""
+                UPDATE {self._SCHEMA}.plan_runs
+                SET state='needs_input', updated_at=now()
+                WHERE plan_id=%s AND plan_version=%s AND thread_id=%s
+                  AND state='failed' AND pending_resume_ciphertext IS NULL
+                  AND planning_commit IS NULL AND pull_request_number IS NULL
+                  AND pull_request_url IS NULL AND approved_commit IS NULL
+                  AND approval_evidence_sha256 IS NULL
+                  AND backlog_blob_sha1 IS NULL AND backlog_sha256 IS NULL
+                RETURNING {self._SELECT}
+                """,
+                (run.plan_id, run.plan_version, run.thread_id),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    f"""SELECT {self._SELECT} FROM {self._SCHEMA}.plan_runs
+                    WHERE plan_id=%s AND plan_version=%s AND thread_id=%s
+                      AND state='needs_input'""",
+                    (run.plan_id, run.plan_version, run.thread_id),
+                ).fetchone()
+                audited = connection.execute(
+                    f"""SELECT 1 FROM {self._SCHEMA}.audit
+                    WHERE event_id=%s AND action='failed_critique_correction'
+                      AND outcome='needs_input' AND details=%s""",
+                    (event_id, Jsonb(details)),
+                ).fetchone()
+                if row is None or audited is None:
+                    raise LifecycleStoreMismatch(
+                        "critique correction conflicts with durable lifecycle state"
+                    )
+            self.audit(
+                event_id=event_id,
+                trace_id=event_id,
+                action="failed_critique_correction",
+                outcome="needs_input",
+                details=details,
+                connection=connection,
+            )
+        return self._restore(row)
+
     def stale_thread_count(self, cutoff: datetime) -> int:
         """Count stale latest nonterminal planning threads without updating them."""
         if cutoff.tzinfo is None:
@@ -1412,23 +1570,15 @@ class PostgresLifecycleStore:
                 and merged_commit is not None
                 and current.merged_commit != merged_commit
             ):
-                raise LifecycleStoreMismatch(
-                    "implementation PR replay changed its merge commit"
-                )
-            if (
-                observed_at == current.head_observed_at
-                and (
-                    head_sha != current.head_sha
-                    or pull_request_state != current.pull_request_state
-                )
+                raise LifecycleStoreMismatch("implementation PR replay changed its merge commit")
+            if observed_at == current.head_observed_at and (
+                head_sha != current.head_sha or pull_request_state != current.pull_request_state
             ):
                 raise LifecycleStoreMismatch(
                     "implementation PR has conflicting facts at one observation time"
                 )
             if current.merged_commit is not None and head_sha != current.head_sha:
-                raise LifecycleStoreMismatch(
-                    "merged implementation PR replay changed its head"
-                )
+                raise LifecycleStoreMismatch("merged implementation PR replay changed its head")
             next_head = current.head_sha
             next_observed = current.head_observed_at
             next_state: Literal["open", "closed"] = current.pull_request_state
@@ -1438,8 +1588,7 @@ class PostgresLifecycleStore:
                 and merged_commit is None
                 and observed_at > current.head_observed_at
                 and (
-                    head_sha != current.head_sha
-                    or pull_request_state != current.pull_request_state
+                    head_sha != current.head_sha or pull_request_state != current.pull_request_state
                 )
             ):
                 next_head = head_sha
@@ -1661,10 +1810,7 @@ class PostgresLifecycleStore:
             raise ValueError("implementation PR URL must be a GitHub HTTPS URL")
         if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
             raise ValueError("implementation PR head must be a full commit SHA")
-        if (
-            merged_commit is not None
-            and not re.fullmatch(r"[0-9a-f]{40}", merged_commit)
-        ):
+        if merged_commit is not None and not re.fullmatch(r"[0-9a-f]{40}", merged_commit):
             raise ValueError("implementation PR merge commit must be a full commit SHA")
         if observed_at.tzinfo is None:
             raise ValueError("implementation PR observation time must be timezone aware")

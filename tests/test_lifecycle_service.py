@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -120,18 +122,19 @@ Restart/replay behavior remains deterministic.
 
 The requests/limits table and App/API contract are prose, not repositories.
 """
-    assert LifecycleService._repositories(description) == (
-        "RausserHQ/planning-platform",
-    )
+    assert LifecycleService._repositories(description) == ("RausserHQ/planning-platform",)
     assert LifecycleService._repositories("RausserHQ/planning-platform") == ()
-    assert LifecycleService._repositories(
-        """## Relevant repositories
+    assert (
+        LifecycleService._repositories(
+            """## Relevant repositories
 RausserHQ/planning-platform
 
 ## Relevant repositories
 RausserHQ/homelab-platform
 """
-    ) == ()
+        )
+        == ()
+    )
     assert LifecycleService._repositories(
         """### ReLeVaNt RePoSiToRiEs ###
 - `RausserHQ/homelab-platform`
@@ -147,13 +150,16 @@ RausserHQ/not-a-repository
 The App/API shape follows Acme/contract.
 """
     ) == ("RausserHQ/planning-platform",)
-    assert LifecycleService._repositories(
-        """```markdown
+    assert (
+        LifecycleService._repositories(
+            """```markdown
 ## Relevant repositories
 Acme/should-not-be-used
 ```
 """
-    ) == ()
+        )
+        == ()
+    )
     assert LifecycleService._repositories(
         """## Relevant repositories
 - [planning](https://github.com/RausserHQ/planning-platform.git)
@@ -166,13 +172,16 @@ Acme/should-not-be-used
 ~~~
 """
     ) == ("RausserHQ/planning-platform",)
-    assert LifecycleService._repositories(
-        """<!--
+    assert (
+        LifecycleService._repositories(
+            """<!--
 ## Relevant repositories
 Acme/should-not-be-used
 -->
 """
-    ) == ()
+        )
+        == ()
+    )
     assert LifecycleService._repositories(
         """## Relevant repositories
 - RausserHQ/planning-platform
@@ -183,11 +192,14 @@ Acme/should-not-be-used
 -->
 """
     ) == ("RausserHQ/planning-platform",)
-    assert LifecycleService._repositories(
-        """<!-- not a heading -->## Relevant repositories
+    assert (
+        LifecycleService._repositories(
+            """<!-- not a heading -->## Relevant repositories
 Acme/should-not-be-used
 """
-    ) == ()
+        )
+        == ()
+    )
     assert LifecycleService._repositories(
         """## Relevant repositories
 - RausserHQ/planning-platform
@@ -202,11 +214,14 @@ Acme/should-not-be-used
 - RausserHQ/planning-platform
 """
     ) == ("RausserHQ/planning-platform",)
-    assert LifecycleService._repositories(
-        """## Relevant repositories
+    assert (
+        LifecycleService._repositories(
+            """## Relevant repositories
     Acme/indented-code-is-not-an-entry
 """
-    ) == ()
+        )
+        == ()
+    )
 
 
 def _implementation_artifact():
@@ -261,6 +276,13 @@ class MemoryStore:
         self.audit_rows: list[tuple[str, str]] = []
         self.crash_on_publish = crash_on_publish
         self.implementation: dict[tuple[str, int], ImplementationPrAssociation] = {}
+        self._critique_correction_lock = Lock()
+
+    def acquire_critique_correction_lock(
+        self, _plan_id: str, _plan_version: int
+    ) -> SimpleNamespace:
+        self._critique_correction_lock.acquire()
+        return SimpleNamespace(release=self._critique_correction_lock.release)
 
     def latest_for_idea(self, _idea_id: int) -> PlanRun | None:
         return self.run
@@ -711,9 +733,7 @@ async def test_service_authored_planning_status_echo_does_not_restart_active_run
     active = replace(store.run, state="needs_input")
     store.run = active
 
-    outcome = await service.handle(
-        _work_package_event(delivery_id="service-status-echo")
-    )
+    outcome = await service.handle(_work_package_event(delivery_id="service-status-echo"))
 
     assert outcome.outcome == "ignored_active_run"
     assert len(planner.starts) == 1
@@ -1006,9 +1026,7 @@ async def test_bounded_replan_recovers_exact_request_after_successor_insert() ->
     assert publication_context is not None
     assert publication_context.selected_root_keys == (root.key,)
     assert publication_context.affected_node_keys == (root.key, child.key)
-    unscoped = bounded.model_copy(
-        update={"plan": bounded.plan.model_copy(update={"replan": None})}
-    )
+    unscoped = bounded.model_copy(update={"plan": bounded.plan.model_copy(update={"replan": None})})
     unscoped_artifact = load_artifact_bytes(
         yaml.safe_dump(unscoped.model_dump(mode="json"), sort_keys=False).encode()
     )
@@ -1038,9 +1056,7 @@ async def test_bounded_replan_recovers_exact_request_after_successor_insert() ->
     assert ignored.outcome == "ignored_after_failed"
     assert len(store.runs) == 2
 
-    retry = await service.handle(
-        _replan_event(delivery_id="replan:wm-root-job-1176-retry")
-    )
+    retry = await service.handle(_replan_event(delivery_id="replan:wm-root-job-1176-retry"))
     assert retry.outcome == "failed"
     assert store.get(prior.plan.id, 3).state == "failed"  # type: ignore[union-attr]
     assert len(store.runs) == 3
@@ -1101,9 +1117,7 @@ async def test_lifecycle_rejects_cross_root_reparent_before_github() -> None:
     )
     seed = loaded.plan.items[0]
     root_a = seed.model_copy(update={"key": "root-a", "type": "Epic", "parent": None})
-    child_a = seed.model_copy(
-        update={"key": "child-a", "type": "Story", "parent": root_a.key}
-    )
+    child_a = seed.model_copy(update={"key": "child-a", "type": "Story", "parent": root_a.key})
     root_b = seed.model_copy(update={"key": "root-b", "type": "Epic", "parent": None})
     prior = loaded.plan.model_copy(update={"items": (root_a, child_a, root_b)})
     raw = yaml.safe_dump(prior.model_dump(mode="json"), sort_keys=False).encode()
@@ -1146,9 +1160,7 @@ async def test_lifecycle_rejects_cross_root_reparent_before_github() -> None:
         LifecycleEventRejected,
         match="changed selected-root ownership",
     ):
-        await service.handle(
-            _replan_event(affected_node_keys=[root_a.key, root_b.key])
-        )
+        await service.handle(_replan_event(affected_node_keys=[root_a.key, root_b.key]))
 
 
 class ResumeCrashPlanner:
@@ -1479,6 +1491,166 @@ async def test_terminal_delivery_abandonment_clears_only_matching_pending_resume
             operator="different-operator",
             reason="different reason",
         )
+
+
+@pytest.mark.asyncio
+async def test_failed_critique_correction_is_retry_safe_and_preserves_completed_delivery() -> None:
+    created_at = datetime.fromisoformat("2026-08-03T01:42:05+00:00")
+    run = PlanRun(
+        idea_id=41,
+        plan_id="idea-41",
+        plan_version=1,
+        thread_id="openproject:41:planning:1",
+        repository="RausserHQ/planning-platform",
+        base_branch="a" * 40,
+        artifact_prefix="planning/idea-41/v1",
+        backlog_path="planning/idea-41/v1/backlog.yaml",
+        snapshot_sha256="b" * 64,
+        snapshot_etag='"snapshot-1"',
+        state="failed",
+    )
+
+    class CorrectionStore(MemoryStore):
+        completed = False
+        completed_values: dict[str, Any] | None = None
+
+        def terminal_delivery(self, idempotency_key: str):
+            if idempotency_key != "event:openproject:comment:00000101":
+                return None
+            return SimpleNamespace(
+                idempotency_key=idempotency_key,
+                event_id=uuid4(),
+                state="completed",
+                lease_expires_at=None,
+                claim_token=None,
+            )
+
+        def completed_critique_correction(self, **values: Any):
+            if self.completed and values["operator"] == "incident-operator":
+                return SimpleNamespace(interrupt_id="critique-corrected")
+            return None
+
+        def complete_critique_correction(self, **values: Any) -> PlanRun:
+            assert values["run"] == self.run
+            assert values["comment_id"] == 101
+            assert values["comment_created_at"] == created_at
+            self.completed = True
+            self.completed_values = values
+            assert self.run is not None
+            self.run = replace(self.run, state="needs_input")
+            self.audit_rows.append(("failed_critique_correction", "needs_input"))
+            return self.run
+
+    response = PlanResponse.model_validate(
+        {
+            "thread_id": run.thread_id,
+            "status": "needs_input",
+            "trace_id": str(uuid4()),
+            "interrupt": {
+                "interrupt_id": "critique-corrected",
+                "questions": ["Provide a bounded story split."],
+                "impact": "The decomposition cannot be published yet.",
+                "created_at": "2026-08-03T02:00:00Z",
+            },
+            "artifact_manifest": [],
+        }
+    )
+
+    class CorrectionPlanner:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def convert_failed_critique_to_interrupt(
+            self, thread_id: str, request: Any
+        ) -> PlanResponse:
+            assert thread_id == run.thread_id
+            self.requests.append(request)
+            await asyncio.sleep(0.05)
+            return response
+
+        async def get(self, thread_id: str) -> PlanResponse:
+            assert thread_id == run.thread_id
+            return response
+
+    store = CorrectionStore(run)
+    planner = CorrectionPlanner()
+
+    class DeduplicatingOpenProjectFake(OpenProjectFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.comment_keys: set[str] = set()
+
+        def ensure_comment(self, work_package_id: int, body: str, *, idempotency_key: str) -> None:
+            if idempotency_key in self.comment_keys:
+                return
+            self.comment_keys.add(idempotency_key)
+            super().ensure_comment(work_package_id, body, idempotency_key=idempotency_key)
+
+    openproject = DeduplicatingOpenProjectFake()
+    service = LifecycleService(
+        planner=planner,  # type: ignore[arg-type]
+        openproject=openproject,  # type: ignore[arg-type]
+        github=object(),  # type: ignore[arg-type]
+        store=store,  # type: ignore[arg-type]
+        publication_database_url="postgresql://unused",
+        recovery_cipher=_cipher(),
+        **_service_policy(),
+    )
+    arguments = {
+        "plan_id": run.plan_id,
+        "plan_version": run.plan_version,
+        "thread_id": run.thread_id,
+        "idempotency_key": "event:openproject:comment:00000101",
+        "interrupt_id": "996c7d3c03c759c3431427ec",
+        "comment_id": 101,
+        "comment_created_at": created_at,
+        "operator": "incident-operator",
+        "reason": "token=supersecret historical exhausted critique correction",
+    }
+    held_lock = store.acquire_critique_correction_lock(run.plan_id, run.plan_version)
+    cancelled = asyncio.create_task(service.convert_failed_critique_to_interrupt(**arguments))
+    await asyncio.sleep(0.02)
+    cancelled.cancel()
+    held_lock.release()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    probe_lock = await asyncio.wait_for(
+        asyncio.to_thread(
+            store.acquire_critique_correction_lock,
+            run.plan_id,
+            run.plan_version,
+        ),
+        timeout=1,
+    )
+    probe_lock.release()
+    with pytest.raises(LifecycleEventRejected, match="not completed"):
+        await service.convert_failed_critique_to_interrupt(
+            **{**arguments, "idempotency_key": "event:openproject:comment:incomplete"}
+        )
+    store.run = replace(run, state="needs_input")
+    with pytest.raises(LifecycleEventRejected, match="artifact-free failure"):
+        await service.convert_failed_critique_to_interrupt(**arguments)
+    store.run = replace(run, planning_commit="c" * 40)
+    with pytest.raises(LifecycleEventRejected, match="artifact-free failure"):
+        await service.convert_failed_critique_to_interrupt(**arguments)
+    store.run = run
+    outcome, replayed = await asyncio.gather(
+        service.convert_failed_critique_to_interrupt(**arguments),
+        service.convert_failed_critique_to_interrupt(**arguments),
+    )
+
+    assert outcome == replayed
+    assert outcome.outcome == "needs_input"
+    assert store.run is not None and store.run.state == "needs_input"
+    assert store.audit_rows[-1] == ("failed_critique_correction", "needs_input")
+    assert len(planner.requests) == 1
+    assert not hasattr(planner.requests[0], "answer")
+    assert store.completed_values is not None
+    assert "supersecret" not in str(store.completed_values)
+    assert "[REDACTED]" in str(store.completed_values["reason"])
+    assert len(openproject.comments) == 1
+    assert openproject.comments[0].startswith("## Planning input required")
+    assert openproject.states[-1][1] == "Needs Input"
 
 
 def _implementation_pr_event(

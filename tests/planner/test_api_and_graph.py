@@ -20,7 +20,7 @@ from planning_platform.planner.execution import (
     InMemoryExecutionGuard,
     _close_connection,
 )
-from planning_platform.planner.graph import build_planner_graph
+from planning_platform.planner.graph import build_planner_graph, critique_interrupt
 from planning_platform.planner.idempotency import (
     IdempotencyClaim,
     IdempotencyConflict,
@@ -36,6 +36,7 @@ from planning_platform.planner.models import (
     DocumentSection,
     IdeaSnapshot,
     OpenProjectSnapshotInput,
+    PendingInterrupt,
     RelationDraft,
     RepositoryFile,
     RequirementsDraft,
@@ -183,9 +184,7 @@ def test_replan_preserves_each_existing_nodes_selected_root() -> None:
     ).plan
     seed = loaded.items[0]
     root_a = seed.model_copy(update={"key": "root-a", "type": "Epic", "parent": None})
-    child_a = seed.model_copy(
-        update={"key": "child-a", "type": "Story", "parent": root_a.key}
-    )
+    child_a = seed.model_copy(update={"key": "child-a", "type": "Story", "parent": root_a.key})
     root_b = seed.model_copy(update={"key": "root-b", "type": "Epic", "parent": None})
     prior = loaded.model_copy(update={"items": (root_a, child_a, root_b)})
     proposal = prior.model_copy(
@@ -208,9 +207,7 @@ def test_replan_preserves_each_existing_nodes_selected_root() -> None:
     escaped = bounded.model_copy(
         update={
             "items": tuple(
-                item.model_copy(update={"parent": root_b.key})
-                if item.key == child_a.key
-                else item
+                item.model_copy(update={"parent": root_b.key}) if item.key == child_a.key else item
                 for item in bounded.items
             )
         }
@@ -559,15 +556,11 @@ async def test_resume_repairs_an_unacceptable_decomposition_critique() -> None:
                 },
                 "interrupt_id": pending["interrupt"]["interrupt_id"],
                 "comment_id": 9071,
-                "comment_created_at": after_timestamp(
-                    pending["interrupt"]["created_at"]
-                ),
+                "comment_created_at": after_timestamp(pending["interrupt"]["created_at"]),
                 "answer": "Use option 1.",
             },
         )
-        artifacts = await client.get(
-            f"/v1/plans/{pending['thread_id']}/artifacts"
-        )
+        artifacts = await client.get(f"/v1/plans/{pending['thread_id']}/artifacts")
 
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "artifacts_ready"
@@ -582,11 +575,18 @@ async def test_resume_repairs_an_unacceptable_decomposition_critique() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_returns_typed_failure_when_critique_repair_is_rejected() -> None:
+async def test_resume_requests_human_input_when_critique_repair_is_rejected() -> None:
     class AlwaysRejectingCritic(DeterministicPlanningModel):
         critique_calls = 0
 
+        def __init__(self) -> None:
+            self.stages: list[str] = []
+            self.critique_answers: list[str] = []
+
         async def generate(self, stage, schema, payload):
+            self.stages.append(stage)
+            if stage == "revise_decomposition":
+                self.critique_answers.append(payload["critique_human_answer"])
             if schema is DecompositionCritique:
                 self.critique_calls += 1
                 return DecompositionCritique(
@@ -611,25 +611,172 @@ async def test_resume_returns_typed_failure_when_critique_repair_is_rejected() -
             ),
         )
         pending = started.json()
+        old_resume = {
+            "event": {
+                "idempotency_key": "resume:critique-rejected:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending["interrupt"]["interrupt_id"],
+            "comment_id": 9072,
+            "comment_created_at": after_timestamp(pending["interrupt"]["created_at"]),
+            "answer": "Use option 1.",
+        }
         resumed = await client.post(
             f"/v1/plans/{pending['thread_id']}/resume",
+            json=old_resume,
+        )
+        critique_pending = resumed.json()
+        replayed_old = await client.post(
+            f"/v1/plans/{pending['thread_id']}/resume", json=old_resume
+        )
+        model.stages.clear()
+        second_resume = {
+            "event": {
+                "idempotency_key": "resume:critique-rejected:0002",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": critique_pending["interrupt"]["interrupt_id"],
+            "comment_id": 9073,
+            "comment_created_at": after_timestamp(critique_pending["interrupt"]["created_at"]),
+            "answer": "Split the work by independently deployable behavior.",
+        }
+        repeated = await client.post(f"/v1/plans/{pending['thread_id']}/resume", json=second_resume)
+
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "needs_input"
+    assert resumed.json()["interrupt"]["interrupt_id"].startswith("critique-")
+    assert repeated.json()["status"] == "needs_input"
+    assert (
+        repeated.json()["interrupt"]["interrupt_id"]
+        != critique_pending["interrupt"]["interrupt_id"]
+    )
+    assert replayed_old.json() == critique_pending
+    assert model.stages[0] == "revise_decomposition"
+    assert model.critique_answers[-1] == second_resume["answer"]
+    assert model.critique_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_operator_converts_exact_completed_exhausted_critique_failure() -> None:
+    class AlwaysRejectingCritic(DeterministicPlanningModel):
+        async def generate(self, stage, schema, payload):
+            if schema is DecompositionCritique:
+                return DecompositionCritique(
+                    acceptable=False,
+                    findings=("The stories need an explicit deployable boundary.",),
+                )
+            return await super().generate(stage, schema, payload)
+
+    service, _, _, graph = make_service(model=AlwaysRejectingCritic())
+    request = StartPlanRequest.model_validate(
+        start_payload(idea_id=74, description="Choose? a material platform architecture.")
+    )
+    pending, _ = await service.start(request)
+    assert pending.interrupt is not None
+    old_resume = ResumePlanRequest.model_validate(
+        {
+            "event": {
+                "idempotency_key": "resume:completed-critique:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending.interrupt.interrupt_id,
+            "comment_id": 9074,
+            "comment_created_at": after_timestamp(pending.interrupt.created_at),
+            "answer": "Keep the prior architecture and split deployment boundaries.",
+        }
+    )
+    exhausted, _ = await service.resume(pending.thread_id, old_resume)
+    assert exhausted.status == "needs_input"
+    before = dict(
+        (await graph.aget_state({"configurable": {"thread_id": pending.thread_id}})).values
+    )
+    await graph.aupdate_state(
+        {"configurable": {"thread_id": pending.thread_id}},
+        {"pending_interrupt": None, "status": "failed"},
+        as_node="prepare_planning_pr",
+    )
+    app = create_app(service, internal_token=INTERNAL_TOKEN)
+    correction = {
+        "idempotency_key": old_resume.event.idempotency_key,
+        "interrupt_id": old_resume.interrupt_id,
+        "comment_id": old_resume.comment_id,
+        "comment_created_at": old_resume.comment_created_at.isoformat(),
+        "operator": "incident-operator",
+        "reason": "token=supersecret convert the historical exhausted critique failure",
+    }
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=AUTH_HEADERS
+    ) as client:
+        wrong = await client.post(
+            f"/v1/plans/{pending.thread_id}/convert-failed-critique-to-interrupt",
+            json={**correction, "comment_id": 9999},
+        )
+        invalid_operator = await client.post(
+            f"/v1/plans/{pending.thread_id}/convert-failed-critique-to-interrupt",
+            json={**correction, "operator": "not an identity"},
+        )
+        structured_reason = await client.post(
+            f"/v1/plans/{pending.thread_id}/convert-failed-critique-to-interrupt",
+            json={**correction, "reason": '{"payload": "must not persist"}'},
+        )
+        corrected = await client.post(
+            f"/v1/plans/{pending.thread_id}/convert-failed-critique-to-interrupt",
+            json=correction,
+        )
+        replayed = await client.post(
+            f"/v1/plans/{pending.thread_id}/convert-failed-critique-to-interrupt",
+            json=correction,
+        )
+        old_replay = await client.post(
+            f"/v1/plans/{pending.thread_id}/resume",
+            json=old_resume.model_dump(mode="json"),
+        )
+        after_correction = dict(
+            (await graph.aget_state({"configurable": {"thread_id": pending.thread_id}})).values
+        )
+        corrected_interrupt = corrected.json()["interrupt"]
+        fresh_resume = await client.post(
+            f"/v1/plans/{pending.thread_id}/resume",
             json={
                 "event": {
-                    "idempotency_key": "resume:critique-rejected:0001",
+                    "idempotency_key": "resume:completed-critique:0002",
                     "trace_id": str(uuid4()),
                 },
-                "interrupt_id": pending["interrupt"]["interrupt_id"],
-                "comment_id": 9072,
-                "comment_created_at": after_timestamp(
-                    pending["interrupt"]["created_at"]
-                ),
-                "answer": "Use option 1.",
+                "interrupt_id": corrected_interrupt["interrupt_id"],
+                "comment_id": 9075,
+                "comment_created_at": after_timestamp(corrected_interrupt["created_at"]),
+                "answer": "Preserve the architecture and use independently deployable stories.",
             },
         )
 
-    assert resumed.status_code == 200
-    assert resumed.json()["status"] == "failed"
-    assert model.critique_calls == 2
+    assert wrong.status_code == 409
+    assert invalid_operator.status_code == 422
+    assert structured_reason.status_code == 422
+    assert corrected.status_code == 200
+    assert corrected.json()["status"] == "needs_input"
+    assert replayed.json() == corrected.json()
+    assert old_replay.json() == corrected.json()
+    assert fresh_resume.status_code == 200
+    assert fresh_resume.json()["status"] == "needs_input"
+    assert fresh_resume.json()["interrupt"]["interrupt_id"] != corrected_interrupt["interrupt_id"]
+    after_fresh_resume = dict(
+        (await graph.aget_state({"configurable": {"thread_id": pending.thread_id}})).values
+    )
+    for key in (
+        "human_answer",
+        "architecture",
+        "requirements_draft",
+        "decomposition",
+        "relation_draft",
+        "critique",
+        "consumed_resume",
+    ):
+        assert after_correction[key] == before[key]
+    assert after_correction.get("artifacts", {}) == {}
+    assert after_correction.get("artifact_manifest", []) == []
+    assert "supersecret" not in repr(after_correction)
+    assert "[REDACTED]" in after_correction["critique_correction"]["reason"]
+    assert after_fresh_resume["consumed_resume"]["comment_id"] == 9075
 
 
 @pytest.mark.asyncio
@@ -680,9 +827,7 @@ async def test_reclaimed_resume_continues_from_checkpointed_critique_repair() ->
             },
             "interrupt_id": pending["interrupt"]["interrupt_id"],
             "comment_id": 9073,
-            "comment_created_at": after_timestamp(
-                pending["interrupt"]["created_at"]
-            ),
+            "comment_created_at": after_timestamp(pending["interrupt"]["created_at"]),
             "answer": "Use option 1.",
         }
         failed = await client.post(
@@ -750,9 +895,7 @@ async def test_abandon_terminal_resume_restores_exact_interrupt_and_blocks_old_e
             },
             "interrupt_id": pending["interrupt"]["interrupt_id"],
             "comment_id": 9081,
-            "comment_created_at": after_timestamp(
-                pending["interrupt"]["created_at"]
-            ),
+            "comment_created_at": after_timestamp(pending["interrupt"]["created_at"]),
             "answer": "Use the old answer.",
         }
         failed = await client.post(
@@ -1012,10 +1155,9 @@ async def test_independent_critic_rejects_overbroad_story() -> None:
             return await super().generate(stage, schema, payload)
 
     service, _, _, _ = make_service(model=OverbroadCritic())
-    response, _ = await service.start(
-        StartPlanRequest.model_validate(start_payload(idea_id=56))
-    )
-    assert response.status == "failed"
+    response, _ = await service.start(StartPlanRequest.model_validate(start_payload(idea_id=56)))
+    assert response.status == "needs_input"
+    assert response.interrupt is not None
 
 
 @pytest.mark.asyncio
@@ -1048,6 +1190,40 @@ def test_request_models_forbid_uncontracted_identity_and_invalid_shape() -> None
     payload["thread_id"] = "caller:chosen"
     with pytest.raises(ValidationError):
         StartPlanRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize("model", (ConsequentialQuestions, DecompositionCritique))
+def test_human_interrupt_model_output_is_bounded(model) -> None:
+    field = "questions" if model is ConsequentialQuestions else "findings"
+    base = (
+        {"impact": "Affects the plan."}
+        if model is ConsequentialQuestions
+        else {"acceptable": False}
+    )
+    with pytest.raises(ValidationError):
+        model.model_validate({**base, field: ["bounded"] * 17})
+    with pytest.raises(ValidationError):
+        model.model_validate({**base, field: ["x" * 2_049]})
+
+
+def test_critique_interrupt_bounds_the_composed_question() -> None:
+    pending = critique_interrupt(
+        {
+            "thread_id": "openproject:75:planning:1",
+            "decomposition": {},
+            "relation_draft": {},
+            "consumed_resume": {},
+        },
+        DecompositionCritique(
+            acceptable=False,
+            findings=("x" * 2_048,),
+        ).model_dump(mode="json"),
+    )
+
+    validated = PendingInterrupt.model_validate(pending)
+
+    assert len(validated.questions) == 1
+    assert len(validated.questions[0]) == 2_048
 
 
 @pytest.mark.parametrize(
@@ -1225,7 +1401,7 @@ async def test_critic_findings_and_terminal_failure_are_sanitized() -> None:
     failed_service, _, _, failed_graph = make_service(model=FailedFindingModel())
     request = StartPlanRequest.model_validate(start_payload(idea_id=63))
     failed, _ = await failed_service.start(request)
-    assert failed.status == "failed"
+    assert failed.status == "needs_input"
     failed_snapshot = await failed_graph.aget_state(
         {"configurable": {"thread_id": "openproject:63:planning:1"}}
     )
@@ -1381,6 +1557,58 @@ async def test_resume_crash_recovers_without_consuming_answer_twice() -> None:
     assert recovered.status == "artifacts_ready"
     state = await graph.aget_state({"configurable": {"thread_id": pending.thread_id}})
     assert state.values["human_answer"] == "Use option A."
+
+
+@pytest.mark.asyncio
+async def test_resume_crash_recovers_when_answer_created_a_new_interrupt() -> None:
+    class AlwaysRejectingCritic(DeterministicPlanningModel):
+        async def generate(self, stage, schema, payload):
+            if schema is DecompositionCritique:
+                return DecompositionCritique(
+                    acceptable=False,
+                    findings=("Split the remaining work at a deployable boundary.",),
+                )
+            return await super().generate(stage, schema, payload)
+
+    repository = CrashOnceRepository()
+    model = AlwaysRejectingCritic()
+    service, saver, _, _ = make_service(idempotency=repository, model=model)
+    pending, _ = await service.start(
+        StartPlanRequest.model_validate(
+            start_payload(idea_id=75, description="Choose? crash before finalizing resume")
+        )
+    )
+    assert pending.interrupt is not None
+    resume = ResumePlanRequest.model_validate(
+        {
+            "event": {
+                "idempotency_key": "resume:critique-crash:0001",
+                "trace_id": str(uuid4()),
+            },
+            "interrupt_id": pending.interrupt.interrupt_id,
+            "comment_id": 9075,
+            "comment_created_at": after_timestamp(pending.interrupt.created_at),
+            "answer": "Use option 1.",
+        }
+    )
+    repository.crash_on_finalize = True
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await service.resume(pending.thread_id, resume)
+    repository.expire_for_test(resume.event.idempotency_key)
+    restarted, _, _, graph = make_service(
+        checkpointer=saver,
+        idempotency=repository,
+        model=model,
+    )
+    recovered, replayed = await restarted.resume(pending.thread_id, resume)
+
+    assert replayed
+    assert recovered.status == "needs_input"
+    assert recovered.interrupt is not None
+    assert recovered.interrupt.interrupt_id.startswith("critique-")
+    state = await graph.aget_state({"configurable": {"thread_id": pending.thread_id}})
+    assert state.values["consumed_resume"]["comment_id"] == 9075
 
 
 @pytest.mark.asyncio

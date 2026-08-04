@@ -12,7 +12,7 @@ from typing import Any, TypeVar, cast
 from langgraph.types import Command
 
 from .execution import ExecutionGuard
-from .graph import PlannerRuntimeContext, sanitize_checkpoint_text
+from .graph import PlannerRuntimeContext, critique_interrupt, sanitize_checkpoint_text
 from .idempotency import (
     IdempotencyClaim,
     IdempotencyRepository,
@@ -23,6 +23,7 @@ from .models import (
     ArtifactBundle,
     ArtifactContent,
     ArtifactManifestEntry,
+    ConvertFailedCritiqueRequest,
     PendingInterrupt,
     PlanResponse,
     ResumeBinding,
@@ -156,7 +157,28 @@ class PlannerService:
             comment_created_at=request.comment_created_at,
         )
         async with self._execution_guard.execution(thread_id) as graph:
-            self._validate_resume_state(await self._state(graph, thread_id), request, binding)
+            state = await self._state(graph, thread_id)
+            pending = state.get("pending_interrupt")
+            if (
+                isinstance(pending, dict)
+                and pending.get("interrupt_id") != request.interrupt_id
+                and await self._idempotency.completed_resume_matches(
+                    key=request.event.idempotency_key,
+                    thread_id=thread_id,
+                    binding=binding,
+                )
+            ):
+                replay = await self._idempotency.claim(
+                    kind="resume",
+                    key=request.event.idempotency_key,
+                    body_hash=_request_hash(request),
+                    thread_id=thread_id,
+                    resume_binding=binding,
+                )
+                if not isinstance(replay, IdempotentReplay):
+                    raise RuntimeError("completed resume unexpectedly created a new claim")
+                return self._response_from_state(thread_id, state), True
+            self._validate_resume_state(state, request, binding)
             claim = await self._idempotency.claim(
                 kind="resume",
                 key=request.event.idempotency_key,
@@ -165,6 +187,11 @@ class PlannerService:
                 resume_binding=binding,
             )
             if isinstance(claim, IdempotentReplay):
+                state = await self._state(graph, thread_id)
+                if state.get("consumed_resume") == binding.model_dump(mode="json") and _is_servable(
+                    state
+                ):
+                    return self._response_from_state(thread_id, state), True
                 return PlanResponse.model_validate(claim.response), True
             response = await self._with_heartbeat(
                 claim,
@@ -238,6 +265,72 @@ class PlannerService:
                 raise RuntimeError("terminal resume abandonment did not restore the interrupt")
             return self._response_from_state(thread_id, restored)
 
+    async def convert_failed_critique_to_interrupt(
+        self,
+        thread_id: str,
+        request: ConvertFailedCritiqueRequest,
+    ) -> PlanResponse:
+        binding = ResumeBinding(
+            interrupt_id=request.interrupt_id,
+            comment_id=request.comment_id,
+            comment_created_at=request.comment_created_at,
+        )
+        async with self._execution_guard.execution(thread_id) as graph:
+            if not await self._idempotency.completed_resume_matches(
+                key=request.idempotency_key,
+                thread_id=thread_id,
+                binding=binding,
+            ):
+                raise ResumeConflict("completed resume claim does not match the exact binding")
+            state = await self._state(graph, thread_id)
+            critique = state.get("critique")
+            if not isinstance(critique, dict):
+                raise ResumeConflict("thread has no decomposition critique")
+            desired = critique_interrupt(state, critique)
+            pending = state.get("pending_interrupt")
+            correction = {
+                "idempotency_key": request.idempotency_key,
+                **binding.model_dump(mode="json"),
+                "operator": request.operator.strip(),
+                "reason": sanitize_checkpoint_text(request.reason.strip(), limit=1_024),
+            }
+            if (
+                isinstance(pending, dict)
+                and pending.get("interrupt_id") == desired["interrupt_id"]
+                and state.get("consumed_resume") == binding.model_dump(mode="json")
+                and state.get("critique_correction") == correction
+                and not state.get("artifact_manifest")
+                and not state.get("artifacts")
+            ):
+                return self._response_from_state(thread_id, state)
+            if state.get("consumed_resume") != binding.model_dump(mode="json"):
+                raise ResumeConflict("thread did not consume the requested resume binding")
+            if (
+                state.get("status") != "failed"
+                or int(state.get("critique_attempts", 0)) < 2
+                or critique.get("acceptable") is not False
+                or not critique.get("findings")
+            ):
+                raise ResumeConflict("thread is not an exhausted critique failure")
+            if state.get("artifact_manifest") or state.get("artifacts"):
+                raise ResumeConflict("critique failure produced artifacts")
+            await graph.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                {
+                    "pending_interrupt": desired,
+                    "status": "planning",
+                    "critique_correction": correction,
+                },
+                as_node="critique_decomposition",
+            )
+            corrected = await self._state(graph, thread_id)
+            if (
+                corrected.get("pending_interrupt", {}).get("interrupt_id")
+                != desired["interrupt_id"]
+            ):
+                raise RuntimeError("critique correction did not create the interrupt")
+            return self._response_from_state(thread_id, corrected)
+
     def _validate_resume_state(
         self,
         state: dict[str, Any],
@@ -246,17 +339,18 @@ class PlannerService:
     ) -> None:
         consumed = state.get("consumed_resume")
         expected = binding.model_dump(mode="json")
-        if isinstance(consumed, dict):
-            if consumed != expected:
-                raise ResumeConflict("thread consumed a different resume binding")
-            return
         pending = state.get("pending_interrupt")
-        if not isinstance(pending, dict):
-            raise ResumeConflict("planning thread has no pending interrupt")
-        if pending.get("interrupt_id") != request.interrupt_id:
-            raise ResumeConflict("resume does not match the pending interrupt")
-        if request.comment_created_at <= _timestamp(str(pending["created_at"])):
-            raise ResumeConflict("resume comment is not newer than the pending interrupt")
+        if isinstance(consumed, dict) and consumed == expected:
+            return
+        if isinstance(pending, dict):
+            if pending.get("interrupt_id") != request.interrupt_id:
+                raise ResumeConflict("resume does not match the pending interrupt")
+            if request.comment_created_at <= _timestamp(str(pending["created_at"])):
+                raise ResumeConflict("resume comment is not newer than the pending interrupt")
+            return
+        if isinstance(consumed, dict):
+            raise ResumeConflict("thread consumed a different resume binding")
+        raise ResumeConflict("planning thread has no pending interrupt")
 
     async def _run_or_recover_resume(
         self,
@@ -268,6 +362,22 @@ class PlannerService:
         state = await self._state(graph, thread_id)
         consumed = state.get("consumed_resume")
         expected_binding = binding.model_dump(mode="json")
+        pending = state.get("pending_interrupt")
+        if isinstance(pending, dict) and pending.get("interrupt_id") == request.interrupt_id:
+            if request.comment_created_at <= _timestamp(str(pending["created_at"])):
+                raise ResumeConflict("resume comment is not newer than the pending interrupt")
+            await graph.ainvoke(
+                Command(
+                    resume={
+                        "answer": sanitize_checkpoint_text(request.answer),
+                        "trace_id": str(request.event.trace_id),
+                        **expected_binding,
+                    }
+                ),
+                {"configurable": {"thread_id": thread_id}},
+                context=PlannerRuntimeContext(()),
+            )
+            return await self._response(graph, thread_id)
         if isinstance(consumed, dict):
             if consumed != expected_binding:
                 raise ResumeConflict("thread consumed a different resume binding")
@@ -279,7 +389,6 @@ class PlannerService:
                 context=PlannerRuntimeContext(()),
             )
             return await self._response(graph, thread_id)
-        pending = state.get("pending_interrupt")
         if not isinstance(pending, dict):
             raise ResumeConflict("planning thread has no pending interrupt")
         if pending.get("interrupt_id") != request.interrupt_id:

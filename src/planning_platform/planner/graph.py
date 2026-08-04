@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -49,6 +50,7 @@ class PlannerState(TypedDict, total=False):
     questions: list[str]
     pending_interrupt: dict[str, Any] | None
     human_answer: str
+    critique_human_answer: str
     consumed_resume: dict[str, Any]
     prd: dict[str, Any] | None
     architecture: dict[str, Any]
@@ -57,6 +59,7 @@ class PlannerState(TypedDict, total=False):
     relation_draft: dict[str, Any]
     critique: dict[str, Any]
     critique_attempts: int
+    critique_correction: dict[str, Any]
     backlog: dict[str, Any]
     artifacts: dict[str, str]
     artifact_manifest: list[dict[str, Any]]
@@ -114,6 +117,7 @@ def _model_payload(state: PlannerState) -> dict[str, Any]:
         "classification": state.get("classification", {}),
         "repository_context": state.get("repository_context", {}),
         "human_answer": state.get("human_answer", ""),
+        "critique_human_answer": state.get("critique_human_answer", ""),
         "compact_specification": state.get("compact_specification", {}),
         "prd": state.get("prd"),
         "architecture": state.get("architecture", {}),
@@ -269,19 +273,47 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
         if critique["acceptable"]:
             return {"critique": critique}
         attempts = int(state.get("critique_attempts", 0)) + 1
-        return {
+        update: dict[str, Any] = {
             "critique": critique,
             "critique_attempts": attempts,
-            **({"status": "failed"} if attempts >= 2 else {}),
+        }
+        if attempts >= 2:
+            update.update(
+                {
+                    "pending_interrupt": critique_interrupt(state, critique),
+                    "status": "planning",
+                }
+            )
+        return update
+
+    async def human_interrupt_after_critique(state: PlannerState) -> dict[str, Any]:
+        pending = state.get("pending_interrupt")
+        if not pending:
+            raise ValueError("exhausted critique requires a pending interrupt")
+        resumed = interrupt(pending)
+        answer = resumed["answer"] if isinstance(resumed, dict) else resumed
+        trace_id = (
+            str(UUID(str(resumed["trace_id"]))) if isinstance(resumed, dict) else state["trace_id"]
+        )
+        consumed = (
+            {key: resumed[key] for key in ("interrupt_id", "comment_id", "comment_created_at")}
+            if isinstance(resumed, dict)
+            else {}
+        )
+        return {
+            "critique_human_answer": _sanitize_text(str(answer)),
+            "trace_id": trace_id,
+            "consumed_resume": consumed,
+            "pending_interrupt": None,
+            "critique_attempts": 0,
+            "status": "planning",
         }
 
     async def revise_decomposition(state: PlannerState) -> dict[str, Any]:
         revised = await model.generate(
             "revise_decomposition", DecompositionDraft, _model_payload(state)
         )
-        decomposition = cast(
-            dict[str, Any], _sanitize_value(revised.model_dump(mode="json"))
-        )
+        decomposition = cast(dict[str, Any], _sanitize_value(revised.model_dump(mode="json")))
         return {
             "decomposition": decomposition,
             "relation_draft": {},
@@ -379,6 +411,7 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
     for name, function in stages:
         builder.add_node(name, function)
     builder.add_node("revise_decomposition", revise_decomposition)
+    builder.add_node("human_interrupt_after_critique", human_interrupt_after_critique)
     builder.add_edge(START, stages[0][0])
     for (source, _), (target, _) in pairwise(stages):
         if source != "critique_decomposition":
@@ -386,18 +419,59 @@ def build_planner_graph(model: PlanningModel, checkpointer: Any) -> Any:
     builder.add_conditional_edges(
         "critique_decomposition",
         lambda state: (
-            "failed"
-            if state.get("status") == "failed"
+            "interrupt"
+            if isinstance(state.get("pending_interrupt"), dict)
             else "accepted"
             if state.get("critique", {}).get("acceptable")
             else "revise"
         ),
         {
-            "failed": END,
+            "interrupt": "human_interrupt_after_critique",
             "accepted": "validate_backlog",
             "revise": "revise_decomposition",
         },
     )
     builder.add_edge("revise_decomposition", "infer_typed_relations")
+    builder.add_edge("human_interrupt_after_critique", "revise_decomposition")
     builder.add_edge(stages[-1][0], END)
     return builder.compile(checkpointer=checkpointer)
+
+
+def critique_interrupt(
+    state: PlannerState | dict[str, Any], critique: dict[str, Any]
+) -> dict[str, Any]:
+    """Build the deterministic, sanitized question for an exhausted critique."""
+    findings = tuple(
+        finding
+        for value in critique.get("findings", ())
+        if (finding := _sanitize_text(str(value), limit=2_048).strip())
+    )
+    if not findings:
+        raise ValueError("unacceptable decomposition critique requires findings")
+    canonical = json.dumps(
+        {
+            "thread_id": state["thread_id"],
+            "decomposition": state.get("decomposition", {}),
+            "relation_draft": state.get("relation_draft", {}),
+            "findings": findings,
+            "consumed_resume": state.get("consumed_resume", {}),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:24]
+    return {
+        "interrupt_id": f"critique-{digest}",
+        "questions": [
+            _sanitize_text(
+                "Provide direction for revising the decomposition to address: " + finding,
+                limit=2_048,
+            ).strip()
+            for finding in findings
+        ],
+        "impact": (
+            "The decomposition cannot be published until these critique findings "
+            "are resolved with human direction."
+        ),
+        "created_at": datetime.now(UTC).isoformat(),
+    }
